@@ -1,0 +1,905 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Polarization &#8212; ItalaSDK  documentation</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "light";
+  </script>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=8d27b9dea8ad943066ae" rel="stylesheet" />
+<link href="../../_static/styles/bootstrap.css?digest=8d27b9dea8ad943066ae" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=8d27b9dea8ad943066ae" rel="stylesheet" />
+
+  
+  <link href="../../_static/vendor/fontawesome/6.5.1/css/all.min.css?digest=8d27b9dea8ad943066ae" rel="stylesheet" />
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="../../_static/vendor/fontawesome/6.5.1/webfonts/fa-solid-900.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="../../_static/vendor/fontawesome/6.5.1/webfonts/fa-brands-400.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="../../_static/vendor/fontawesome/6.5.1/webfonts/fa-regular-400.woff2" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=a746c00c" />
+  
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8d27b9dea8ad943066ae" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8d27b9dea8ad943066ae" />
+  <script src="../../_static/vendor/fontawesome/6.5.1/js/all.min.js?digest=8d27b9dea8ad943066ae"></script>
+
+    <script src="../../_static/documentation_options.js?v=7f41d439"></script>
+    <script src="../../_static/doctools.js?v=888ff710"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'pages/api_reference/polarization';</script>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Register" href="register.html" />
+    <link rel="prev" title="NodeMap" href="nodemap.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <a id="pst-skip-link" class="skip-link" href="#main-content">Skip to main content</a>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>
+    Back to top
+  </button>
+
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          name="__primary"
+          id="__primary"/>
+  <label class="overlay overlay-primary" for="__primary"></label>
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          name="__secondary"
+          id="__secondary"/>
+  <label class="overlay overlay-secondary" for="__secondary"></label>
+  
+  <div class="search-button__wrapper">
+    <div class="search-button__overlay"></div>
+    <div class="search-button__search-container">
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         id="search-input"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form></div>
+  </div>
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar">
+<div class="bd-header__inner bd-page-width">
+  <label class="sidebar-toggle primary-toggle" for="__primary">
+    <span class="fa-solid fa-bars"></span>
+  </label>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/itala_logo_adapted.png" class="logo__image only-light" alt="ItalaSDK  documentation - Home"/>
+    <script>document.write(`<img src="../../_static/itala_logo_adapted.png" class="logo__image only-dark" alt="ItalaSDK  documentation - Home"/>`);</script>
+  
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+<nav class="navbar-nav">
+  <ul class="bd-navbar-elements navbar-nav">
+    
+                    <li class="nav-item">
+                      <a class="nav-link nav-internal" href="../../index.html">
+                        Introduction
+                      </a>
+                    </li>
+                
+
+                    <li class="nav-item">
+                      <a class="nav-link nav-internal" href="../configuration.html">
+                        Configuration
+                      </a>
+                    </li>
+                
+
+                    <li class="nav-item">
+                      <a class="nav-link nav-internal" href="../programmers_guide.html">
+                        Programmer’s Guide
+                      </a>
+                    </li>
+                
+
+                    <li class="nav-item current active">
+                      <a class="nav-link nav-internal" href="../api_reference.html">
+                        API Reference
+                      </a>
+                    </li>
+                
+
+                    <li class="nav-item">
+                      <a class="nav-link nav-internal" href="../code_samples.html">
+                        Code samples
+                      </a>
+                    </li>
+                
+  </ul>
+</nav></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+ <script>
+ document.write(`
+   <button class="btn navbar-btn search-button-field search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <span class="search-button__default-text">Search</span>
+    <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+   </button>
+ `);
+ </script>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<script>
+document.write(`
+  <button class="btn btn-sm navbar-btn theme-switch-button" title="light/dark" aria-label="light/dark" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="theme-switch nav-link" data-mode="light"><i class="fa-solid fa-sun fa-lg"></i></span>
+    <span class="theme-switch nav-link" data-mode="dark"><i class="fa-solid fa-moon fa-lg"></i></span>
+    <span class="theme-switch nav-link" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg"></i></span>
+  </button>
+`);
+</script></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+ <script>
+ document.write(`
+   <button class="btn navbar-btn search-button-field search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <span class="search-button__default-text">Search</span>
+    <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+   </button>
+ `);
+ </script>
+    </div>
+  
+
+  
+    <label class="sidebar-toggle secondary-toggle" for="__secondary" tabindex="0">
+      <span class="fa-solid fa-outdent"></span>
+    </label>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <div class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          <div class="navbar-item">
+<nav class="navbar-nav">
+  <ul class="bd-navbar-elements navbar-nav">
+    
+                    <li class="nav-item">
+                      <a class="nav-link nav-internal" href="../../index.html">
+                        Introduction
+                      </a>
+                    </li>
+                
+
+                    <li class="nav-item">
+                      <a class="nav-link nav-internal" href="../configuration.html">
+                        Configuration
+                      </a>
+                    </li>
+                
+
+                    <li class="nav-item">
+                      <a class="nav-link nav-internal" href="../programmers_guide.html">
+                        Programmer’s Guide
+                      </a>
+                    </li>
+                
+
+                    <li class="nav-item current active">
+                      <a class="nav-link nav-internal" href="../api_reference.html">
+                        API Reference
+                      </a>
+                    </li>
+                
+
+                    <li class="nav-item">
+                      <a class="nav-link nav-internal" href="../code_samples.html">
+                        Code samples
+                      </a>
+                    </li>
+                
+  </ul>
+</nav></div>
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<script>
+document.write(`
+  <button class="btn btn-sm navbar-btn theme-switch-button" title="light/dark" aria-label="light/dark" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="theme-switch nav-link" data-mode="light"><i class="fa-solid fa-sun fa-lg"></i></span>
+    <span class="theme-switch nav-link" data-mode="dark"><i class="fa-solid fa-moon fa-lg"></i></span>
+    <span class="theme-switch nav-link" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg"></i></span>
+  </button>
+`);
+</script></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+<nav class="bd-docs-nav bd-links"
+     aria-label="Section Navigation">
+  <p class="bd-links__title" role="heading" aria-level="1">Section Navigation</p>
+  <div class="bd-toc-item navbar-nav"><ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="boolean.html">Boolean</a></li>
+<li class="toctree-l1"><a class="reference internal" href="category.html">Category</a></li>
+<li class="toctree-l1"><a class="reference internal" href="command.html">Command</a></li>
+<li class="toctree-l1"><a class="reference internal" href="defectdetection.html">DefectDetection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="device.html">Device</a></li>
+<li class="toctree-l1"><a class="reference internal" href="deviceinfo.html">DeviceInfo</a></li>
+<li class="toctree-l1"><a class="reference internal" href="dispose.html">Dispose</a></li>
+<li class="toctree-l1"><a class="reference internal" href="enumentry.html">EnumEntry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="enumeration.html">Enumeration</a></li>
+<li class="toctree-l1"><a class="reference internal" href="float.html">Float</a></li>
+<li class="toctree-l1"><a class="reference internal" href="image.html">Image</a></li>
+<li class="toctree-l1"><a class="reference internal" href="integer.html">Integer</a></li>
+<li class="toctree-l1"><a class="reference internal" href="interfaceinfo.html">InterfaceInfo</a></li>
+<li class="toctree-l1"><a class="reference internal" href="node.html">Node</a></li>
+<li class="toctree-l1"><a class="reference internal" href="nodemap.html">NodeMap</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Polarization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="register.html">Register</a></li>
+<li class="toctree-l1"><a class="reference internal" href="selector.html">Selector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="string.html">String</a></li>
+<li class="toctree-l1"><a class="reference internal" href="system.html">System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="value.html">Value</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+  
+  <div id="rtd-footer-container"></div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+
+
+<nav aria-label="Breadcrumb">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    
+    <li class="breadcrumb-item"><a href="../api_reference.html" class="nav-link">API Reference</a></li>
+    
+    <li class="breadcrumb-item active" aria-current="page">Polarization</li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="polarization">
+<h1>Polarization<a class="headerlink" href="#polarization" title="Link to this heading">#</a></h1>
+<dl class="py function">
+<dt class="sig sig-object py" id="itala.itala.extract_polar_component">
+<span class="sig-prename descclassname"><span class="pre">itala.itala.</span></span><span class="sig-name descname"><span class="pre">extract_polar_component</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">image</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">component</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">algorithm</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#itala.itala.extract_polar_component" title="Link to this definition">#</a></dt>
+<dd><p>Extract a specific component (or angle) of the polarizer filter. The resulting image
+represents the captured light at the angle specified in degrees.</p>
+<p>Notes: Only monochrome images are supported.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>image</strong> (<a class="reference internal" href="image.html#itala.itala.IImage" title="itala.itala.IImage"><code class="xref py py-class docutils literal notranslate"><span class="pre">IImage</span></code></a>) – Raw image, acquired using a monochrome polarization filter array.</p></li>
+<li><p><strong>component</strong> (<em>int</em>) – Component of the polarizer sensor.</p></li>
+<li><p><strong>algorithm</strong> (<em>int</em>) – Demosaicing algorithm to be applied to the image.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="image.html#itala.itala.IImage" title="itala.itala.IImage"><code class="xref py py-class docutils literal notranslate"><span class="pre">IImage</span></code></a></p>
+</dd>
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Pointer to the image containing the requested polar component.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="itala.itala.extract_all_polar_components">
+<span class="sig-prename descclassname"><span class="pre">itala.itala.</span></span><span class="sig-name descname"><span class="pre">extract_all_polar_components</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">image</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">algorithm</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#itala.itala.extract_all_polar_components" title="Link to this definition">#</a></dt>
+<dd><p>Extract an image for each component (or angle) of the polarizer filter. Each resulting
+image represents the captured light at 0, 45, 90 and 135 degrees respectively.</p>
+<p>Notes: Only monochrome images are supported.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>image</strong> (<a class="reference internal" href="image.html#itala.itala.IImage" title="itala.itala.IImage"><code class="xref py py-class docutils literal notranslate"><span class="pre">IImage</span></code></a>) – Raw image, acquired using a monochrome polarization filter array.</p></li>
+<li><p><strong>algorithm</strong> (<em>int</em>) – Demosaicing algorithm to be applied to the image.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#itala.itala.PolarComponents" title="itala.itala.PolarComponents"><code class="xref py py-class docutils literal notranslate"><span class="pre">PolarComponents</span></code></a></p>
+</dd>
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Structure containing the pointers to the polar component images.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="itala.itala.extract_all_polar_components_color">
+<span class="sig-prename descclassname"><span class="pre">itala.itala.</span></span><span class="sig-name descname"><span class="pre">extract_all_polar_components_color</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">image</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">algorithm</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#itala.itala.extract_all_polar_components_color" title="Link to this definition">#</a></dt>
+<dd><p>For each color channel, extract an image for each component (or angle) of the polarizer
+filter. Each resulting image represents the captured light at 0, 45, 90 and
+135 degrees respectively, for each color channel.</p>
+<p>Notes: Only bayer color images are supported.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>image</strong> (<a class="reference internal" href="image.html#itala.itala.IImage" title="itala.itala.IImage"><code class="xref py py-class docutils literal notranslate"><span class="pre">IImage</span></code></a>) – Raw image, acquired using a color polarization filter array.</p></li>
+<li><p><strong>algorithm</strong> (<em>int</em>) – Demosaicing algorithm to be applied to the image.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#itala.itala.PolarComponentsColor" title="itala.itala.PolarComponentsColor"><code class="xref py py-class docutils literal notranslate"><span class="pre">PolarComponentsColor</span></code></a></p>
+</dd>
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Structure containing the pointers to the polar component images, for each color channel.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="itala.itala.compute_stokes_s0">
+<span class="sig-prename descclassname"><span class="pre">itala.itala.</span></span><span class="sig-name descname"><span class="pre">compute_stokes_s0</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">polarComponents</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#itala.itala.compute_stokes_s0" title="Link to this definition">#</a></dt>
+<dd><p>Computes only the S0 component of the Stokes vectors from the extracted polar components.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>polarComponents</strong> (<a class="reference internal" href="#itala.itala.PolarComponents" title="itala.itala.PolarComponents"><code class="xref py py-class docutils literal notranslate"><span class="pre">PolarComponents</span></code></a>) – Polarization components demosaiced from the raw image.</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="image.html#itala.itala.IImage" title="itala.itala.IImage"><code class="xref py py-class docutils literal notranslate"><span class="pre">IImage</span></code></a></p>
+</dd>
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Pointer to the image containing the requested stokes vectors.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="itala.itala.compute_stokes_s1">
+<span class="sig-prename descclassname"><span class="pre">itala.itala.</span></span><span class="sig-name descname"><span class="pre">compute_stokes_s1</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">polarComponents</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#itala.itala.compute_stokes_s1" title="Link to this definition">#</a></dt>
+<dd><p>Computes only the S1 component of the Stokes vectors from the extracted polar components.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>polarComponents</strong> (<a class="reference internal" href="#itala.itala.PolarComponents" title="itala.itala.PolarComponents"><code class="xref py py-class docutils literal notranslate"><span class="pre">PolarComponents</span></code></a>) – Polarization components demosaiced from the raw image.</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="image.html#itala.itala.IImage" title="itala.itala.IImage"><code class="xref py py-class docutils literal notranslate"><span class="pre">IImage</span></code></a></p>
+</dd>
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Pointer to the image containing the requested stokes vectors.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="itala.itala.compute_stokes_s2">
+<span class="sig-prename descclassname"><span class="pre">itala.itala.</span></span><span class="sig-name descname"><span class="pre">compute_stokes_s2</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">polarComponents</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#itala.itala.compute_stokes_s2" title="Link to this definition">#</a></dt>
+<dd><p>Computes only the S2 component of the Stokes vectors from the extracted polar components.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>polarComponents</strong> (<a class="reference internal" href="#itala.itala.PolarComponents" title="itala.itala.PolarComponents"><code class="xref py py-class docutils literal notranslate"><span class="pre">PolarComponents</span></code></a>) – Polarization components demosaiced from the raw image.</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="image.html#itala.itala.IImage" title="itala.itala.IImage"><code class="xref py py-class docutils literal notranslate"><span class="pre">IImage</span></code></a></p>
+</dd>
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Pointer to the image containing the requested stokes vectors.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="itala.itala.compute_all_stokes">
+<span class="sig-prename descclassname"><span class="pre">itala.itala.</span></span><span class="sig-name descname"><span class="pre">compute_all_stokes</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">polarComponents</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#itala.itala.compute_all_stokes" title="Link to this definition">#</a></dt>
+<dd><p>Compute all the Stokes vectors to determine the polarization state of the light given the
+extracted components. The Stokes vector components are expressed as 32-bit or 64-bit floating
+point numbers depending on the raw image format.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>polarComponents</strong> (<a class="reference internal" href="#itala.itala.PolarComponents" title="itala.itala.PolarComponents"><code class="xref py py-class docutils literal notranslate"><span class="pre">PolarComponents</span></code></a>) – Polarization components demosaiced from the raw image.</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#itala.itala.StokesVectors" title="itala.itala.StokesVectors"><code class="xref py py-class docutils literal notranslate"><span class="pre">StokesVectors</span></code></a></p>
+</dd>
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Structure containing the pointers to the stokes vector images.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="itala.itala.compute_ao_lp">
+<span class="sig-prename descclassname"><span class="pre">itala.itala.</span></span><span class="sig-name descname"><span class="pre">compute_ao_lp</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#itala.itala.compute_ao_lp" title="Link to this definition">#</a></dt>
+<dd><p><em>Overload 1:</em></p>
+<p>Compute the AoLP (Angle of Linear Polarization) image from the Stokes vectors.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>stokesVectors</strong> (<a class="reference internal" href="#itala.itala.StokesVectors" title="itala.itala.StokesVectors"><code class="xref py py-class docutils literal notranslate"><span class="pre">StokesVectors</span></code></a>) – Stokes vectors computed from the polarization components.</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="image.html#itala.itala.IImage" title="itala.itala.IImage"><code class="xref py py-class docutils literal notranslate"><span class="pre">IImage</span></code></a></p>
+</dd>
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Pointer to the AoLP image.</p>
+</dd>
+</dl>
+<div class="line-block">
+<div class="line"><br /></div>
+</div>
+<p><em>Overload 2:</em></p>
+<p>Convenience function which computes the AoLP (Angle of Linear Polarization) image directly
+from the raw polarization image without manual intermediate steps.</p>
+<p>Notes: Only monochrome images are supported.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>image</strong> (<a class="reference internal" href="image.html#itala.itala.IImage" title="itala.itala.IImage"><code class="xref py py-class docutils literal notranslate"><span class="pre">IImage</span></code></a>) – Raw polarization image.</p></li>
+<li><p><strong>algorithm</strong> (<em>int</em>) – Demosaicing algorithm to be applied to the image.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="image.html#itala.itala.IImage" title="itala.itala.IImage"><code class="xref py py-class docutils literal notranslate"><span class="pre">IImage</span></code></a></p>
+</dd>
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Pointer to AoLP image.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="itala.itala.compute_do_lp">
+<span class="sig-prename descclassname"><span class="pre">itala.itala.</span></span><span class="sig-name descname"><span class="pre">compute_do_lp</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#itala.itala.compute_do_lp" title="Link to this definition">#</a></dt>
+<dd><p><em>Overload 1:</em></p>
+<p>Compute the DoLP (Degree of Linear Polarization) image from the Stokes vectors.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>stokesVectors</strong> (<a class="reference internal" href="#itala.itala.StokesVectors" title="itala.itala.StokesVectors"><code class="xref py py-class docutils literal notranslate"><span class="pre">StokesVectors</span></code></a>) – Stokes vectors computed from the polarization components.</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="image.html#itala.itala.IImage" title="itala.itala.IImage"><code class="xref py py-class docutils literal notranslate"><span class="pre">IImage</span></code></a></p>
+</dd>
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Pointer to the DoLP image.</p>
+</dd>
+</dl>
+<div class="line-block">
+<div class="line"><br /></div>
+</div>
+<p><em>Overload 2:</em></p>
+<p>Convenience function which computes the DoLP (Degree of Linear Polarization) image
+directly from the raw polarization image without manual intermediate steps.</p>
+<p>Notes: Only monochrome images are supported.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>image</strong> (<a class="reference internal" href="image.html#itala.itala.IImage" title="itala.itala.IImage"><code class="xref py py-class docutils literal notranslate"><span class="pre">IImage</span></code></a>) – Raw polarization image.</p></li>
+<li><p><strong>algorithm</strong> (<em>int</em>) – Demosaicing algorithm to be applied to the image.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="image.html#itala.itala.IImage" title="itala.itala.IImage"><code class="xref py py-class docutils literal notranslate"><span class="pre">IImage</span></code></a></p>
+</dd>
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Pointer to DoLP image.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="itala.itala.compute_intensity">
+<span class="sig-prename descclassname"><span class="pre">itala.itala.</span></span><span class="sig-name descname"><span class="pre">compute_intensity</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#itala.itala.compute_intensity" title="Link to this definition">#</a></dt>
+<dd><p><em>Overload 1:</em></p>
+<p>Compute the intensity image from the Stokes vectors.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>stokesVectors</strong> (<a class="reference internal" href="#itala.itala.StokesVectors" title="itala.itala.StokesVectors"><code class="xref py py-class docutils literal notranslate"><span class="pre">StokesVectors</span></code></a>) – Stokes vectors computed from the polarization components.</p></li>
+<li><p><strong>rawImagePixelFormat</strong> (<em>int</em>) – The format of the raw polarization image.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="image.html#itala.itala.IImage" title="itala.itala.IImage"><code class="xref py py-class docutils literal notranslate"><span class="pre">IImage</span></code></a></p>
+</dd>
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Pointer to intensity image.</p>
+</dd>
+</dl>
+<div class="line-block">
+<div class="line"><br /></div>
+</div>
+<p><em>Overload 2:</em></p>
+<p>Convenience function which computes the intensity image directly from the raw polarization
+image without manual intermediate steps.</p>
+<p>Notes: Only monochrome images are supported.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>image</strong> (<a class="reference internal" href="image.html#itala.itala.IImage" title="itala.itala.IImage"><code class="xref py py-class docutils literal notranslate"><span class="pre">IImage</span></code></a>) – Raw polarization image.</p></li>
+<li><p><strong>algorithm</strong> (<em>int</em>) – Demosaicing algorithm to be applied to the image.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="image.html#itala.itala.IImage" title="itala.itala.IImage"><code class="xref py py-class docutils literal notranslate"><span class="pre">IImage</span></code></a></p>
+</dd>
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Pointer to intensity image.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="itala.itala.compute_polar_quadrants_image">
+<span class="sig-prename descclassname"><span class="pre">itala.itala.</span></span><span class="sig-name descname"><span class="pre">compute_polar_quadrants_image</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">image</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#itala.itala.compute_polar_quadrants_image" title="Link to this definition">#</a></dt>
+<dd><p>Computes an image split in quadrants containing the four extracted polarization
+components (angles), of the same width and height of the raw polarization image.</p>
+<p>Notes: Only monochrome images are supported.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>image</strong> (<a class="reference internal" href="image.html#itala.itala.IImage" title="itala.itala.IImage"><code class="xref py py-class docutils literal notranslate"><span class="pre">IImage</span></code></a>) – Raw polarization image.</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="image.html#itala.itala.IImage" title="itala.itala.IImage"><code class="xref py py-class docutils literal notranslate"><span class="pre">IImage</span></code></a></p>
+</dd>
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Pointer to quadrants image.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="itala.itala.PolarComponents">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">itala.itala.</span></span><span class="sig-name descname"><span class="pre">PolarComponents</span></span><a class="headerlink" href="#itala.itala.PolarComponents" title="Link to this definition">#</a></dt>
+<dd><p>Convenient POD structure used as container for ‘ExtractAllPolarComponents’ ‘s
+multi-result.</p>
+<dl class="py property">
+<dt class="sig sig-object py" id="itala.itala.PolarComponents.thisown">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">thisown</span></span><a class="headerlink" href="#itala.itala.PolarComponents.thisown" title="Link to this definition">#</a></dt>
+<dd><p>The membership flag</p>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="itala.itala.PolarComponents.P0">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">P0</span></span><a class="headerlink" href="#itala.itala.PolarComponents.P0" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="itala.itala.PolarComponents.P45">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">P45</span></span><a class="headerlink" href="#itala.itala.PolarComponents.P45" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="itala.itala.PolarComponents.P90">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">P90</span></span><a class="headerlink" href="#itala.itala.PolarComponents.P90" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="itala.itala.PolarComponents.P135">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">P135</span></span><a class="headerlink" href="#itala.itala.PolarComponents.P135" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="itala.itala.PolarComponentsColor">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">itala.itala.</span></span><span class="sig-name descname"><span class="pre">PolarComponentsColor</span></span><a class="headerlink" href="#itala.itala.PolarComponentsColor" title="Link to this definition">#</a></dt>
+<dd><p>Convenient POD structure used as container for ‘ExtractAllPolarComponentsColor’ ‘s
+multi-result.</p>
+<dl class="py property">
+<dt class="sig sig-object py" id="itala.itala.PolarComponentsColor.thisown">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">thisown</span></span><a class="headerlink" href="#itala.itala.PolarComponentsColor.thisown" title="Link to this definition">#</a></dt>
+<dd><p>The membership flag</p>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="itala.itala.PolarComponentsColor.RedComponents">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">RedComponents</span></span><a class="headerlink" href="#itala.itala.PolarComponentsColor.RedComponents" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="itala.itala.PolarComponentsColor.GreenComponents">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">GreenComponents</span></span><a class="headerlink" href="#itala.itala.PolarComponentsColor.GreenComponents" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="itala.itala.PolarComponentsColor.BlueComponents">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">BlueComponents</span></span><a class="headerlink" href="#itala.itala.PolarComponentsColor.BlueComponents" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="itala.itala.StokesVectors">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">itala.itala.</span></span><span class="sig-name descname"><span class="pre">StokesVectors</span></span><a class="headerlink" href="#itala.itala.StokesVectors" title="Link to this definition">#</a></dt>
+<dd><p>Convenient POD structure used as container for ‘ComputeAllStokes’ ‘s
+multi-result.</p>
+<dl class="py property">
+<dt class="sig sig-object py" id="itala.itala.StokesVectors.thisown">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">thisown</span></span><a class="headerlink" href="#itala.itala.StokesVectors.thisown" title="Link to this definition">#</a></dt>
+<dd><p>The membership flag</p>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="itala.itala.StokesVectors.S0">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">S0</span></span><a class="headerlink" href="#itala.itala.StokesVectors.S0" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="itala.itala.StokesVectors.S1">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">S1</span></span><a class="headerlink" href="#itala.itala.StokesVectors.S1" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="itala.itala.StokesVectors.S2">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">S2</span></span><a class="headerlink" href="#itala.itala.StokesVectors.S2" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="nodemap.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">NodeMap</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="register.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Register</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <div class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.extract_polar_component"><code class="docutils literal notranslate"><span class="pre">extract_polar_component()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.extract_all_polar_components"><code class="docutils literal notranslate"><span class="pre">extract_all_polar_components()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.extract_all_polar_components_color"><code class="docutils literal notranslate"><span class="pre">extract_all_polar_components_color()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.compute_stokes_s0"><code class="docutils literal notranslate"><span class="pre">compute_stokes_s0()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.compute_stokes_s1"><code class="docutils literal notranslate"><span class="pre">compute_stokes_s1()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.compute_stokes_s2"><code class="docutils literal notranslate"><span class="pre">compute_stokes_s2()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.compute_all_stokes"><code class="docutils literal notranslate"><span class="pre">compute_all_stokes()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.compute_ao_lp"><code class="docutils literal notranslate"><span class="pre">compute_ao_lp()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.compute_do_lp"><code class="docutils literal notranslate"><span class="pre">compute_do_lp()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.compute_intensity"><code class="docutils literal notranslate"><span class="pre">compute_intensity()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.compute_polar_quadrants_image"><code class="docutils literal notranslate"><span class="pre">compute_polar_quadrants_image()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.PolarComponents"><code class="docutils literal notranslate"><span class="pre">PolarComponents</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.PolarComponents.thisown"><code class="docutils literal notranslate"><span class="pre">PolarComponents.thisown</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.PolarComponents.P0"><code class="docutils literal notranslate"><span class="pre">PolarComponents.P0</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.PolarComponents.P45"><code class="docutils literal notranslate"><span class="pre">PolarComponents.P45</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.PolarComponents.P90"><code class="docutils literal notranslate"><span class="pre">PolarComponents.P90</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.PolarComponents.P135"><code class="docutils literal notranslate"><span class="pre">PolarComponents.P135</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.PolarComponentsColor"><code class="docutils literal notranslate"><span class="pre">PolarComponentsColor</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.PolarComponentsColor.thisown"><code class="docutils literal notranslate"><span class="pre">PolarComponentsColor.thisown</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.PolarComponentsColor.RedComponents"><code class="docutils literal notranslate"><span class="pre">PolarComponentsColor.RedComponents</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.PolarComponentsColor.GreenComponents"><code class="docutils literal notranslate"><span class="pre">PolarComponentsColor.GreenComponents</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.PolarComponentsColor.BlueComponents"><code class="docutils literal notranslate"><span class="pre">PolarComponentsColor.BlueComponents</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.StokesVectors"><code class="docutils literal notranslate"><span class="pre">StokesVectors</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.StokesVectors.thisown"><code class="docutils literal notranslate"><span class="pre">StokesVectors.thisown</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.StokesVectors.S0"><code class="docutils literal notranslate"><span class="pre">StokesVectors.S0</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.StokesVectors.S1"><code class="docutils literal notranslate"><span class="pre">StokesVectors.S1</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#itala.itala.StokesVectors.S2"><code class="docutils literal notranslate"><span class="pre">StokesVectors.S2</span></code></a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script src="../../_static/scripts/bootstrap.js?digest=8d27b9dea8ad943066ae"></script>
+<script src="../../_static/scripts/pydata-sphinx-theme.js?digest=8d27b9dea8ad943066ae"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+
+  <p class="copyright">
+    
+      © Copyright 2023, Opto Engineering.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+
+  <p class="sphinx-version">
+    Created using <a href="https://www.sphinx-doc.org/">Sphinx</a> 7.2.6.
+    <br/>
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+    <div class="footer-items__end">
+      
+        <div class="footer-item">
+<p class="theme-version">
+  Built with the <a href="https://pydata-sphinx-theme.readthedocs.io/en/stable/index.html">PyData Sphinx Theme</a> 0.15.2.
+</p></div>
+      
+    </div>
+  
+</div>
+
+  </footer>
+  </body>
+</html>

@@ -1,0 +1,36 @@
+#### CONFIG FILE ####
+## INPUT PARAMETERS FOR THE PIPELINE ##
+
+## Step 1: Image quality check ##
+
+# folder with monitoriqng images
+input_folder: 
+
+# batch size for processing
+batch_size: 1000
+
+# folder to save results
+output_folder: 
+
+## Step 2: Batch segmentation ##
+
+# fraction used when computing median background for background correction
+fraction: 0.1
+
+# specify minimum area for blob filtering
+min_area: 8000 
+# specify margin around detected blobs
+margin: 50 
+
+# Saving intentions
+save_crop: true
+# example step by step process / batch 
+num_examples_per_batch: 3
+# save example outputs
+save_box: true
+save_steps: true
+
+## Step 3: Presorting and LabelChecker conversion ##
+
+# convert to LC format
+convert_to_lc: true
