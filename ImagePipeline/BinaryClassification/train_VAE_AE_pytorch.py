@@ -60,7 +60,7 @@ DEBUG = False
 N_DEBUG = 5000
 EPOCHS_DEBUG = 10
 
-monitoring_effort = "Kristineberg_251128"  # for titles and saved model names, e.g. "kristineberg_251128" or "skagerrak_220915"
+monitoring_effort = "Kristineberg_250915"  # for titles and saved model names, e.g. "kristineberg_251128" or "skagerrak_220915"
 grid_size = 32  # number of tiles along one side (e.g. 6 means 6x6=36 tiles per image)
 
 # model hyperparameters
@@ -68,8 +68,8 @@ image_size = 128
 latent_dims = 6
 hidden_channels = 32
 
-train_tiles_path = os.path.join(ROOT_DIR_C, monitoring_effort, "tiles" + str(grid_size), "no_obs")
-train_og_images_path = os.path.join(ROOT_DIR_C, monitoring_effort, "OG_images", "no_obs")
+train_tiles_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train", f"tiles{grid_size}")
+train_og_images_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train", "OG_images")
 
 print(f"train_tiles_path: {train_tiles_path}")
 print(f"train_og_images_path: {train_og_images_path}")
@@ -78,6 +78,7 @@ print(f"train_og_images_path: {train_og_images_path}")
 images_train = sorted(Path(train_og_images_path).rglob("*.png"))
 
 print(f"Total training images with tiles found: {len(images_train)}")
+print(f"total training tiles found: {len(list(Path(train_tiles_path).rglob('*.png')))}")
 
 model_name = "models/vae_model_" + str(monitoring_effort) + "_" + str(grid_size) + "_l" + str(latent_dims) + ".pth"
 if DEBUG:
@@ -510,3 +511,5 @@ plt.show()
 #%% Model summary
 
 print(f"Bby you are done stop running cells and relax a lil")
+
+# %%

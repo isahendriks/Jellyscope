@@ -13,7 +13,7 @@ import pandas as pd
 from scipy.stats import chi2
 from sklearn.model_selection import train_test_split
 
-from sklearn.svm import SVC
+from sklearn.svm import OneClassSVM
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 
@@ -73,7 +73,7 @@ grid_size = 32  # number of tiles along one side (e.g. 6 means 6x6=36 tiles per 
 latent_dim = 6
 batch_size = 64
 
-model_name = f"models/vae_model{grid_size}_l{latent_dim}.pth"
+model_name = f"models/{monitoring_effort}_vae_model{grid_size}_l{latent_dim}.pth"
 if DEBUG:
     model_name = model_name.replace(".pth", "_debug.pth")
 print(f"Model to load: {model_name}")
@@ -239,7 +239,9 @@ recon_errors = torch.cat(recon_errors, dim=0).numpy()
 
 # Create dataframe with image names, tile numbers, and latent representations
 latent_cols = [f"latent_{i}" for i in range(mu_array.shape[1])]
-svm_feature_cols = latent_cols + ["recon_error"]
+# scale latent space for svm training
+  # Use all latent dimensions as features for SVM
+
 df_latent = pd.DataFrame(mu_array, columns=latent_cols)
 df_latent.insert(0, "label_manual", tile_labels)  # Add manual labels (True for obs, False for no_obs)
 df_latent.insert(1, "tile_row", tile_rows)
@@ -263,48 +265,84 @@ else:
 print(f"Class distribution in test set: obs={len(df_latent[df_latent['label_manual']==True])}, no_obs={len(df_latent[df_latent['label_manual']==False])}")
 
 #%% Split dataset into one for training the SVM and one for evaluating the SVM performance (e.g. plotting confusion matrix, ROC curve, and visualizing false positives/negatives)
+# Hyperparameter search space (small grid)
+weight_grid =[0.1, 0.5, 1, 2, 3, 4, 6, 8, 10, 12, 15]  # Weights to apply to the reconstruction error feature before training the SVM
+nu_grid = [0.1, 0.2, 0.3, 0.4, 0.5]  # Nu values to try for the One-Class SVM (controls the fraction of outliers allowed in the training data)
+
+# Fallback defaults (used only if search is skipped/empty)
+svm_feature_cols_names = [f"latent_{i}" for i in range(mu_array.shape[1])] + ["recon_error"]  # Column names for SVM features
 df_svm_train, df_svm_eval = train_test_split(df_latent, test_size=0.5, stratify=df_latent['label_manual'], random_state=42)
 
-labels_train = df_svm_train['label_manual'].values
-latent_cols_train = df_svm_train[svm_feature_cols].values
+# Scale on train split only (avoid data leakage), then apply reconstruction-error weight
+scaler = StandardScaler()
+X_train_base = scaler.fit_transform(df_svm_train[svm_feature_cols_names].values)
+X_eval_base = scaler.transform(df_svm_eval[svm_feature_cols_names].values)
+recon_col_idx = len(svm_feature_cols_names) - 1
+y_true = df_svm_eval['label_manual'].values
+train_no_obs_mask = (df_svm_train['label_manual'].values == False)
 
-svm = svm = make_pipeline(
-    StandardScaler(),
-    SVC(kernel='rbf', probability=True, random_state=42, class_weight="balanced"),
-)
-# SVC(kernel='rbf', probability=True, random_state=42)
-svm.fit(latent_cols_train, labels_train)
+# Small grid search for best (weight_recon_error, nu)
+search_results = []
+for w in weight_grid:
+    for nu_val in nu_grid:
+        print(f"\nTesting weight_recon_error={w}, nu={nu_val}...", end="")
+        X_train_try = X_train_base.copy()
+        X_eval_try = X_eval_base.copy()
+        X_train_try[:, recon_col_idx] *= w
+        X_eval_try[:, recon_col_idx] *= w
+
+        model_try = OneClassSVM(kernel='rbf', gamma='scale', nu=nu_val)
+        model_try.fit(X_train_try[train_no_obs_mask])
+
+        y_scores_try = -model_try.decision_function(X_eval_try)
+        fpr_try, tpr_try, _ = roc_curve(y_true, y_scores_try)
+        auc_try = auc(fpr_try, tpr_try)
+        optimal_idx = np.argmax(tpr_try - fpr_try)  # Youden's J statistic to find optimal threshold
+        fnr_try = 1 - tpr_try
+        fnr = fnr_try[optimal_idx]
+        fpr = fpr_try[optimal_idx]
+        search_results.append({"weight": w, "nu": nu_val, "auc": auc_try, "fnr": fnr, "fpr": fpr})
+        print(f"Testing weight_recon_error={w}, nu={nu_val}... done! AUC={auc_try:.4f}, FNR={fnr:.4f}, FPR={fpr:.4f}", end="\r")
+        
+       
+search_df = pd.DataFrame(search_results).sort_values("auc", ascending=False).reset_index(drop=True)
+best_row = search_df.iloc[0]
+weight_recon_error = float(best_row["weight"])
+nu = float(best_row["nu"])
+
+print("\nTop hyperparameter combos (by ROC-AUC):")
+print(search_df.head(10))
+print(f"\nSelected -> weight_recon_error={weight_recon_error}, nu={nu}, AUC={best_row['auc']:.4f}")
+
+# Build final weighted features with best params
+X_train = X_train_base.copy()
+X_eval = X_eval_base.copy()
+X_train[:, recon_col_idx] *= weight_recon_error
+X_eval[:, recon_col_idx] *= weight_recon_error
+
+# Train SVM on the latent space representations
+labels_train = df_svm_train['label_manual'].values
+latent_cols_train = df_svm_train[latent_cols].values
+
+### train SVM on empty class for anomaly detection
+latent_cols_train_no_obs = X_train[train_no_obs_mask]
+n_empty = latent_cols_train_no_obs.shape[0]
+
+# Define one-class SVM with RBF kernel and gamma='scale' (default) which uses 1/n_features as gamma value, and nu=0.05 to allow for some outliers in the training data
+svm = OneClassSVM(kernel='rbf', gamma='scale', nu=nu) 
+# Train only on no_obs class (inliers)
+svm.fit(latent_cols_train_no_obs)
 
 # Add predicted labels to the evaluation dataframe
-df_svm_eval['label_predicted'] = svm.predict(df_svm_eval[svm_feature_cols].values)
-
-# Save the SVM model for later use
-svm_model_name = model_name.replace("vae_model", "svm_model").replace(".pth", ".pkl")
-with open(svm_model_name, "wb") as f:
-    pkl.dump(svm, f)
-
+svm_pred = svm.predict(X_eval)  # +1=inlier(no_obs), -1=outlier(obs)
+df_svm_eval['label_predicted'] = (svm_pred == -1)
 
 ### plot ROC curve
-# Get true labels
-y_true = df_svm_eval['label_manual'].values
-
-# Get predicted probabilities for the positive class (obs = True)
-pos_class_idx = int(np.where(svm.classes_ == True)[0][0])
-y_scores = svm.predict_proba(df_svm_eval[svm_feature_cols].values)[:, pos_class_idx]
+# OneClassSVM has no predict_proba; use anomaly score for obs likelihood
+y_scores = -svm.decision_function(X_eval)
 
 fpr, tpr, thresholds = roc_curve(y_true, y_scores) # Compute ROC curve
 roc_auc = auc(fpr, tpr) # Compute AUC
-
-# Plot ROC curve
-plt.figure(figsize=(6,6))
-plt.plot(fpr, tpr, label=f"AUC = {roc_auc:.3f}")
-plt.plot([0, 1], [0, 1], linestyle='--')  # random classifier line
-plt.xlabel("False Positive Rate")
-plt.ylabel("True Positive Rate")
-plt.title("ROC Curve for SVM on VAE Latent Space")
-plt.legend()
-plt.grid(alpha=0.3)
-plt.show()
 
 # set treshold based on ROC curve (e.g. Youden's J statistic)
 youden_j = tpr - fpr
@@ -312,19 +350,40 @@ optimal_idx = np.argmax(youden_j)
 optimal_threshold = thresholds[optimal_idx]
 print(f"Optimal threshold based on Youden's J statistic: {optimal_threshold:.3f}")
 
-# plot confusion matrix with the optimal threshold
+# predict test set labels based on optimal threshold
+df_svm_eval['label_predicted_SVM'] = (y_scores >= optimal_threshold)
+
+#%% Save the SVM model, scaler, recon-error weight and score threshold for later use
+svm_model_name = model_name.replace("vae_model", "svm_model").replace(".pth", ".pkl")
+with open(svm_model_name, "wb") as f:
+    pkl.dump((svm, scaler, weight_recon_error, optimal_threshold), f)
+print(f"\nSVM model trained and saved to: {svm_model_name}")
+
+# plot ROC curve
+plt.figure(figsize=(6,6))
+plt.plot(fpr, tpr, label=f"AUC = {roc_auc:.3f}")
+plt.plot([0, 1], [0, 1], linestyle='--')  # random classifier line
+plt.plot(fpr[optimal_idx], tpr[optimal_idx], marker='o', markersize=8, label=f"Optimal threshold = {optimal_threshold:.3f}", color='red')
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve for SVM on VAE Latent Space")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.show()
+
+# plot normalized confusion matrix with the optimal threshold
 y_pred_optimal = (y_scores >= optimal_threshold).astype(bool)
-cm = confusion_matrix(df_svm_eval['label_manual'], df_svm_eval['label_predicted'], labels=[False, True])
+cm = confusion_matrix(df_svm_eval['label_manual'], y_pred_optimal, labels=[False, True], normalize='true')
 disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["no_obs", "obs"])
 disp.plot(cmap=plt.cm.Blues)
-plt.title("Confusion Matrix for SVM on VAE Latent Space")
+plt.title("Confusion Matrix for One-Class SVM on VAE Latent Space")
 
 
 #%% Plot false positives/negatives
 # False positives: manual no_obs, predicted obs
-df_false_positives = df_svm_eval[(df_svm_eval['label_manual'] == False) & (df_svm_eval['label_predicted'] == True)]
+df_false_positives = df_svm_eval[(df_svm_eval['label_manual'] == False) & (df_svm_eval['label_predicted_SVM'] == True)]
 # False negatives: manual obs, predicted no_obs
-df_false_negatives = df_svm_eval[(df_svm_eval['label_manual'] == True) & (df_svm_eval['label_predicted'] == False)]
+df_false_negatives = df_svm_eval[(df_svm_eval['label_manual'] == True) & (df_svm_eval['label_predicted_SVM'] == False)]
 
 N_fp = len(df_false_positives)
 N_hor = 8

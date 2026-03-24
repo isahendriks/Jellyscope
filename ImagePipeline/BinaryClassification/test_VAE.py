@@ -48,14 +48,15 @@ print("="*40)
 print(f"Using device:      {device}")
 
 #%% Define paths and parameters
-ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data\Binary_classifier"
-# ROOT_DIR_C = r"C:\Users\Admin\Documents\Jellyscope\Training data\Binary_classifier"   
+# ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data\Binary_classifier"
+ROOT_DIR_C = r"C:\Users\Admin\Documents\Jellyscope\Training data\Binary_classifier"   
+monitoring_effort = "Kristineberg_250915"
 
-test_images_folder = os.path.join(ROOT_DIR_R, "test", "OG_images")
+test_images_folder = os.path.join(ROOT_DIR_C, monitoring_effort, "test", "OG_images")
 tile_grid_size = 32 # how many tiles along one side (e.g. 6 means 6x6=36 tiles per image)
 tile_size = 4512 // tile_grid_size # size of the tiles that the original image is split into
 latent_dim = 6 # how many tiles along one side 
-model_name = f"models/vae_model{tile_grid_size}_l{latent_dim}.pth"
+model_name = f"models/{monitoring_effort}_vae_model{tile_grid_size}_l{latent_dim}.pth"
 
 # Autoencoder parameters
 batch_size = 64
@@ -66,7 +67,11 @@ val_params_name = model_name.replace(".pth", "_params.pkl")
 val_params = pkl.load(open(val_params_name, "rb"))
 
 svm_model_name = model_name.replace("vae_model", "svm_model").replace(".pth", ".pkl")
-svm_model = pkl.load(open(svm_model_name, "rb"))
+svm_data = pkl.load(open(svm_model_name, "rb"))
+svm_model = svm_data[0]
+scaler = svm_data[1]
+weight_recon_error = svm_data[2]
+svm_score_threshold = svm_data[3] if len(svm_data) > 3 else None
 
 mu_g = val_params["mu_g"]
 cov_g = val_params["cov_g"]
@@ -76,7 +81,12 @@ threshold = val_params["threshold"]
 
 test_images_path = list(Path(test_images_folder).glob("*.png"))
 print(f"Found {len(test_images_path)} test images in: {test_images_folder}")
-print(f"loading model from: {model_name}")
+print(f"loading VAE model from: {model_name}")
+print(f"loading SVM model from: {svm_model_name}")
+if svm_score_threshold is None:
+    print("SVM score threshold not found in model file -> using raw OneClassSVM decision boundary (predict).")
+else:
+    print(f"Using saved SVM score threshold: {svm_score_threshold:.4f}")
 #%% Load model
 checkpoint = torch.load(model_name, map_location=device, weights_only=False)
 
@@ -134,6 +144,8 @@ print(f"Created tile dataloader for test images with batch size {batch_size} and
 mu_list = []
 image_names_list = []
 d2_list = []
+recon_list = []
+svm_scores_list = []
 label_list_d2 = []
 label_list_svm = []
 path_label_list = []
@@ -153,6 +165,11 @@ for batch in tile_loader:
     
     mu = mu.cpu().detach().numpy()
     
+    # reconstruction error per tile (mean squared error over pixels)
+    x_hat = model(tiles, row=rows, col=cols)
+    recon_err = ((tiles - x_hat) ** 2).flatten(1).mean(dim=1)
+    recon_list.append(recon_err.cpu().detach())  # Store the reconstructed tiles for later visualization
+    
     mu_list.append(mu)
     tile_rows.append(rows.cpu().numpy())
     tile_cols.append(cols.cpu().numpy())
@@ -170,14 +187,20 @@ for batch in tile_loader:
     label_list_d2.append(is_obs)
     
     # predict using SVM model
-    label_svm = svm_model.predict(mu)
-    label_list_svm.append(label_svm)
+    
+    svm_features = np.hstack([mu, recon_err.cpu().detach().numpy().reshape(-1, 1)])  # Combine latent features and reconstruction error for SVM
+    svm_features = scaler.transform(svm_features)  # Scale the features using the fitted scaler
+    svm_features[:, -1] *= weight_recon_error  # Apply weight to reconstruction error
+    svm_scores = -svm_model.decision_function(svm_features)
+    label_svm_is_obs = (svm_scores >= svm_score_threshold)
+
+    svm_scores_list.append(svm_scores)
+    label_list_svm.append(label_svm_is_obs)
     
     batch_counter += 1
     print(f"processed batch {batch_counter}/{len(tile_loader)} | obs={is_obs.sum()} empty = {(~is_obs).sum()}", end="\r")
 
 mu_array = np.concatenate(mu_list, axis=0)
-
 d2_array = np.concatenate(d2_list, axis=0)
 
 labels_array_d2 = np.concatenate(label_list_d2, axis=0)
@@ -185,6 +208,8 @@ labels_array_svm = np.concatenate(label_list_svm, axis=0)
 image_names_array = np.concatenate(image_names_list, axis=0)
 tile_rows_array = np.concatenate(tile_rows, axis=0)
 tile_cols_array = np.concatenate(tile_cols, axis=0)
+recon_array = torch.cat(recon_list, dim=0).cpu().numpy()
+svm_scores_array = np.concatenate(svm_scores_list, axis=0)
 # tile_array = np.concatenate(tile_list, axis=0)
 
 # Create dataframe with image names, tile numbers, and latent representations
@@ -193,14 +218,20 @@ df_latent = pd.DataFrame(mu_array, columns=latent_cols)
 df_latent.insert(0, "image_name", image_names_array)  # Add image names as the first column
 df_latent.insert(1, "tile_row", tile_rows_array)
 df_latent.insert(2, "tile_col", tile_cols_array)
-df_latent.insert(3, "label_predicted_d2", labels_array_d2)  # Add manual labels (True for obs, False for no_obs)
-df_latent.insert(4, "label_predicted_svm", labels_array_svm)  # Add SVM predicted labels
-df_latent.insert(5, "d2", d2_array)  # Add Mahalanobis distance values
-# df_latent['tile'] = tile_array
+df_latent.insert(3, "recon_error", recon_array)  # Add reconstruction error as a column
+df_latent.insert(4, "label_predicted_d2", labels_array_d2)  # Add manual labels (True for obs, False for no_obs)
+df_latent.insert(5, "label_predicted_svm", labels_array_svm)  # Add SVM predicted labels
+df_latent.insert(6, "d2", d2_array)  # Add Mahalanobis distance values
+df_latent.insert(7, "svm_scores", svm_scores_array)  # Add SVM scores
+
+# print class distribution for manual labels and predicted labels both methods
+print(f"Class distribution for d2 threshold method: {df_latent['label_predicted_d2'].value_counts()}")
+print(f"Class distribution for SVM method: {df_latent['label_predicted_svm'].value_counts()}")
+
 
 #%% chose method for predicted labels (d2 threshold vs SVM)
 # labels_predicted = df_latent["label_predicted_d2"].values
-labels_predicted = df_latent["label_predicted_svm"].values
+labels_predicted = df_latent["label_predicted_svm"].values.astype(bool)
 
 #%% PCA for visualization of latent space
 pca = PCA(n_components=2)
@@ -265,17 +296,19 @@ for image_name in image_names_unique:
 
 #%% Use heatmap to visualize the predicted obs tiles across the original image
 # Global color scale across all images
+observation_metric = "svm_scores"  # Choose which metric to visualize in the heatmap (e.g. "d2" or "svm_scores")
+treshold_heatmap = svm_score_threshold if observation_metric == "svm_scores" else threshold
 
-obs_likelihood_all = chi2.cdf(df_latent["d2"].values, df=2)  # higher d2 -> higher obs-likelihood
-likelihood_treshold = chi2.cdf(threshold*1.5, df=2)  # Convert d2 threshold to obs likelihood threshold for color scaling
+obs_likelihood_all = chi2.cdf(df_latent[observation_metric].values, df=2)  # higher d2 -> higher obs-likelihood
+likelihood_treshold = 0.9  # Convert threshold to obs likelihood threshold for color scaling
+
 cmap = mpl.colors.LinearSegmentedColormap.from_list("red_yellow_green", ["red", "yellow", "green"])
 norm = mpl.colors.TwoSlopeNorm(vmin=0.0, vcenter=likelihood_treshold, vmax=1.0) # for midpoint at threshold
 
-print(f"Mahalanobis distance threshold (d2): {threshold:.3f}")
 print(f"Observation likelihood threshold: {likelihood_treshold:.3f}")
 
 ### Loop through each unique image and plot the tiles with a heatmap 
-for i, image_name in enumerate(image_names_unique[3:4]):  # Show heatmap for the first image only
+for i, image_name in enumerate(image_names_unique):  # Show heatmap for the first image only
     df_latent_image = df_latent[df_latent["image_name"] == image_name]
 
     image_path = Path(test_images_folder) / f"{image_name}.png"
