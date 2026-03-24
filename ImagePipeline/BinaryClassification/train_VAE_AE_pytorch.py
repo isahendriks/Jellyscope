@@ -79,7 +79,7 @@ images_train = sorted(Path(train_og_images_path).rglob("*.png"))
 
 print(f"Total training images with tiles found: {len(images_train)}")
 
-model_name = "models/vae_model" + str(monitoring_effort) + "_" + str(grid_size) + "_l" + str(latent_dims) + ".pth"
+model_name = "models/vae_model_" + str(monitoring_effort) + "_" + str(grid_size) + "_l" + str(latent_dims) + ".pth"
 if DEBUG:
     model_name = model_name.replace(".pth", "_debug.pth")
 model_output_path = Path(model_name)

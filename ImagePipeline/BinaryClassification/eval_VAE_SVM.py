@@ -68,7 +68,7 @@ SAMPLE_IMAGE_IDX_TRAIN = 0  # Index of the sample image to plot process (0-based
 DEBUG = False
 n_debug = 0.2
 
-monitoring_effort = "Kristineberg_251128"  # Used in folder names to load data and save results, e.g. "Kristineberg_251128"
+monitoring_effort = "Kristineberg_250915"  # Used in folder names to load data and save results, e.g. "Kristineberg_251128"
 grid_size = 32  # number of tiles along one side (e.g. 6 means 6x6=36 tiles per image)
 latent_dim = 6
 batch_size = 64
@@ -83,6 +83,7 @@ test_og_images_path = os.path.join(ROOT_DIR_C, monitoring_effort, "test", "OG_im
 
 # images_train = list(Path(train_og_images_path).glob("*.png"))
 images_test = list(Path(test_og_images_path).glob("*.png"))
+print(len(images_test), "test images found in:", test_og_images_path)
 sample_image_path = Path(test_og_images_path) / images_test[SAMPLE_IMAGE_IDX_TEST].name
 sample_image = cv2.imread(sample_image_path, cv2.IMREAD_GRAYSCALE)
 
@@ -196,6 +197,7 @@ tile_labels = []
 tile_rows = []
 tile_cols = []
 tiles = []
+recon_errors = []
 
 with torch.no_grad():
     for test_loader in [test_loader_obs, test_loader_no_obs]:
@@ -207,6 +209,11 @@ with torch.no_grad():
             images = images.to(device)
             mu, _ = model.encode(images, row=rows, col=cols)  # forward pass with row/col info (currently not used in the model, but can be implemented later)
             mu_list.append(mu.cpu().detach())
+
+            # reconstruction error per tile (mean squared error over pixels)
+            x_hat = model(images, row=rows, col=cols)
+            recon_err = ((images - x_hat) ** 2).flatten(1).mean(dim=1)
+            recon_errors.append(recon_err.cpu().detach())
 
             # extract image name, tile row, and tile col from the batch paths
             tile_labels.append(labels.cpu().detach())
@@ -228,13 +235,16 @@ tile_labels = torch.cat(tile_labels, dim=0).numpy().astype(bool)
 tile_rows = torch.cat(tile_rows, dim=0).numpy()
 tile_cols = torch.cat(tile_cols, dim=0).numpy()
 tiles = np.concatenate(tiles, axis=0)
+recon_errors = torch.cat(recon_errors, dim=0).numpy()
 
 # Create dataframe with image names, tile numbers, and latent representations
 latent_cols = [f"latent_{i}" for i in range(mu_array.shape[1])]
+svm_feature_cols = latent_cols + ["recon_error"]
 df_latent = pd.DataFrame(mu_array, columns=latent_cols)
 df_latent.insert(0, "label_manual", tile_labels)  # Add manual labels (True for obs, False for no_obs)
 df_latent.insert(1, "tile_row", tile_rows)
 df_latent.insert(2, "tile_col", tile_cols)
+df_latent.insert(3, "recon_error", recon_errors)
 df_latent['tile'] = list(tiles)  # Add tile images for later visualization
 
 # Sanity check
@@ -256,28 +266,65 @@ print(f"Class distribution in test set: obs={len(df_latent[df_latent['label_manu
 df_svm_train, df_svm_eval = train_test_split(df_latent, test_size=0.5, stratify=df_latent['label_manual'], random_state=42)
 
 labels_train = df_svm_train['label_manual'].values
-latent_cols_train = df_svm_train[latent_cols].values
+latent_cols_train = df_svm_train[svm_feature_cols].values
 
-svm = SVC(kernel='rbf', probability=True, random_state=42)
+svm = svm = make_pipeline(
+    StandardScaler(),
+    SVC(kernel='rbf', probability=True, random_state=42, class_weight="balanced"),
+)
+# SVC(kernel='rbf', probability=True, random_state=42)
 svm.fit(latent_cols_train, labels_train)
 
 # Add predicted labels to the evaluation dataframe
-df_svm_eval['label_predicted'] = svm.predict(df_svm_eval[latent_cols].values)
+df_svm_eval['label_predicted'] = svm.predict(df_svm_eval[svm_feature_cols].values)
 
 # Save the SVM model for later use
 svm_model_name = model_name.replace("vae_model", "svm_model").replace(".pth", ".pkl")
 with open(svm_model_name, "wb") as f:
     pkl.dump(svm, f)
 
-# plot confusion matrix
-cm = confusion_matrix(df_svm_eval['label_manual'], df_svm_eval['label_predicted'])
-disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=svm.classes_)
+
+### plot ROC curve
+# Get true labels
+y_true = df_svm_eval['label_manual'].values
+
+# Get predicted probabilities for the positive class (obs = True)
+pos_class_idx = int(np.where(svm.classes_ == True)[0][0])
+y_scores = svm.predict_proba(df_svm_eval[svm_feature_cols].values)[:, pos_class_idx]
+
+fpr, tpr, thresholds = roc_curve(y_true, y_scores) # Compute ROC curve
+roc_auc = auc(fpr, tpr) # Compute AUC
+
+# Plot ROC curve
+plt.figure(figsize=(6,6))
+plt.plot(fpr, tpr, label=f"AUC = {roc_auc:.3f}")
+plt.plot([0, 1], [0, 1], linestyle='--')  # random classifier line
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve for SVM on VAE Latent Space")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.show()
+
+# set treshold based on ROC curve (e.g. Youden's J statistic)
+youden_j = tpr - fpr
+optimal_idx = np.argmax(youden_j)
+optimal_threshold = thresholds[optimal_idx]
+print(f"Optimal threshold based on Youden's J statistic: {optimal_threshold:.3f}")
+
+# plot confusion matrix with the optimal threshold
+y_pred_optimal = (y_scores >= optimal_threshold).astype(bool)
+cm = confusion_matrix(df_svm_eval['label_manual'], df_svm_eval['label_predicted'], labels=[False, True])
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["no_obs", "obs"])
 disp.plot(cmap=plt.cm.Blues)
 plt.title("Confusion Matrix for SVM on VAE Latent Space")
 
-#%% Plot false positives (manualy labeled as obs but classified as no_obs)
-df_false_positives = df_svm_eval[(df_svm_eval['label_manual'] == True) & (df_svm_eval['label_predicted'] == False)]
-df_false_negatives = df_svm_eval[(df_svm_eval['label_manual'] == False) & (df_svm_eval['label_predicted'] == True)]
+
+#%% Plot false positives/negatives
+# False positives: manual no_obs, predicted obs
+df_false_positives = df_svm_eval[(df_svm_eval['label_manual'] == False) & (df_svm_eval['label_predicted'] == True)]
+# False negatives: manual obs, predicted no_obs
+df_false_negatives = df_svm_eval[(df_svm_eval['label_manual'] == True) & (df_svm_eval['label_predicted'] == False)]
 
 N_fp = len(df_false_positives)
 N_hor = 8
@@ -304,7 +351,7 @@ plt.suptitle(title_str, fontsize=14, fontweight="bold")
 plt.tight_layout()
 plt.show()
 
-#%% Plot false negatives (manualy labeled as no_obs but classified as obs)
+#%% Plot false negatives (manualy labeled as obs but classified as no_obs)
 N_fn = len(df_false_negatives)
 N_hor = 8
 if N_fn > N_hor * 8:  # If more than 64 false negatives, limit to 64 for visualization
@@ -329,3 +376,4 @@ for idx, ax in enumerate(axs):
 plt.suptitle(title_str, fontsize=14, fontweight="bold")
 plt.tight_layout()
 plt.show()
+# %%
