@@ -13,77 +13,70 @@ print("=" * 60)
 #%% Define user parameters
 monitoring_effort = "Kristineberg_250915" #"Kristineberg_251128"
 
-ROOT_C = r"C:\Users\Admin\Documents\GitHub\Jellyscope\Training data"
-ROOT_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data"
+ROOT_C = r"C:\\Users\\Admin\\Documents\\Jellyscope"
+ROOT_R = r"R:\\LU24A1037-Jellyscope\\Jellyscope"
 
-folder_crops = f"{ROOT_R}\Class_classifier\Monitoring_training_data\Original"
-source_folder = f"{ROOT_R}\Monitoring data\{monitoring_effort}"
-output_folder = f"{ROOT_R}\Binary_classifier\{monitoring_effort}\test\cropped_images"
+folder_crops = f"{ROOT_R}\\Training data\\Class_classifier\\Monitoring_training_data\\Original_new"
+source_folder = f"{ROOT_R}\\Monitoring data\\{monitoring_effort}\\gain10_nobgsub"  # Folder containing the original images to match against (e.g., OG_images folder for the same monitoring effort)
+output_folder = f"{ROOT_R}\\Training data\\Binary_classifier\\{monitoring_effort}\\test\\OG_images"
 
+# subfolders_source = [f for f in Path(source_folder).iterdir() if f.is_dir()]  # List of subfolders in the source folder
+# subfolders_source_keep = ["gain10", "gain10_nobgsub"]  # List of subfolder names to keep (e.g., those containing the dates of interest)
+# subfolders_source = [f for f in subfolders_source if f.name in subfolders_source_keep]  # Limit to specified subfolders for testing
 
+monitoring_image_names = [img.stem for img in Path(source_folder).rglob('*.png')]  # List of image names (without extension) in the source folder
+subfolders = [f for f in Path(folder_crops).iterdir() if f.is_dir()]
 
 print("Configuration:")
 print(f"  Input folder: {folder_crops}")
 print(f"  Source folder: {source_folder}")
 print(f"  Output folder: {output_folder}")
-
-print(f"  Date(s):      {date}")
+print(f"  {len(subfolders)} subfolders in the input folder.")
+print(f"  {len(monitoring_image_names)} monitoring images.")
 
 #%% Find all subfolders in the input folder
-subfolders = [f for f in Path(folder_crops).iterdir() if f.is_dir()]
+df_matches = pd.DataFrame(columns=["image_path", "image_name", "species"])  # Initialize an empty DataFrame to store matches
 
-df_matches = pd.DataFrame(columns=["image_path", "date", "species"])  # Initialize an empty DataFrame to store matches
-
-print(f"Found {len(subfolders)} subfolders in the input folder.")
-
-for subfolder in subfolders:
-    # print(f"\nProcessing subfolder: {subfolder.name}")
+for subfolder in subfolders:  # Limit to first 2 subfolders for testing
+    print(f"\nProcessing subfolder: {subfolder.name}")
     
     # Find all images in the subfolder
-    images = list(subfolder.rglob('*.png'))  # Adjust the pattern if you want to filter specific image formats
-    # print(f"  Found {len(images)} images in this subfolder.")
+    crops = list(subfolder.rglob('*.png'))  # Adjust the pattern if you want to filter specific image formats
     
-    # Filter images by date using regex
-    date_pattern = "|".join(date.split(","))
-    matched_images = [img for img in images if re.search(date_pattern, img.stem)]  # Check if the date pattern matches the image name (excluding the last 14 characters)
-    img_name = [img.stem for img in matched_images]
+    print(f"  Found {len(crops)} crop images in subfolder: {subfolder.name}")
     
-    # Create a DataFrame to store matched image paths and their corresponding dates
-    entry = pd.DataFrame({
-        "image_path": matched_images,
-        "image_name": img_name,
-        "species": subfolder.name,
-    })
+    for crop in crops:
+        OG_image_name = crop.stem[:-11]  # Remove the last 15 characters to get the original image name
+        OG_image_path = Path(source_folder).joinpath(Path(OG_image_name + ".png"))
+        
+        # check if the original image exists in the source folder
+        if OG_image_name in monitoring_image_names:
+            print(f"  Found matching original image for crop: {crop.name}, OG image name: {OG_image_name}")
+            entry = pd.DataFrame({
+                "image_path": [OG_image_path],
+                "image_name": [OG_image_name],
+                "species": [subfolder.name],
+            })
+            df_matches = pd.concat([df_matches, entry], ignore_index=True)  # Append the entry to the matches DataFrame
+        else:
+            # print(f"Warning: Original image not found for crop: {crop}, expected OG image name: {OG_image_name}")
+            continue  # Skip to the next crop if the original image is not found
     
-    # Append the matched images to the main DataFrame
-    df_matches = pd.concat([df_matches, entry], ignore_index=True)
-    print(f" {subfolder.name}: {len(entry)} images matched the date(s).")
-
+    print(f"  Total matches found in subfolder {subfolder.name}: {len(df_matches)}")
+    
 print(f"\n Found a total of {len(df_matches)} images matching the date(s) across all subfolders.")
 
-#%%
-species_to_copy = df_matches["species"].unique()
-# species_to_drop = ['dentritus', 'filament', 'dentritus_glo', 'filament_glo', 'macro_filament']
-# species_to_copy = [species for species in species_to_copy if species not in species_to_drop]
-df_to_copy = df_matches[df_matches['species'].isin(species_to_copy)]
-print(f"\n Species to copy: {species_to_copy}, total number of iamages to copy: {len(df_to_copy)}")
+#%% Copy original images to the output folder, appending the species name to the image name to avoid overwriting images with the same name from different subfolders
 
-#%% Copy the images from source to output folder
-
-for _, row in df_to_copy[11].iterrows():  # Limit to first 10 images for testing
-    image_path = Path(row["image_path"])
-    image_name = image_path.stem
+for idx, row in df_matches.iterrows():
+    source_path = row["image_path"]
+    species_name = row["species"]
+    image_name = row["image_name"]
     
-    species = row["species"]
+    # Create a new image name by appending the species name to the original image name
+    new_image_name = f"{image_name}_{species_name}.png"
+    destination_path = Path(output_folder).joinpath(Path(new_image_name))
     
-    # Construct the source path based on the image path
-    source_path = image_path
-    output_path = Path(output_folder) / Path(str(image_name) + f"_{species}.png")  # Append species name to the output image name
-
-    print(f"Copying image: {source_path} to {output_path}")
-    
-    if source_path.exists():
-        output_path.parent.mkdir(parents=True, exist_ok=True)  # Create output folder if it doesn't exist
-        shutil.copy(source_path, output_path)  # Copy the file to the output folder
-    else:
-        print(f"Warning: Source image not found: {source_path}")
+    # Copy the original image to the output folder with the new name
+    shutil.copy(source_path, destination_path)
+    print(f"Copied img {idx+1}/{len(df_matches)}: {source_path.name} to {destination_path.name}", end="\r")

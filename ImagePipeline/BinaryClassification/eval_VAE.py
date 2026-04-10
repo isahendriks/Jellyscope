@@ -16,8 +16,6 @@ from sklearn.svm import SVC, OneClassSVM
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 
-
-
 import pickle as pkl
 from pathlib import Path
 import cv2
@@ -257,7 +255,7 @@ if len(df_latent[df_latent['label_manual']==True]) == len(test_tiles_obs) and le
 print(f"Class distribution: obs={len(df_latent[df_latent['label_manual']==True])}, no_obs={len(df_latent[df_latent['label_manual']==False])}")
 
 
-#%% Split data into train and eval for SVM and stratify empty tiles
+#%% Split data into train and eval for SVM 
 svm_feature_cols_names = [f"latent_{i}" for i in range(mu_array.shape[1])] + ["recon_error"]
 df_svm_train, df_svm_eval = train_test_split(df_latent, test_size=0.5, stratify=df_latent['label_manual'], random_state=42)
 
@@ -495,13 +493,24 @@ plt.grid(alpha=0.3)
 plt.show()
 
 
-#%% Save SVM model
-svm_model_name = model_name.replace("vae_model", "svm_model").replace(".pth", ".pkl")
+#%% Save SVM models
+
+### One class SVM
+svm_model_name = model_name.replace("vae_model", "oc_svm_model").replace(".pth", ".pkl")
 print(f"\nSaving SVM model to: {svm_model_name} with paramters:", end = "\n")
 print(f"weight_recon_error={weight_recon_error}, nu={nu}, threshold_svm={threshold_svm:.8f}")
 with open(svm_model_name, "wb") as f:
     pkl.dump((svm, scaler, weight_recon_error, nu, threshold_svm), f)
-print(f"\nSVM model trained and saved to: {svm_model_name}")
+print(f"\n One class SVM model trained and saved to: {svm_model_name}")
+
+### Binary SVM
+bsvm_model_name = model_name.replace("vae_model", "binary_svm_model").replace(".pth", ".pkl")
+print(f"\nSaving Binary SVM model to: {bsvm_model_name} with paramters:", end = "\n")
+print(f"threshold_bsvm={threshold_bsvm:.8f}")
+with open(bsvm_model_name, "wb") as f:
+    pkl.dump((model, scaler_bsvm, threshold_bsvm), f)
+print(f"\nBinary SVM model trained and saved to: {bsvm_model_name}")
+
 #%% Cell 10: Select model and plot false positives and false negatives
 # Choose which method to evaluate (uncomment one)
 USE_SVM = True  # Set to True for SVM, False for Mahalanobis

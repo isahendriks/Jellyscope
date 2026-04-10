@@ -71,7 +71,7 @@ mu_g = val_params["mu_g"]
 cov_g = val_params["cov_g"]
 threshold = val_params["threshold"]
 
-# Load SVM model and parameters
+# Load OneClass SVM model and parameters
 svm_model_name = model_name.replace("vae_model", "svm_model").replace(".pth", ".pkl")
 svm_data = pkl.load(open(svm_model_name, "rb"))
 svm_model = svm_data[0]
@@ -80,6 +80,18 @@ weight_recon_error = svm_data[2]
 nu = svm_data[3] if len(svm_data) > 3 else None
 svm_score_threshold_original = svm_data[4] if len(svm_data) > 4 else None  # Store original threshold
 svm_score_threshold = svm_score_threshold_original  # Use original by default
+
+# Load Binary SVM model and parameters
+binary_svm_model_name = model_name.replace("vae_model", "binary_svm_model").replace(".pth", ".pkl")
+try:
+    binary_svm_data = pkl.load(open(binary_svm_model_name, "rb"))
+    binary_svm_model = binary_svm_data[0]
+    binary_scaler = binary_svm_data[1]
+    binary_svm_threshold = binary_svm_data[2] if len(binary_svm_data) > 2 else 0.0
+    binary_svm_available = True
+except FileNotFoundError:
+    print(f"⚠ Binary SVM model not found at: {binary_svm_model_name}")
+    binary_svm_available = False
 
 # THRESHOLD ADJUSTMENT: Increase this value to reduce false positives (e.g., 1.2, 1.5, 2.0)
 # Higher multiplier = higher threshold = fewer obs predictions = fewer false positives
@@ -90,9 +102,12 @@ svm_score_threshold = svm_score_threshold_original  # Use original by default
 test_images_path = list(Path(test_images_folder).glob("*.png"))
 print(f"Found {len(test_images_path)} test images in: {test_images_folder}")
 print(f"loading VAE model from: {model_name}")
-print(f"loading SVM model from: {svm_model_name} with parameters:", end="\n")
+print(f"loading OneClass SVM model from: {svm_model_name} with parameters:", end="\n")
 print(f"weight_recon_error={weight_recon_error}, nu={nu}")
 print(f"Original threshold_svm={svm_data[4]:.8f}")
+if binary_svm_available:
+    print(f"loading Binary SVM model from: {binary_svm_model_name}")
+    print(f"Binary SVM threshold: {binary_svm_threshold:.8f}")
 
 
 #%% Load model
@@ -157,6 +172,8 @@ recon_list = []
 svm_scores_list = []
 label_list_d2 = []
 label_list_svm = []
+label_list_binary_svm = [] if binary_svm_available else None
+binary_svm_scores_list = [] if binary_svm_available else None
 path_label_list = []
 tile_rows = []
 tile_cols = []
@@ -195,7 +212,7 @@ for batch in tile_loader:
     d2_list.append(d2)
     label_list_d2.append(is_obs)
     
-    # predict using SVM model    
+    # predict using OneClass SVM model    
     svm_features = np.hstack([mu, recon_err.cpu().detach().numpy().reshape(-1, 1)])  # Combine latent features and reconstruction error for SVM
     svm_features = scaler.transform(svm_features)  # Scale the features using the fitted scaler
     svm_features[:, -1] *= weight_recon_error  # Apply weight to reconstruction error
@@ -205,6 +222,19 @@ for batch in tile_loader:
     svm_scores_list.append(svm_scores)
     label_list_svm.append(label_svm_is_obs)
     
+    # Predict using Binary SVM if available
+    if binary_svm_available:
+        binary_svm_features = np.hstack([mu, recon_err.cpu().detach().numpy().reshape(-1, 1)])
+        binary_svm_features = binary_scaler.transform(binary_svm_features)
+        binary_svm_scores = binary_svm_model.decision_function(binary_svm_features)
+        label_binary_svm_is_obs = (binary_svm_scores >= binary_svm_threshold)
+        
+        if not hasattr(label_list_binary_svm, 'append'):
+            label_list_binary_svm = []
+            binary_svm_scores_list = []
+        label_list_binary_svm.append(label_binary_svm_is_obs)
+        binary_svm_scores_list.append(binary_svm_scores)
+    
     batch_counter += 1
     print(f"processed batch {batch_counter}/{len(tile_loader)} | obs={is_obs.sum()} empty = {(~is_obs).sum()}", end="\r")
 
@@ -213,11 +243,13 @@ d2_array = np.concatenate(d2_list, axis=0)
 
 labels_array_d2 = np.concatenate(label_list_d2, axis=0)
 labels_array_svm = np.concatenate(label_list_svm, axis=0)
+labels_array_binary_svm = np.concatenate(label_list_binary_svm, axis=0) if binary_svm_available else None
 image_names_array = np.concatenate(image_names_list, axis=0)
 tile_rows_array = np.concatenate(tile_rows, axis=0)
 tile_cols_array = np.concatenate(tile_cols, axis=0)
 recon_array = torch.cat(recon_list, dim=0).cpu().numpy()
 svm_scores_array = np.concatenate(svm_scores_list, axis=0)
+binary_svm_scores_array = np.concatenate(binary_svm_scores_list, axis=0) if binary_svm_available else None
 # tile_array = np.concatenate(tile_list, axis=0)
 
 # Create dataframe with image names, tile numbers, and latent representations
@@ -229,18 +261,23 @@ df_latent.insert(2, "tile_col", tile_cols_array)
 df_latent.insert(3, "recon_error", recon_array)  # Add reconstruction error as a column
 df_latent.insert(4, "label_predicted_d2", labels_array_d2)  # Add manual labels (True for obs, False for no_obs)
 df_latent.insert(5, "label_predicted_svm", labels_array_svm)  # Add SVM predicted labels
-df_latent.insert(6, "d2", d2_array)  # Add Mahalanobis distance values
-df_latent.insert(7, "svm_scores", svm_scores_array)  # Add SVM scores
+
+df_latent.insert(6, "label_predicted_bsvm", labels_array_binary_svm)  # Add Binary SVM predicted labels
+df_latent.insert(7, "d2", d2_array)  # Add Mahalanobis distance values
+df_latent.insert(8, "svm_scores", svm_scores_array)  # Add OneClass SVM scores
+df_latent.insert(9, "bsvm_scores", binary_svm_scores_array)  # Add Binary SVM scores
+
 
 # print class distribution for manual labels and predicted labels both methods
 print(f"Class distribution for d2 threshold method: {df_latent['label_predicted_d2'].value_counts()}")
-print(f"Class distribution for SVM method: {df_latent['label_predicted_svm'].value_counts()}")
+print(f"Class distribution for OneClass SVM method: {df_latent['label_predicted_svm'].value_counts()}")
+print(f"Class distribution for Binary SVM method: {df_latent['label_predicted_bsvm'].value_counts()}")
 
 
 #%% chose method for predicted labels (d2 threshold vs SVM)
 # labels_predicted = df_latent["label_predicted_d2"].values
-labels_predicted = df_latent["label_predicted_svm"].values.astype(bool)
-observation_metric = "svm_scores"  # Choose which metric to visualize in the heatmap (e.g. "d2" or "svm_scores")
+labels_predicted = df_latent["label_predicted_bsvm"].values.astype(bool)
+observation_metric = "bsvm_scores"  # Choose which metric to visualize in the heatmap (e.g. "d2" or "svm_scores")
 
 #%% PCA for visualization of latent space
 pca = PCA(n_components=2)
@@ -276,11 +313,13 @@ plt.title("Mahalanobis distance distributions predicted labels"); plt.show()
 #%% Show the original test image with tiles colored by predicted label (obs vs no_obs)
 
 # Recalculate SVM predictions using the (possibly adjusted) threshold
+method = "bsvm" if binary_svm_available else "svm"
+print(f"\nUsing {method} method with threshold multiplier: {threshold_multiplier}")
 # Find the predicted labels based on the adjusted threshold
-threshold_multiplier = 0.5  # Adjust this multiplier to increase/decrease the threshold (e.g., 0.25, 0.5, 1.0, 1.5, 2.0)
+threshold_multiplier = 1  # Adjust this multiplier to increase/decrease the threshold (e.g., 0.25, 0.5, 1.0, 1.5, 2.0)
 adjusted_threshold_svm = svm_score_threshold_original * threshold_multiplier  # Use ORIGINAL threshold, not already-adjusted one
 
-df_latent['label_predicted_svm'] = (df_latent['svm_scores'] >= adjusted_threshold_svm)
+df_latent['label_predicted_bsvm'] = (df_latent['bsvm_scores'] >= adjusted_threshold_svm)
 
 # Extract unique image names from the dataframe
 image_names_unique = df_latent["image_name"].unique()
@@ -295,13 +334,12 @@ for image_name in image_names_unique[:1]:  # Show the first image only for testi
     fig, ax = plt.subplots(1, 1, figsize=(12, 12))
     ax.imshow(image)
 
-
     # overlay predicted obs tiles
     for df_tile in df_latent_image.itertuples():
         x0 = int(df_tile.tile_col * tile_size)
         y0 = int(df_tile.tile_row * tile_size)
         rect = Rectangle((x0, y0), tile_size, tile_size, linewidth=2, edgecolor="lime", facecolor="none")  # green rectangle for predicted obs tiles
-        if df_tile.label_predicted_svm == True:  # If predicted as obs, add green rectangle
+        if df_tile.label_predicted_bsvm == True:  # If predicted as obs, add green rectangle
             ax.add_patch(rect)
 
     ax.set_title(f"Predicted obs tiles in green for image: {image_name}", fontsize=16, fontweight="bold")
@@ -312,13 +350,13 @@ for image_name in image_names_unique[:1]:  # Show the first image only for testi
 
 #%% Use heatmap to visualize the predicted obs tiles across the original image
 # Global color scale across all images
-treshold_heatmap = svm_score_threshold if observation_metric == "svm_scores" else threshold
+# treshold_heatmap = bsvm_score_threshold  # Use the same threshold as for classification to set the color scale
 
 obs_likelihood_all = chi2.cdf(df_latent[observation_metric].values, df=2)  # higher d2 -> higher obs-likelihood
-likelihood_treshold =  0.985 # Convert threshold to obs likelihood threshold for color scaling
+likelihood_treshold =  0.97 # Convert threshold to obs likelihood threshold for color scaling
 
 cmap = mpl.colors.LinearSegmentedColormap.from_list("red_yellow_green", ["red", "yellow", "green"])
-norm = mpl.colors.TwoSlopeNorm(vmin=0.97, vcenter=likelihood_treshold, vmax=1.0) # for midpoint at threshold
+norm = mpl.colors.TwoSlopeNorm(vmin=0.95, vcenter=likelihood_treshold, vmax=1.0) # for midpoint at threshold
 
 print(f"Observation likelihood threshold: {likelihood_treshold:.3f}")
 
