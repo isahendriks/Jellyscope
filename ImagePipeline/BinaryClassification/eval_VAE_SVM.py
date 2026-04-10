@@ -297,12 +297,13 @@ for w in weight_grid:
         y_scores_try = -model_try.decision_function(X_eval_try)
         fpr_try, tpr_try, _ = roc_curve(y_true, y_scores_try)
         auc_try = auc(fpr_try, tpr_try)
+        
         optimal_idx = np.argmax(tpr_try - fpr_try)  # Youden's J statistic to find optimal threshold
         fnr_try = 1 - tpr_try
         fnr = fnr_try[optimal_idx]
         fpr = fpr_try[optimal_idx]
         search_results.append({"weight": w, "nu": nu_val, "auc": auc_try, "fnr": fnr, "fpr": fpr})
-        print(f"Testing weight_recon_error={w}, nu={nu_val}... done! AUC={auc_try:.4f}, FNR={fnr:.4f}, FPR={fpr:.4f}", end="\r")
+        print(f"\rTesting weight_recon_error={w}, nu={nu_val}... done! AUC={auc_try:.4f}, FNR={fnr:.4f}, FPR={fpr:.4f}", end="\r")
         
        
 search_df = pd.DataFrame(search_results).sort_values("auc", ascending=False).reset_index(drop=True)
@@ -365,6 +366,7 @@ plt.plot(fpr, tpr, label=f"AUC = {roc_auc:.3f}")
 plt.plot([0, 1], [0, 1], linestyle='--')  # random classifier line
 plt.plot(fpr[optimal_idx], tpr[optimal_idx], marker='o', markersize=8, label=f"Optimal threshold = {optimal_threshold:.3f}", color='red')
 plt.xlabel("False Positive Rate")
+
 plt.ylabel("True Positive Rate")
 plt.title("ROC Curve for SVM on VAE Latent Space")
 plt.legend()

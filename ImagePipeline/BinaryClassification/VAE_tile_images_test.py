@@ -74,19 +74,18 @@ def center_crop_to_tile_grid(image, tile_size):
 
 #%% Cell 2: Define User Parameters
 
-
 # Tile parameters
 grid_size = 32
 tile_size = int(4512/grid_size)  # dimensions of tiles, clean divisions: 2, 3, 4, 6, 8, 9, 12, 16, 18, 24, 32, 36, 48, 72, 96, 144, 288, 576, 1152, 2304, 4512
 monitoring_effort = 'Kristineberg_251128'  # e.g. "Kristineberg_251128" or "Kristineberg_251129"
-INPUT_NO_OBS_INDICES = True  # True: entered indices are no_obs, False: entered indices are obs
+INPUT_NO_OBS_INDICES = False  # True: entered indices are no_obs, False: entered indices are obs
 
 # Folder paths
-input_folder = "R:\\LU24A1037-Jellyscope\\Jellyscope\\Training data\\Binary_classifier\\" + monitoring_effort + "\\test\\cropped_images"  # Folder containing images to split
+input_folder = "R:\\LU24A1037-Jellyscope\\Jellyscope\\Training data\\Binary_classifier\\" + monitoring_effort + "\\test\\OG_images"  # Folder containing images to split
 output_folder = "R:\\LU24A1037-Jellyscope\\Jellyscope\\Training data\\Binary_classifier\\" + monitoring_effort + "\\test\\tiles" + str(grid_size)  # Folder to save the tiles (will be created if it doesn't exist)
 
 all_image_files = list(Path(input_folder).rglob('*.*')) # get all image files in the input folder
-species_names = [str(image.stem)[35:] for image in all_image_files]
+species_names = [str(image.stem)[24:] for image in all_image_files]
 
 # create dataframe with image names and species names
 df_images = pd.DataFrame({
@@ -120,13 +119,11 @@ input_path = Path(input_folder)
 if not input_path.exists():
     raise ValueError(f"Input folder does not exist: {input_folder}")
 
-# Image extensions to look for
-image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif'}
 # Image range to process
-start_image_idx = 12  # Currently done: 30 tiles
+start_image_idx = 0  # Currently done: 30 tiles
 end_image_idx = len(df_images)  # Set to total number of images in the input folder
 
-species = df_images['species'].unique()[15]
+species = df_images['species'].unique()[0]
 image_files = df_images[df_images['species'] == species]['image_name'].tolist()
 image_files_species = [Path(input_folder) / Path(image_name) for image_name in image_files]
 image_files = image_files_species[start_image_idx:end_image_idx] # select images from start to end index

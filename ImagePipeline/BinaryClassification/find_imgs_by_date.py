@@ -11,10 +11,16 @@ print("=" * 60)
 
 
 #%% Define user parameters
-folder_crops = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data\Class_classifier\Monitoring_training_data\Original"
-source_folder = r"R:\LU24A1037-Jellyscope\Jellyscope\Monitoring data\Kristineberg_251128"
-output_folder = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data\Binary_classifier\Kristineberg_251128\test\cropped_images"
-date = "251128,251129,251130"  # one or several, e.g. "251128" or "251128,251129"
+monitoring_effort = "Kristineberg_250915" #"Kristineberg_251128"
+
+ROOT_C = r"C:\Users\Admin\Documents\GitHub\Jellyscope\Training data"
+ROOT_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data"
+
+folder_crops = f"{ROOT_R}\Class_classifier\Monitoring_training_data\Original"
+source_folder = f"{ROOT_R}\Monitoring data\{monitoring_effort}"
+output_folder = f"{ROOT_R}\Binary_classifier\{monitoring_effort}\test\cropped_images"
+
+
 
 print("Configuration:")
 print(f"  Input folder: {folder_crops}")
@@ -64,7 +70,7 @@ print(f"\n Species to copy: {species_to_copy}, total number of iamages to copy: 
 
 #%% Copy the images from source to output folder
 
-for _, row in df_to_copy[11:].iterrows():  # Limit to first 10 images for testing
+for _, row in df_to_copy[11].iterrows():  # Limit to first 10 images for testing
     image_path = Path(row["image_path"])
     image_name = image_path.stem
     

@@ -60,12 +60,12 @@ DEBUG = False
 N_DEBUG = 5000
 EPOCHS_DEBUG = 10
 
-monitoring_effort = "Kristineberg_250915"  # for titles and saved model names, e.g. "kristineberg_251128" or "skagerrak_220915"
+monitoring_effort = "Kristineberg_250915"  # for titles and saved model names, e.g. "kristineberg_251128" 
 grid_size = 32  # number of tiles along one side (e.g. 6 means 6x6=36 tiles per image)
 
 # model hyperparameters
 image_size = 128
-latent_dims = 6
+latent_dims = 32
 hidden_channels = 32
 
 train_tiles_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train", f"tiles{grid_size}")
@@ -80,7 +80,7 @@ images_train = sorted(Path(train_og_images_path).rglob("*.png"))
 print(f"Total training images with tiles found: {len(images_train)}")
 print(f"total training tiles found: {len(list(Path(train_tiles_path).rglob('*.png')))}")
 
-model_name = "models/vae_model_" + str(monitoring_effort) + "_" + str(grid_size) + "_l" + str(latent_dims) + ".pth"
+model_name = f"models/{monitoring_effort}_vae_model{grid_size}_l{latent_dims}.pth"
 if DEBUG:
     model_name = model_name.replace(".pth", "_debug.pth")
 model_output_path = Path(model_name)
@@ -89,7 +89,7 @@ model_output_path.parent.mkdir(parents=True, exist_ok=True)
 # training hyperparameters
 batch_size = 64
 learning_rate = 1e-4 * (batch_size / 64)  # scale learning rate with batch size
-epochs = 100
+epochs = 50
 warmup_epochs = 30  # Number of epochs to linearly increase learning rate (helps stabilize early training)
 if DEBUG:
     print(f"DEBUG MODE: Using only {N_DEBUG} tiles and training for {EPOCHS_DEBUG} epochs \n if saving enabled model name will be: {model_output_path.name}")
@@ -117,6 +117,7 @@ print("="*120)
 
 # Sanity-check one batch to verify row/col loading
 x_chk, y_chk, rows_chk, cols_chk = next(iter(train_loader))
+
 print(
     f"Sanity batch -> x: {tuple(x_chk.shape)}, rows: {tuple(rows_chk.shape)} ({rows_chk.dtype}), "
     f"cols: {tuple(cols_chk.shape)} ({cols_chk.dtype})"
@@ -140,21 +141,20 @@ sample_image_name_train = sample_image_path_train.stem
 # Find all tiles corresponding to the sample image
 _r_patterns = ("?", "??", "???", "????")
 _c_patterns = ("?", "??", "???", "????")
-# _i_patterns = ("?", "??", "???", "????", "?????", "??????", "???????", "????????")
 
 sample_image_tiles_path_train = sorted({
     path
     for r_pat in _r_patterns
     for c_pat in _c_patterns
     for path in Path(train_tiles_path).glob(
-        f"{sample_image_name_train}_r{r_pat}_c{c_pat}_*.png"
+        f"{sample_image_name_train}_r{r_pat}_c{c_pat}.png"
     )
 })
 
-# Sort images by index (the last number in the filename) to ensure correct order in grid
+# Sort images by r and then c indices (extract from filename)
 sample_image_tiles_path_train = sorted(
     sample_image_tiles_path_train,
-    key=lambda p: int(p.stem.split("_")[-1][1:])  # Extract the index after 'i' and convert to int
+    key=lambda p: (int(p.stem.split("_")[-2][1:]), int(p.stem.split("_")[-1][1:]))  # Extract r and c indices and convert to integers
 )
 
 print(f"number of tiles selected for plotting: {len(sample_image_tiles_path_train)}")
@@ -249,7 +249,6 @@ epoch_losses, recon_losses, kl_losses = [], [], []
 step_losses, step_recon_losses, step_kl_losses = [], [], []
 kl_per_dim_history = []  # For tracking KL per latent dim over time
 model.train()
-
 
 # before training
 n_batches = len(train_loader)
@@ -512,4 +511,3 @@ plt.show()
 
 print(f"Bby you are done stop running cells and relax a lil")
 
-# %%

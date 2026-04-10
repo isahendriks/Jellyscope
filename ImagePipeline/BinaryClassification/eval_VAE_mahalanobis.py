@@ -62,17 +62,18 @@ SAMPLE_IMAGE_IDX_TRAIN = 0  # Index of the sample image to plot process (0-based
 DEBUG = False
 n_debug = 0.2
 
+monitoring_effort = "Kristineberg_250915"
 grid_size = 32  # number of tiles along one side (e.g. 6 means 6x6=36 tiles per image)
 latent_dim = 6
 batch_size = 64
 
-model_name = f"models/vae_model{grid_size}_l{latent_dim}.pth"
+model_name = f"models/{monitoring_effort}_vae_model{grid_size}_l{latent_dim}.pth"
 if DEBUG:
     model_name = model_name.replace(".pth", "_debug.pth")
 print(f"Model to load: {model_name}")
 
-test_tiles_path = os.path.join(ROOT_DIR_C, "test", f"tiles{grid_size}")
-test_og_images_path = os.path.join(ROOT_DIR_C, "test", "OG_images")
+test_tiles_path = os.path.join(ROOT_DIR_C, monitoring_effort, "test", f"tiles{grid_size}")
+test_og_images_path = os.path.join(ROOT_DIR_C, monitoring_effort, "test", "OG_images")
 
 # images_train = list(Path(train_og_images_path).glob("*.png"))
 images_test = list(Path(test_og_images_path).glob("*.png"))

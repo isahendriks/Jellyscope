@@ -1,6 +1,7 @@
 #%% Import packages and set up environment
 ### PACKAGES ###
 import os
+
 import torch
 from torch.utils.data import DataLoader
 
@@ -50,47 +51,55 @@ print(f"Using device:      {device}")
 #%% Define paths and parameters
 # ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data\Binary_classifier"
 ROOT_DIR_C = r"C:\Users\Admin\Documents\Jellyscope\Training data\Binary_classifier"   
-monitoring_effort = "Kristineberg_250915"
+monitoring_effort = "Kristineberg_251128" #"Kristineberg_251128" #"Kristineberg_250915"
 
-test_images_folder = os.path.join(ROOT_DIR_C, monitoring_effort, "test", "OG_images")
+test_images_folder = os.path.join(ROOT_DIR_C, monitoring_effort, "val", "OG_images")
 tile_grid_size = 32 # how many tiles along one side (e.g. 6 means 6x6=36 tiles per image)
 tile_size = 4512 // tile_grid_size # size of the tiles that the original image is split into
-latent_dim = 6 # how many tiles along one side 
+latent_dim = 32 # how many tiles along one side 
 model_name = f"models/{monitoring_effort}_vae_model{tile_grid_size}_l{latent_dim}.pth"
 
 # Autoencoder parameters
-batch_size = 64
+batch_size = 2048
 image_size = 128
 hidden_channels = 32
 
+# Load mahalanobis distance parameters (mu_g, cov_g, threshold)
 val_params_name = model_name.replace(".pth", "_params.pkl")
 val_params = pkl.load(open(val_params_name, "rb"))
+mu_g = val_params["mu_g"]
+cov_g = val_params["cov_g"]
+threshold = val_params["threshold"]
 
+# Load SVM model and parameters
 svm_model_name = model_name.replace("vae_model", "svm_model").replace(".pth", ".pkl")
 svm_data = pkl.load(open(svm_model_name, "rb"))
 svm_model = svm_data[0]
 scaler = svm_data[1]
 weight_recon_error = svm_data[2]
-svm_score_threshold = svm_data[3] if len(svm_data) > 3 else None
+nu = svm_data[3] if len(svm_data) > 3 else None
+svm_score_threshold_original = svm_data[4] if len(svm_data) > 4 else None  # Store original threshold
+svm_score_threshold = svm_score_threshold_original  # Use original by default
 
-mu_g = val_params["mu_g"]
-cov_g = val_params["cov_g"]
-threshold = val_params["threshold"]
+# THRESHOLD ADJUSTMENT: Increase this value to reduce false positives (e.g., 1.2, 1.5, 2.0)
+# Higher multiplier = higher threshold = fewer obs predictions = fewer false positives
+
 
 # tile_size = 4512 // tile_grid_size
 
 test_images_path = list(Path(test_images_folder).glob("*.png"))
 print(f"Found {len(test_images_path)} test images in: {test_images_folder}")
 print(f"loading VAE model from: {model_name}")
-print(f"loading SVM model from: {svm_model_name}")
-if svm_score_threshold is None:
-    print("SVM score threshold not found in model file -> using raw OneClassSVM decision boundary (predict).")
-else:
-    print(f"Using saved SVM score threshold: {svm_score_threshold:.4f}")
+print(f"loading SVM model from: {svm_model_name} with parameters:", end="\n")
+print(f"weight_recon_error={weight_recon_error}, nu={nu}")
+print(f"Original threshold_svm={svm_data[4]:.8f}")
+
+
 #%% Load model
 checkpoint = torch.load(model_name, map_location=device, weights_only=False)
 
 latent_dims = checkpoint.get("latent_dim")
+
 if latent_dims!= latent_dim:
     print(f"⚠ Warning: Loaded model latent_dims={latent_dims} does not match expected latent_dim={latent_dim}. Using loaded value.")
     
@@ -186,8 +195,7 @@ for batch in tile_loader:
     d2_list.append(d2)
     label_list_d2.append(is_obs)
     
-    # predict using SVM model
-    
+    # predict using SVM model    
     svm_features = np.hstack([mu, recon_err.cpu().detach().numpy().reshape(-1, 1)])  # Combine latent features and reconstruction error for SVM
     svm_features = scaler.transform(svm_features)  # Scale the features using the fitted scaler
     svm_features[:, -1] *= weight_recon_error  # Apply weight to reconstruction error
@@ -232,6 +240,7 @@ print(f"Class distribution for SVM method: {df_latent['label_predicted_svm'].val
 #%% chose method for predicted labels (d2 threshold vs SVM)
 # labels_predicted = df_latent["label_predicted_d2"].values
 labels_predicted = df_latent["label_predicted_svm"].values.astype(bool)
+observation_metric = "svm_scores"  # Choose which metric to visualize in the heatmap (e.g. "d2" or "svm_scores")
 
 #%% PCA for visualization of latent space
 pca = PCA(n_components=2)
@@ -249,7 +258,6 @@ plt.grid()
 plt.show()
 
 #%%
-
 bins = np.linspace(0, df_latent["d2"].max(), int(df_latent["d2"].max()/threshold*4 ))
 
 plt.figure(figsize=(6,4))
@@ -261,17 +269,24 @@ plt.ylabel("Counts", fontsize=16)
 plt.ylim(0, 12000)
 plt.tight_layout()
 plt.grid()
-plt.legend(); 
+plt.legend()
 plt.title("Mahalanobis distance distributions predicted labels"); plt.show()
 
 
 #%% Show the original test image with tiles colored by predicted label (obs vs no_obs)
 
+# Recalculate SVM predictions using the (possibly adjusted) threshold
+# Find the predicted labels based on the adjusted threshold
+threshold_multiplier = 0.5  # Adjust this multiplier to increase/decrease the threshold (e.g., 0.25, 0.5, 1.0, 1.5, 2.0)
+adjusted_threshold_svm = svm_score_threshold_original * threshold_multiplier  # Use ORIGINAL threshold, not already-adjusted one
+
+df_latent['label_predicted_svm'] = (df_latent['svm_scores'] >= adjusted_threshold_svm)
+
 # Extract unique image names from the dataframe
 image_names_unique = df_latent["image_name"].unique()
 
 # Loop through each unique image and overlay predicted labels as a grid on original image
-for image_name in image_names_unique:
+for image_name in image_names_unique[:1]:  # Show the first image only for testing
     df_latent_image = df_latent[df_latent["image_name"] == image_name]
 
     image_path = Path(test_images_folder) / f"{image_name}.png"
@@ -280,12 +295,13 @@ for image_name in image_names_unique:
     fig, ax = plt.subplots(1, 1, figsize=(12, 12))
     ax.imshow(image)
 
+
     # overlay predicted obs tiles
     for df_tile in df_latent_image.itertuples():
         x0 = int(df_tile.tile_col * tile_size)
         y0 = int(df_tile.tile_row * tile_size)
-        rect = Rectangle((x0, y0), tile_size, tile_size, linewidth=2,  facecolor="lime", alpha=0.5, edgecolor="none")  # green rectangle for predicted obs tiles
-        if df_tile.label_predicted_svm:  # If predicted as obs, add green rectangle
+        rect = Rectangle((x0, y0), tile_size, tile_size, linewidth=2, edgecolor="lime", facecolor="none")  # green rectangle for predicted obs tiles
+        if df_tile.label_predicted_svm == True:  # If predicted as obs, add green rectangle
             ax.add_patch(rect)
 
     ax.set_title(f"Predicted obs tiles in green for image: {image_name}", fontsize=16, fontweight="bold")
@@ -296,14 +312,13 @@ for image_name in image_names_unique:
 
 #%% Use heatmap to visualize the predicted obs tiles across the original image
 # Global color scale across all images
-observation_metric = "svm_scores"  # Choose which metric to visualize in the heatmap (e.g. "d2" or "svm_scores")
 treshold_heatmap = svm_score_threshold if observation_metric == "svm_scores" else threshold
 
 obs_likelihood_all = chi2.cdf(df_latent[observation_metric].values, df=2)  # higher d2 -> higher obs-likelihood
-likelihood_treshold = 0.9  # Convert threshold to obs likelihood threshold for color scaling
+likelihood_treshold =  0.985 # Convert threshold to obs likelihood threshold for color scaling
 
 cmap = mpl.colors.LinearSegmentedColormap.from_list("red_yellow_green", ["red", "yellow", "green"])
-norm = mpl.colors.TwoSlopeNorm(vmin=0.0, vcenter=likelihood_treshold, vmax=1.0) # for midpoint at threshold
+norm = mpl.colors.TwoSlopeNorm(vmin=0.97, vcenter=likelihood_treshold, vmax=1.0) # for midpoint at threshold
 
 print(f"Observation likelihood threshold: {likelihood_treshold:.3f}")
 
@@ -326,7 +341,7 @@ for i, image_name in enumerate(image_names_unique):  # Show heatmap for the firs
         # Convert d2 to "obs likelihood" in [0,1] and map to a color
         obs_likelihood = chi2.cdf(df_tile.d2, df=2)
         color = cmap(norm(obs_likelihood))
-        rect = Rectangle((x0, y0), tile_size, tile_size, linewidth=0, edgecolor="none", facecolor=color, alpha=0.45)
+        rect = Rectangle((x0, y0), tile_size, tile_size, linewidth=0, edgecolor="none", facecolor=color, alpha=0.2)
         ax.add_patch(rect)
     # Colorbar
     
@@ -446,3 +461,4 @@ if plot:
                     rotation=90, fontsize=16, fontweight="bold")
     plt.tight_layout()
     plt.show()
+# %%
