@@ -64,8 +64,8 @@ SAMPLE_IMAGE_IDX_TEST = 0
 DEBUG = False
 n_debug = 0.2
 
-monitoring_effort = "Kristineberg_251128"
-# monitoring_effort = "Kristineberg_250915"
+# monitoring_effort = "Kristineberg_251128"
+monitoring_effort = "Kristineberg_250915"
 grid_size = 32
 latent_dim = 32
 batch_size = 1024
@@ -451,13 +451,35 @@ roc_auc_bsvm = auc(fpr_bsvm, tpr_bsvm)
 precision_bsvm, recall_bsvm, thresholds_pr_bsvm = precision_recall_curve(labels_eval, pred_scores)
 aps_bsvm = average_precision_score(labels_eval, pred_scores)
 
-#%% Set threshold for binary classification
-lambda_weight_bsvm = 0.4  # Adjust this weight to balance FPR and FNR according to your needs (0.5 means equal weight)
-fnr_bsvm = 1 - tpr_bsvm
-cost_bsvm = lambda_weight_bsvm * fpr_bsvm + (1 - lambda_weight_bsvm) * fnr_bsvm
-best_idx_roc = np.argmin(cost_bsvm)
-threshold_bsvm = thresholds_bsvm[best_idx_roc]
-print(f"\nBinary SVM Optimal threshold (Youden's J): {threshold_bsvm:.8f}")
+#%% METHOD 2: Set threshold for binary classification
+
+# METHOD A: Using weighted FPR and FNR (original method)
+# lambda_weight_bsvm = 0.4  # Adjust this weight to balance FPR and FNR according to your needs (0.5 means equal weight)
+# fnr_bsvm = 1 - tpr_bsvm
+# cost_bsvm = lambda_weight_bsvm * fpr_bsvm + (1 - lambda_weight_bsvm) * fnr_bsvm
+# best_idx_roc = np.argmin(cost_bsvm)
+# threshold_bsvm = thresholds_bsvm[best_idx_roc]
+
+# METHOD B: Using maximum allowed False Discovery Rate (FDR)
+# FDR = False Positives / (True Positives + False Positives)
+# This means: out of all predictions marked as positive, what fraction are actually false positives
+# If you want 1% FDR, that means 99% precision (99 out of 100 positive predictions are correct)
+max_fdr_bsvm = 0.9  # 10% false positives allowed out of total positive predictions (= 90% precision)
+min_precision = 1 - max_fdr_bsvm  # minimum required precision
+
+# Find the threshold that achieves at least the minimum precision
+valid_indices = np.where(precision_bsvm >= min_precision)[0]
+if len(valid_indices) > 0:
+    # Among valid thresholds, choose the one with highest recall (most sensitive)
+    best_idx_precision = valid_indices[np.argmax(recall_bsvm[valid_indices])]
+    threshold_bsvm = thresholds_pr_bsvm[best_idx_precision]
+    actual_precision = precision_bsvm[best_idx_precision]
+    actual_recall = recall_bsvm[best_idx_precision]
+    print(f"\nBinary SVM threshold set by FDR: {threshold_bsvm:.8f}")
+    print(f"Achieved precision (1-FDR): {actual_precision:.4f} (target: {min_precision:.4f})")
+    print(f"Achieved recall: {actual_recall:.4f}")
+else:
+    print(f"⚠ Warning: Cannot achieve {max_fdr_bsvm:.2%} FDR with current model.")
 
 df_svm_eval['label_predicted_BinarySVM'] = (pred_scores >= threshold_bsvm).astype(int)
 
@@ -475,11 +497,20 @@ plt.show()
 
 ## Confusion matrix using optimal threshold
 y_pred_bsvm_optimal = (pred_scores >= threshold_bsvm).astype(bool)
-cm_bsvm_optimal = confusion_matrix(df_svm_eval['label_manual'], y_pred_bsvm_optimal, labels=[False, True], normalize='true')
-disp_optimal = ConfusionMatrixDisplay(confusion_matrix=cm_bsvm_optimal, display_labels=["no_obs", "obs"])
+cm_bsvm_optimal = confusion_matrix(df_svm_eval['label_manual'], y_pred_bsvm_optimal, labels=[False, True])
+disp_optimal = ConfusionMatrixDisplay(confusion_matrix=cm_bsvm_optimal, display_labels=["empty", "observation"])
 disp_optimal.plot(cmap=plt.cm.Blues, values_format=".2f")
 plt.title("Confusion Matrix for Binary SVM (Optimal Threshold)")
 plt.show()
+
+## Confusion matrix using optimal threshold
+y_pred_bsvm_optimal = (pred_scores >= threshold_bsvm).astype(bool)
+cm_bsvm_optimal = confusion_matrix(df_svm_eval['label_manual'], y_pred_bsvm_optimal, labels=[False, True], normalize='true')
+disp_optimal = ConfusionMatrixDisplay(confusion_matrix=cm_bsvm_optimal, display_labels=["empty", "observation"])
+disp_optimal.plot(cmap=plt.cm.Blues, values_format=".2f")
+plt.title("Confusion Matrix for Binary SVM (Optimal Threshold) normalized")
+plt.show()
+plt.savefig(f"confusion_matrix_binary_svm_{model_name[7:].replace('.pth', '')}.png", dpi=300)
 
 # PR curve for Binary SVM
 

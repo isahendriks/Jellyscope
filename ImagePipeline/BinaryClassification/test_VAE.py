@@ -51,9 +51,10 @@ print(f"Using device:      {device}")
 #%% Define paths and parameters
 # ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data\Binary_classifier"
 ROOT_DIR_C = r"C:\Users\Admin\Documents\Jellyscope\Training data\Binary_classifier"   
-monitoring_effort = "Kristineberg_251128" #"Kristineberg_251128" #"Kristineberg_250915"
+# monitoring_effort = "Kristineberg_251128" 
+monitoring_effort = "Kristineberg_250915" 
 
-test_images_folder = os.path.join(ROOT_DIR_C, monitoring_effort, "val", "OG_images")
+test_images_folder = os.path.join(ROOT_DIR_C, monitoring_effort, "test", "OG_images")
 tile_grid_size = 32 # how many tiles along one side (e.g. 6 means 6x6=36 tiles per image)
 tile_size = 4512 // tile_grid_size # size of the tiles that the original image is split into
 latent_dim = 32 # how many tiles along one side 
@@ -64,15 +65,8 @@ batch_size = 2048
 image_size = 128
 hidden_channels = 32
 
-# Load mahalanobis distance parameters (mu_g, cov_g, threshold)
-val_params_name = model_name.replace(".pth", "_params.pkl")
-val_params = pkl.load(open(val_params_name, "rb"))
-mu_g = val_params["mu_g"]
-cov_g = val_params["cov_g"]
-threshold = val_params["threshold"]
-
 # Load OneClass SVM model and parameters
-svm_model_name = model_name.replace("vae_model", "svm_model").replace(".pth", ".pkl")
+svm_model_name = model_name.replace("vae_model", "oc_svm_model").replace(".pth", ".pkl")
 svm_data = pkl.load(open(svm_model_name, "rb"))
 svm_model = svm_data[0]
 scaler = svm_data[1]
@@ -100,14 +94,21 @@ except FileNotFoundError:
 # tile_size = 4512 // tile_grid_size
 
 test_images_path = list(Path(test_images_folder).glob("*.png"))
+
+
 print(f"Found {len(test_images_path)} test images in: {test_images_folder}")
+# if len(test_images_path) > 50:
+#     rand_idxs = np.random.choice(len(test_images_path), size=50, replace=False)
+#     test_images_path = [test_images_path[i] for i in rand_idxs]
+#     print(f"Showing a random subset of 50 test images for evaluation:")
+
 print(f"loading VAE model from: {model_name}")
 print(f"loading OneClass SVM model from: {svm_model_name} with parameters:", end="\n")
 print(f"weight_recon_error={weight_recon_error}, nu={nu}")
 print(f"Original threshold_svm={svm_data[4]:.8f}")
-if binary_svm_available:
-    print(f"loading Binary SVM model from: {binary_svm_model_name}")
-    print(f"Binary SVM threshold: {binary_svm_threshold:.8f}")
+
+print(f"loading Binary SVM model from: {binary_svm_model_name}")
+print(f"Binary SVM threshold: {binary_svm_threshold:.8f}")
 
 
 #%% Load model
@@ -268,7 +269,7 @@ df_latent.insert(8, "svm_scores", svm_scores_array)  # Add OneClass SVM scores
 df_latent.insert(9, "bsvm_scores", binary_svm_scores_array)  # Add Binary SVM scores
 
 
-# print class distribution for manual labels and predicted labels both methods
+#%% print class distribution for manual labels and predicted labels both methods
 print(f"Class distribution for d2 threshold method: {df_latent['label_predicted_d2'].value_counts()}")
 print(f"Class distribution for OneClass SVM method: {df_latent['label_predicted_svm'].value_counts()}")
 print(f"Class distribution for Binary SVM method: {df_latent['label_predicted_bsvm'].value_counts()}")
@@ -279,53 +280,18 @@ print(f"Class distribution for Binary SVM method: {df_latent['label_predicted_bs
 labels_predicted = df_latent["label_predicted_bsvm"].values.astype(bool)
 observation_metric = "bsvm_scores"  # Choose which metric to visualize in the heatmap (e.g. "d2" or "svm_scores")
 
-#%% PCA for visualization of latent space
-pca = PCA(n_components=2)
-mu_pca = pca.fit_transform(mu_array)
+#%% Show the original test image with the predicted obs tiles overlaid as green rectangles
 
-plt.figure(figsize=(12, 10))
-plt.scatter(mu_pca[labels_predicted, 0], mu_pca[labels_predicted, 1], s=50, c="blue", label="obs", alpha=0.6, edgecolors='black', linewidth=0.5)
-plt.scatter(mu_pca[~labels_predicted, 0], mu_pca[~labels_predicted, 1], s=50, c="orange", label="empty", alpha=0.6, edgecolors='black', linewidth=0.5)
+method = "bsvm"  # Choose which metric to visualize in the heatmap (e.g. "d2" or "svm_scores")
+label_method = "label_predicted_" + method  # Choose which predicted label to visualize (e.g. "label_predicted_d2" or "label_predicted_svm")
+score_method = method + "_scores"  # Choose which score to visualize in the heatmap (e.g. "d2" or "svm_scores")
 
-plt.xlabel("PCA 1", fontsize=24)
-plt.ylabel("PCA 2", fontsize=24)
-plt.legend(loc="best", fontsize=12)
-plt.title("Outlier detection in 2D latent space", fontsize=20, fontweight="bold")
-plt.grid()
-plt.show()
-
-#%%
-bins = np.linspace(0, df_latent["d2"].max(), int(df_latent["d2"].max()/threshold*4 ))
-
-plt.figure(figsize=(6,4))
-plt.hist(df_latent.loc[df_latent.label_predicted_d2==0,'d2'], bins=bins, alpha=0.6, label='no_obs', color='orange')
-plt.hist(df_latent.loc[df_latent.label_predicted_d2==1,'d2'], bins=bins, alpha=0.6, label='obs', color='blue')
-plt.vlines(threshold, ymin=0, ymax=12000, colors='red', linestyles='dashed', label=f'Threshold (d2={threshold:.1f})')
-plt.xlabel("Mahalanobis distance (d2)", fontsize=16)
-plt.ylabel("Counts", fontsize=16)
-plt.ylim(0, 12000)
-plt.tight_layout()
-plt.grid()
-plt.legend()
-plt.title("Mahalanobis distance distributions predicted labels"); plt.show()
-
-
-#%% Show the original test image with tiles colored by predicted label (obs vs no_obs)
-
-# Recalculate SVM predictions using the (possibly adjusted) threshold
-method = "bsvm" if binary_svm_available else "svm"
-print(f"\nUsing {method} method with threshold multiplier: {threshold_multiplier}")
-# Find the predicted labels based on the adjusted threshold
-threshold_multiplier = 1  # Adjust this multiplier to increase/decrease the threshold (e.g., 0.25, 0.5, 1.0, 1.5, 2.0)
-adjusted_threshold_svm = svm_score_threshold_original * threshold_multiplier  # Use ORIGINAL threshold, not already-adjusted one
-
-df_latent['label_predicted_bsvm'] = (df_latent['bsvm_scores'] >= adjusted_threshold_svm)
 
 # Extract unique image names from the dataframe
 image_names_unique = df_latent["image_name"].unique()
 
 # Loop through each unique image and overlay predicted labels as a grid on original image
-for image_name in image_names_unique[:1]:  # Show the first image only for testing
+for image_name in image_names_unique:  # Show the first image only for testing
     df_latent_image = df_latent[df_latent["image_name"] == image_name]
 
     image_path = Path(test_images_folder) / f"{image_name}.png"
@@ -352,16 +318,28 @@ for image_name in image_names_unique[:1]:  # Show the first image only for testi
 # Global color scale across all images
 # treshold_heatmap = bsvm_score_threshold  # Use the same threshold as for classification to set the color scale
 
-obs_likelihood_all = chi2.cdf(df_latent[observation_metric].values, df=2)  # higher d2 -> higher obs-likelihood
-likelihood_treshold =  0.97 # Convert threshold to obs likelihood threshold for color scaling
+SAVE_PREDICTION_IMAGES = True  # Whether to save the heatmap images to disk (will be saved in a "heatmaps" subfolder in the test images folder)
+output_folder_heatmaps = Path(test_images_folder) / "heatmaps"
+output_folder_heatmaps.mkdir(parents=True, exist_ok=True)
+
+# Normalize the observation metric for color mapping
+obs_likelihood = df_latent[score_method] 
+obs_min = obs_likelihood.min()
+obs_max = obs_likelihood.max()
+obs_likelihood_scaled = (obs_likelihood - obs_min) / (obs_max - obs_min)  # Normalize to [0,1] for color mapping
+threshold_heatmap = (binary_svm_threshold - obs_min) / (obs_max - obs_min)  # Normalize threshold to [0,1]
+threshold_heatmap = threshold_heatmap  # Adjust threshold for heatmap visualization (e.g., 80% of the way to the threshold to show more gradation in colors below the threshold)
 
 cmap = mpl.colors.LinearSegmentedColormap.from_list("red_yellow_green", ["red", "yellow", "green"])
-norm = mpl.colors.TwoSlopeNorm(vmin=0.95, vcenter=likelihood_treshold, vmax=1.0) # for midpoint at threshold
+norm = mpl.colors.TwoSlopeNorm(vmin=threshold_heatmap*0.8, vcenter=threshold_heatmap, vmax=threshold_heatmap*1.2) # for midpoint at threshold
 
-print(f"Observation likelihood threshold: {likelihood_treshold:.3f}")
+print(f"Observation likelihood threshold: {threshold_heatmap:.3f}")
+print(f"Score range: [{obs_min:.3f}, {obs_max:.3f}], Binary SVM threshold: {binary_svm_threshold:.3f}")
 
 ### Loop through each unique image and plot the tiles with a heatmap 
-for i, image_name in enumerate(image_names_unique):  # Show heatmap for the first image only
+
+for i, image_name in enumerate(image_names_unique):  # Show heatmap for each image
+    print(f"Creating heatmap for image: {image_name} ({i+1}/{len(image_names_unique)})", end="\r")
     df_latent_image = df_latent[df_latent["image_name"] == image_name]
 
     image_path = Path(test_images_folder) / f"{image_name}.png"
@@ -376,23 +354,48 @@ for i, image_name in enumerate(image_names_unique):  # Show heatmap for the firs
         x0 = int(df_tile.tile_col * tile_size)
         y0 = int(df_tile.tile_row * tile_size)
         
-        # Convert d2 to "obs likelihood" in [0,1] and map to a color
-        obs_likelihood = chi2.cdf(df_tile.d2, df=2)
-        color = cmap(norm(obs_likelihood))
+        # Get the score value for this specific tile and normalize it
+        tile_score = getattr(df_tile, score_method)
+        tile_score_normalized = (tile_score - obs_min) / (obs_max - obs_min)
+        
+        color = cmap(norm(tile_score_normalized))
         rect = Rectangle((x0, y0), tile_size, tile_size, linewidth=0, edgecolor="none", facecolor=color, alpha=0.2)
         ax.add_patch(rect)
-    # Colorbar
-    
-    # sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
-    # sm.set_array([])
-    # ticks = np.linspace(0, 1, 6)   # evenly spaced: 0.0, 0.2, ..., 1.0
-    # cbar = fig.colorbar(sm, ax=ax, fraction=0.02, pad=0.01, aspect=30, location="right")
-    # cbar.set_ticks(ticks)
-    # cbar.set_ticklabels([f"{t:.1f}" for t in ticks], fontsize=20)
-    # cbar.set_label("Observation likelihood", rotation=90, fontsize=20, fontweight="bold")
-    # plt.imsave(f"heatmap_{image_name}.png", fig, dpi=300)  # Save heatmap as PNG    
-    
-    plt.show()
+        
+    if SAVE_PREDICTION_IMAGES:
+        save_path = output_folder_heatmaps / f"{image_name}_heatmap.png"
+        plt.savefig(save_path, dpi=300, bbox_inches="tight", pad_inches=0)
+        plt.close(fig)
+
+#%% PCA for visualization of latent space
+pca = PCA(n_components=2)
+mu_pca = pca.fit_transform(mu_array)
+
+plt.figure(figsize=(12, 10))
+plt.scatter(mu_pca[labels_predicted, 0], mu_pca[labels_predicted, 1], s=50, c="blue", label="obs", alpha=0.6, edgecolors='black', linewidth=0.5)
+plt.scatter(mu_pca[~labels_predicted, 0], mu_pca[~labels_predicted, 1], s=50, c="orange", label="empty", alpha=0.6, edgecolors='black', linewidth=0.5)
+
+plt.xlabel("PCA 1", fontsize=24)
+plt.ylabel("PCA 2", fontsize=24)
+plt.legend(loc="best", fontsize=12)
+plt.title("Outlier detection in 2D latent space", fontsize=20, fontweight="bold")
+plt.grid()
+plt.show()
+
+
+bins = np.linspace(0, df_latent["d2"].max(), int(df_latent["d2"].max()/threshold*4 ))
+
+plt.figure(figsize=(6,4))
+plt.hist(df_latent.loc[df_latent.label_predicted_d2==0,'d2'], bins=bins, alpha=0.6, label='no_obs', color='orange')
+plt.hist(df_latent.loc[df_latent.label_predicted_d2==1,'d2'], bins=bins, alpha=0.6, label='obs', color='blue')
+plt.vlines(threshold, ymin=0, ymax=12000, colors='red', linestyles='dashed', label=f'Threshold (d2={threshold:.1f})')
+plt.xlabel("Mahalanobis distance (d2)", fontsize=16)
+plt.ylabel("Counts", fontsize=16)
+plt.ylim(0, 12000)
+plt.tight_layout()
+plt.grid()
+plt.legend()
+plt.title("Mahalanobis distance distributions predicted labels"); plt.show()
 
 #%% Test on single image and visualize the tiles with lowest and highest Mahalanobis distance (most likely obs vs most likely empty)
 empty_images_path = r"R:\LU24A1037-Jellyscope\Jellyscope\Monitoring data\Kristineberg_250915\Binary_classifier_test_data\checked\Hard_class\Without_jellyfish\Background"

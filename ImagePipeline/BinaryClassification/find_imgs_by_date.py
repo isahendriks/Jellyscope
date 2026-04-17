@@ -11,13 +11,13 @@ print("=" * 60)
 
 
 #%% Define user parameters
-monitoring_effort = "Kristineberg_250915" #"Kristineberg_251128"
+monitoring_effort = "Kristineberg_251128"# "Kristineberg_250915" #"Kristineberg_251128"
 
 ROOT_C = r"C:\\Users\\Admin\\Documents\\Jellyscope"
 ROOT_R = r"R:\\LU24A1037-Jellyscope\\Jellyscope"
 
 folder_crops = f"{ROOT_R}\\Training data\\Class_classifier\\Monitoring_training_data\\Original_new"
-source_folder = f"{ROOT_R}\\Monitoring data\\{monitoring_effort}\\gain10_nobgsub"  # Folder containing the original images to match against (e.g., OG_images folder for the same monitoring effort)
+source_folder = f"{ROOT_R}\\Monitoring data\\{monitoring_effort}"  # Folder containing the original images to match against (e.g., OG_images folder for the same monitoring effort)
 output_folder = f"{ROOT_R}\\Training data\\Binary_classifier\\{monitoring_effort}\\test\\OG_images"
 
 # subfolders_source = [f for f in Path(source_folder).iterdir() if f.is_dir()]  # List of subfolders in the source folder
@@ -49,9 +49,9 @@ for subfolder in subfolders:  # Limit to first 2 subfolders for testing
         OG_image_name = crop.stem[:-11]  # Remove the last 15 characters to get the original image name
         OG_image_path = Path(source_folder).joinpath(Path(OG_image_name + ".png"))
         
-        # check if the original image exists in the source folder
-        if OG_image_name in monitoring_image_names:
-            print(f"  Found matching original image for crop: {crop.name}, OG image name: {OG_image_name}")
+        # check if the original image exists in the source folder, if og_image_name is already added to df_matches it can be skipped
+        if OG_image_name in monitoring_image_names and OG_image_name not in df_matches["image_name"].values:
+            print(f"  Found matching original image for crop: {crop.name}, OG image name: {OG_image_name}", end="\r")
             entry = pd.DataFrame({
                 "image_path": [OG_image_path],
                 "image_name": [OG_image_name],

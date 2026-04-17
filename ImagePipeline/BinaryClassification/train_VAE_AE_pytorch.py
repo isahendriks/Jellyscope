@@ -138,6 +138,7 @@ SAMPLE_IMAGE_IDX_TRAIN = random.randint(0, len(images_train) - 1)  # Index of th
 sample_image_path_train = images_train[SAMPLE_IMAGE_IDX_TRAIN] 
 sample_image_name_train = sample_image_path_train.stem
 
+
 # Find all tiles corresponding to the sample image
 _r_patterns = ("?", "??", "???", "????")
 _c_patterns = ("?", "??", "???", "????")

@@ -1,0 +1,27 @@
+# GPU packages from PyTorch official index
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.10.0
+torchvision==0.25.0
+torchaudio==2.10.0
+
+# Core dependencies for train_VAE.py
+deeptrack==1.6.0
+deeplay==0.1.4
+lightning==2.6.1
+torchmetrics==1.8.2
+
+# Data & visualization
+numpy==2.2.6
+matplotlib==3.10.8
+pillow==12.1.1
+opencv-python==4.13.0.92
+scikit-image==0.25.2
+scipy==1.15.3
+
+# Data processing
+scikit-learn==1.7.2
+pandas==2.3.3
+
+# Additional utilities
+tqdm==4.67.3
+pint
