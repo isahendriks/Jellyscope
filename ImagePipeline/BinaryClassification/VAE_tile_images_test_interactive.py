@@ -1,5 +1,4 @@
 #%% Cell 1: Import Packages
-
 import os
 import cv2
 import numpy as np
@@ -7,8 +6,6 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import pandas as pd
-
-from functions import split_image_into_tiles
 
 print("\n" + "="*60)
 print("Interactive Tile Labeler - Simple Grid-Based")
@@ -25,13 +22,25 @@ output_folder = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data\Binary_classi
 
 all_image_files = sorted(list(Path(input_folder).rglob('*.png')))
 
+# Check if images are already in output folder, exclude those images
+processed_obs_patches = set(Path(output_folder).rglob('obs/*.png'))
+processed_no_obs_patches = set(Path(output_folder).rglob('no_obs/*.png'))
+
+processed_patches = processed_obs_patches.union(processed_no_obs_patches)
+processed_images = set(patch.stem.rsplit('_r', 1)[0] for patch in processed_patches)
+
+# Filter out images that are already processed
+all_image_files_unprocessed = [img for img in all_image_files if img not in processed_images]
+
 print(f"Configuration:")
 print(f"  Input folder:  {input_folder}")
 print(f"  Output folder: {output_folder}")
 print(f"  Tile size:     {tile_size}x{tile_size}")
 print(f"  Grid size:     {grid_size}x{grid_size}")
 print(f"  Total images:  {len(all_image_files)}")
-
+print(f"  Already processed (obs): {len(processed_obs_patches)}")
+print(f"  Already processed (no_obs): {len(processed_no_obs_patches)}")
+print(f"  Remaining images to process: {len(all_image_files_unprocessed)}")
 print("\n" + "="*60)
 print("Parameters configured successfully!")
 print("="*60)
@@ -275,13 +284,13 @@ if progress_file.exists():
         start_index = 0
 
 # Ask user for starting index
-print(f"\nYou have {len(all_image_files)} images to process.")
+print(f"\nYou have {len(all_image_files_unprocessed)} images to process.")
 user_input = input(f"Enter starting index (default: {start_index} to continue): ").strip()
 
 if user_input:
     try:
         start_index = int(user_input)
-        if start_index < 0 or start_index >= len(all_image_files):
+        if start_index < 0 or start_index >= len(all_image_files_unprocessed):
             print(f"⚠ Invalid index. Using default {start_index}")
     except:
         print(f"⚠ Invalid input. Using default {start_index}")
@@ -296,13 +305,13 @@ fig, ax = plt.subplots(1, 1, figsize=(14, 14))
 current_image_index = start_index
 
 try:
-    for img_idx, image_path in enumerate(all_image_files[start_index:], start=start_index):
+    for img_idx, image_path in enumerate(all_image_files_unprocessed[start_index:], start=start_index):
         current_image_index = img_idx
-        print(f"\n[{img_idx + 1}/{len(all_image_files)}] {image_path.name}")
+        print(f"\n[{img_idx + 1}/{len(all_image_files_unprocessed)}] {image_path.name}")
         
         try:
             labeler = GridTileLabeler(image_path, grid_size=grid_size, tile_size=tile_size, 
-                                     fig=fig, ax=ax, img_idx=img_idx, total_images=len(all_image_files))
+                                     fig=fig, ax=ax, img_idx=img_idx, total_images=len(all_image_files_unprocessed))
             
             # Wait for user to confirm this image
             while not labeler.image_confirmed:
