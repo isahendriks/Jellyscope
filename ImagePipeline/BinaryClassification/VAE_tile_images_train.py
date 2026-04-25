@@ -22,8 +22,7 @@ grid_size = 32  # number of tiles along one side (e.g. 6 means 6x6=36 tiles per 
 tile_size = int(4512/grid_size)  # dimensions of tiles, clean divisions: 2, 3, 4, 6, 8, 9, 12, 16, 18, 24, 32, 36, 48, 72, 96, 144, 288, 576, 1152, 2304, 4512
 AUGMENTATION = False
 
-monitoring_effort = "Kristineberg_250915" #"Kristineberg_251128"
-
+monitoring_effort = "Kristineberg_260424" #"Kristineberg_251128"
 
 # Folder paths
 input_folder = f"{monitoring_effort}\\train\\OG_images"# Folder containing images to split
@@ -32,7 +31,6 @@ output_folder = f"{monitoring_effort}\\train\\tiles{grid_size}"# Folder to save 
 input_path = Path(ROOT_DIR_C).joinpath(Path(input_folder))
 
 total_images = len(list(Path(input_path).rglob('*.png')))
-
 
 # Calculate expected tiles per image
 # load first image in the folder to get size (all images are same size)
@@ -49,6 +47,7 @@ expected_total_tiles = total_images * tiles_per_image
 # whether to apply data augmentation (e.g. rotations, flips) to the tiles (not implemented yet)
 if AUGMENTATION:
     output_folder += "_aug"
+    
 
 #%% Cell 3: Define input and output paths
 
@@ -164,3 +163,4 @@ if __name__ == "__main__":
     print("\n" + "="*60)
     print("All images processed successfully yippie!")
     print("="*60)
+# %%

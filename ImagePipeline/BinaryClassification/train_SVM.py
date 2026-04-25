@@ -64,8 +64,8 @@ SAMPLE_IMAGE_IDX_TEST = 0
 DEBUG = False
 n_debug = 0.2
 
-# monitoring_effort = "Kristineberg_251128"
-monitoring_effort = "Kristineberg_250915"
+monitoring_effort = "Kristineberg_251128"
+# monitoring_effort = "Kristineberg_250915"
 grid_size = 32
 latent_dim = 32
 batch_size = 1024

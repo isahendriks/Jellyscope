@@ -15,18 +15,37 @@ print("="*60)
 
 grid_size = 32
 tile_size = int(4512 / grid_size)
-monitoring_effort = 'Kristineberg_251128'
+monitoring_effort = 'Kristineberg_260424'  #
 
-input_folder = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data\Binary_classifier\{}\test\OG_images".format(monitoring_effort)
-output_folder = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data\Binary_classifier\{}\test\tiles{}".format(monitoring_effort, grid_size)
+ROOT_C = r"C:\Users\Admin\Documents\Jellyscope\Training data\Binary_classifier"
+ROOT_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data\Binary_classifier"
 
-all_image_files = sorted(list(Path(input_folder).rglob('*.png')))
+input_folder = r"{}\test\OG_images".format(monitoring_effort)
+output_folder = r"{}\test\tiles{}".format(monitoring_effort, grid_size)
+
+input_path = Path(ROOT_C).joinpath(Path(input_folder))
+output_path = Path(ROOT_C).joinpath(Path(output_folder))
+
+all_image_files = sorted(list(Path(input_path).rglob('*.png')))
+species_names = [str(img_name)[126:-4] for img_name in all_image_files]  # Extract species name from filename
+species_names = np.unique(species_names)  # Get unique species names
+
+species_names_to_exclude =  ['dentritus', 'dentritus_glo', 'filament', 'macro_filament', 'filament_glo'] # Set this to a subset of species if you want to filter
+species_names_to_include = [str(name) for name in species_names if name not in species_names_to_exclude] 
+
+# exclude images that do not match the included species names
+all_image_files_filtered = []
+for img in all_image_files:
+    species_name = str(img)[126:-4]  # Extract species name from filename
+    if species_name in species_names_to_include:
+        all_image_files_filtered.append(img)
+
+print(f"Excluded species names: {species_names_to_exclude}, corresponding to {len(all_image_files) - len(all_image_files_filtered)} images")
+print(f"Images after filtering: {len(all_image_files_filtered)}")
 
 # Check if images are already in output folder, exclude those images.
-# Fast path: only look for the sentinel tile *_r0_c0.png (one file per processed image)
-# instead of scanning every patch file.
-obs_folder = Path(output_folder) / 'obs'
-no_obs_folder = Path(output_folder) / 'no_obs'
+obs_folder = output_path / Path('obs')
+no_obs_folder = output_path / Path('no_obs')
 
 processed_images = set()
 for patch in obs_folder.glob('*_r0_c0.png'):
@@ -36,19 +55,17 @@ for patch in no_obs_folder.glob('*_r0_c0.png'):
 
 ## Filter out images that are already processed
 all_image_files_unprocessed = []
-for img in all_image_files:
-    if img.stem in processed_images:
-        print(f"✓ Already processed: {img.name}")
-    else:
-        print(f"→ To process: {img.name}")
+for img in all_image_files_filtered:
+    if img.stem not in processed_images:
         all_image_files_unprocessed.append(img)
 
 print(f"Configuration:")
-print(f"  Input folder:  {input_folder}")
-print(f"  Output folder: {output_folder}")
+print(f"  Input folder:  {input_path}")
+print(f"  Output folder: {output_path}")
 print(f"  Tile size:     {tile_size}x{tile_size}")
 print(f"  Grid size:     {grid_size}x{grid_size}")
 print(f"  Total images:  {len(all_image_files)}")
+print(f"  Images after filtering by species: {len(all_image_files_filtered)}")
 print(f"  Already processed images: {len(processed_images)}")
 print(f"  Remaining images to process: {len(all_image_files_unprocessed)}")
 print("\n" + "="*60)
@@ -59,10 +76,9 @@ print("="*60)
 image_files_to_process = all_image_files_unprocessed
 
 #%% Cell 3: Create output folders
-output_path = Path(output_folder)
 output_path.mkdir(parents=True, exist_ok=True)
-(output_path / "obs").mkdir(exist_ok=True)
-(output_path / "no_obs").mkdir(exist_ok=True)
+(output_path / Path("obs")).mkdir(exist_ok=True)
+(output_path / Path("no_obs")).mkdir(exist_ok=True)
 
 #%% Cell 4: Simple Grid-Based Tile Labeler Class
 
@@ -95,6 +111,9 @@ class GridTileLabeler:
             self.fig, self.ax = plt.subplots(1, 1, figsize=(14, 14))
         else:
             self.fig, self.ax = fig, ax
+        
+        # Add margin at top to prevent title overlap
+        self.fig.subplots_adjust(top=0.93)
         
         self.tile_rects = {}  # {linear_idx: rect_patch}
         self.image_confirmed = False  # Flag to track when user presses 'c'
@@ -162,7 +181,7 @@ class GridTileLabeler:
         title += f"OBS (green): {len(self.obs_indices)} | NO_OBS (red): {self.grid_size * self.grid_size - len(self.obs_indices)}\n\n"
         title += "LEFT-CLICK: mark/unmark | 'r': reset | 'u': undo | 'c': save & next | 'e': exit"
         
-        self.ax.set_title(title, fontsize=12, fontweight='bold', pad=20)
+        self.ax.set_title(title, fontsize=9, fontweight='bold', pad=20)
         self.fig.canvas.draw_idle()
     
     def get_tile_at_click(self, x, y):
@@ -204,8 +223,9 @@ class GridTileLabeler:
             print("\n✓ Confirming image...")
             self.save_image()
             self.image_confirmed = True
-            # Update title to show saved message
-            self.ax.set_title("✓ Saved - Next image coming...", fontsize=14, fontweight='bold', pad=20, color='green')
+            # Update title to show saved message with species name
+            species_name = self.image_path.stem.split('_')[-1]
+            self.ax.set_title(f"✓ Saved - {species_name} - Next image coming...", fontsize=10, fontweight='bold', pad=20, color='green')
             self.fig.canvas.draw_idle()
         
         elif event.key == 'r':
@@ -273,7 +293,7 @@ class GridTileLabeler:
     
     def save_progress(self, index):
         """Save progress to file."""
-        progress_file = Path(output_folder) / "progress.txt"
+        progress_file = output_path / "progress.txt"
         progress_file.write_text(str(index))
 
 #%% Cell 5: Process Images Interactively
@@ -286,7 +306,7 @@ print("="*60)
 crops_to_save = []
 
 # Load progress from file
-progress_file = Path(output_folder) / "progress.txt"
+progress_file = output_path / "progress.txt"
 start_index = 0
 
 if progress_file.exists():
@@ -369,7 +389,7 @@ if crops_to_save:
         print(f"  Saving crop {crop_idx}/{len(crops_to_save)}: {filename}", end='\r')
         
         # Save crop to disk in appropriate folder
-        filepath = Path(output_folder) / label / filename
+        filepath = output_path / label / filename
         if filepath.exists():
             duplicates.append(filename)
         
@@ -388,7 +408,7 @@ if crops_to_save:
     
     # Create and save dataframe
     df = pd.DataFrame(df_data)
-    csv_path = Path(output_folder) / "crops_metadata.csv"
+    csv_path = output_path / "crops_metadata.csv"
     df.to_csv(csv_path, index=False)
     
     # Count obs and no_obs
@@ -412,7 +432,7 @@ else:
 print("\n" + "="*60)
 print("Interactive Tile Labeler - COMPLETE")
 print("="*60)
-print(f"All labeled tiles saved to: {output_folder}")
+print(f"All labeled tiles saved to: {output_path}")
 
 # Delete progress file when done
 # if progress_file.exists():

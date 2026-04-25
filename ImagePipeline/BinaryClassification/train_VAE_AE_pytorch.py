@@ -60,7 +60,7 @@ DEBUG = False
 N_DEBUG = 5000
 EPOCHS_DEBUG = 10
 
-monitoring_effort = "Kristineberg_250915"  # for titles and saved model names, e.g. "kristineberg_251128" 
+monitoring_effort = "Kristineberg_260424"  # for titles and saved model names, e.g. "kristineberg_251128" 
 grid_size = 32  # number of tiles along one side (e.g. 6 means 6x6=36 tiles per image)
 
 # model hyperparameters
@@ -83,6 +83,9 @@ print(f"total training tiles found: {len(list(Path(train_tiles_path).rglob('*.pn
 model_name = f"models/{monitoring_effort}_vae_model{grid_size}_l{latent_dims}.pth"
 if DEBUG:
     model_name = model_name.replace(".pth", "_debug.pth")
+    epochs = EPOCHS_DEBUG
+    images_train = images_train[:N_DEBUG // (grid_size**2)]  
+    
 model_output_path = Path(model_name)
 model_output_path.parent.mkdir(parents=True, exist_ok=True)
 

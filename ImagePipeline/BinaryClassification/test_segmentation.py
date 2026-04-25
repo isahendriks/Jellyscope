@@ -19,7 +19,12 @@ from matplotlib.patches import Rectangle
 from sklearn.decomposition import PCA
 import matplotlib as mpl
 
-from functions import split_image_into_tiles, classify_image, mahalanobis_distance, VariationalAutoencoder, test_image_pipeline, preprocess_tile
+from functions import split_image_into_tiles, VariationalAutoencoder, test_image_pipeline, preprocess_tile
+
+def mahalanobis_distance(x, mu, cov_inv):
+    diff = x - mu
+    d2 = np.sum(diff @ cov_inv * diff, axis=1)  # Mahalanobis distance squared
+    return d2
 
 #%% Activate GPU
 
@@ -203,15 +208,7 @@ for batch in tile_loader:
     image_names_list.append(image_names)
 
     tiles_numpy = tiles.cpu().numpy()  # Convert tile tensor to numpy array for visualization
-    # tile_gray = cv2.cvtColor(tiles_numpy, cv2.COLOR_BGR2GRAY)  # Convert tile to grayscale for visualization
     tile_list.append(tiles_numpy)  # Store the original tile image for later visualization
-    
-    # predict obs vs no_obs based on Mahalanobis distance in latent space
-    d2 = mahalanobis_distance(mu, mu_g, np.linalg.inv(cov_g))  # Calculate Mahalanobis distance to the "empty" distribution
-    is_obs = d2 > threshold   # if threshold was set on d2
-
-    d2_list.append(d2)
-    label_list_d2.append(is_obs)
     
     # predict using OneClass SVM model    
     svm_features = np.hstack([mu, recon_err.cpu().detach().numpy().reshape(-1, 1)])  # Combine latent features and reconstruction error for SVM
@@ -223,6 +220,8 @@ for batch in tile_loader:
     svm_scores_list.append(svm_scores)
     label_list_svm.append(label_svm_is_obs)
     
+    is_obs = label_svm_is_obs  # Use SVM predicted labels for now, can switch to d2 or binary SVM later
+
     # Predict using Binary SVM if available
     if binary_svm_available:
         binary_svm_features = np.hstack([mu, recon_err.cpu().detach().numpy().reshape(-1, 1)])
@@ -237,12 +236,10 @@ for batch in tile_loader:
         binary_svm_scores_list.append(binary_svm_scores)
     
     batch_counter += 1
-    print(f"processed batch {batch_counter}/{len(tile_loader)} | obs={is_obs.sum()} empty = {(~is_obs).sum()}", end="\r")
+    print(f"processed batch {batch_counter}/{len(tile_loader)} |SVM classification: obs={label_svm_is_obs.sum()} empty = {(~label_svm_is_obs).sum()}", end="\r")
 
 mu_array = np.concatenate(mu_list, axis=0)
-d2_array = np.concatenate(d2_list, axis=0)
 
-labels_array_d2 = np.concatenate(label_list_d2, axis=0)
 labels_array_svm = np.concatenate(label_list_svm, axis=0)
 labels_array_binary_svm = np.concatenate(label_list_binary_svm, axis=0) if binary_svm_available else None
 image_names_array = np.concatenate(image_names_list, axis=0)
@@ -260,55 +257,68 @@ df_latent.insert(0, "image_name", image_names_array)  # Add image names as the f
 df_latent.insert(1, "tile_row", tile_rows_array)
 df_latent.insert(2, "tile_col", tile_cols_array)
 df_latent.insert(3, "recon_error", recon_array)  # Add reconstruction error as a column
-df_latent.insert(4, "label_predicted_d2", labels_array_d2)  # Add manual labels (True for obs, False for no_obs)
-df_latent.insert(5, "label_predicted_svm", labels_array_svm)  # Add SVM predicted labels
+df_latent.insert(4, "label_predicted_svm", labels_array_svm)  # Add SVM predicted labels
 
-df_latent.insert(6, "label_predicted_bsvm", labels_array_binary_svm)  # Add Binary SVM predicted labels
-df_latent.insert(7, "d2", d2_array)  # Add Mahalanobis distance values
-df_latent.insert(8, "svm_scores", svm_scores_array)  # Add OneClass SVM scores
-df_latent.insert(9, "bsvm_scores", binary_svm_scores_array)  # Add Binary SVM scores
+df_latent.insert(5, "label_predicted_bsvm", labels_array_binary_svm)  # Add Binary SVM predicted labels
+df_latent.insert(7, "svm_scores", svm_scores_array)  # Add OneClass SVM scores
+df_latent.insert(8, "bsvm_scores", binary_svm_scores_array)  # Add Binary SVM scores
 
 
 #%% print class distribution for manual labels and predicted labels both methods
-print(f"Class distribution for d2 threshold method: {df_latent['label_predicted_d2'].value_counts()}")
 print(f"Class distribution for OneClass SVM method: {df_latent['label_predicted_svm'].value_counts()}")
 print(f"Class distribution for Binary SVM method: {df_latent['label_predicted_bsvm'].value_counts()}")
-
 
 #%% chose method for predicted labels (d2 threshold vs SVM)
 # labels_predicted = df_latent["label_predicted_d2"].values
 labels_predicted = df_latent["label_predicted_bsvm"].values.astype(bool)
 observation_metric = "bsvm_scores"  # Choose which metric to visualize in the heatmap (e.g. "d2" or "svm_scores")
 
-#%% Show the original test image with the predicted obs tiles overlaid as green rectangles
+#%% Show the original test image with the predicted obs tiles overlaid as blob outlines
 
 method = "bsvm"  # Choose which metric to visualize in the heatmap (e.g. "d2" or "svm_scores")
 label_method = "label_predicted_" + method  # Choose which predicted label to visualize (e.g. "label_predicted_d2" or "label_predicted_svm")
 score_method = method + "_scores"  # Choose which score to visualize in the heatmap (e.g. "d2" or "svm_scores")
 
-
 # Extract unique image names from the dataframe
 image_names_unique = df_latent["image_name"].unique()
 
-# Loop through each unique image and overlay predicted labels as a grid on original image
+# Loop through each unique image and overlay predicted labels as blob outlines on original image
 for image_name in image_names_unique:  # Show the first image only for testing
     df_latent_image = df_latent[df_latent["image_name"] == image_name]
 
     image_path = Path(test_images_folder) / f"{image_name}.png"
     image = cv2.imread(str(image_path))
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    
+    # Create a binary mask for predicted observations
+    image_h, image_w = image.shape[:2]
+    mask = np.zeros((image_h, image_w), dtype=np.uint8)
+    
+    for df_tile in df_latent_image.itertuples():
+        if df_tile.label_predicted_bsvm == True:  # If predicted as obs
+            x0 = int(df_tile.tile_col * tile_size)
+            y0 = int(df_tile.tile_row * tile_size)
+            x1 = min(x0 + tile_size, image_w)
+            y1 = min(y0 + tile_size, image_h)
+            mask[y0:y1, x0:x1] = 255
+    
+    # Find contours from the binary mask
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     fig, ax = plt.subplots(1, 1, figsize=(12, 12))
-    ax.imshow(image)
+    ax.imshow(image_rgb)
+    
+    # Draw contours as green outlines
+    for contour in contours:
+        contour_xy = contour.squeeze().astype(int)
+        if contour_xy.ndim == 1:  # Single point
+            contour_xy = contour_xy.reshape(-1, 2)
+        if len(contour_xy) > 2:  # Only draw if contour has more than 2 points
+            ax.plot(contour_xy[:, 0], contour_xy[:, 1], color='lime', linewidth=2)
+            # Close the contour
+            ax.plot([contour_xy[-1, 0], contour_xy[0, 0]], [contour_xy[-1, 1], contour_xy[0, 1]], color='lime', linewidth=2)
 
-    # overlay predicted obs tiles
-    for df_tile in df_latent_image.itertuples():
-        x0 = int(df_tile.tile_col * tile_size)
-        y0 = int(df_tile.tile_row * tile_size)
-        rect = Rectangle((x0, y0), tile_size, tile_size, linewidth=2, edgecolor="lime", facecolor="none")  # green rectangle for predicted obs tiles
-        if df_tile.label_predicted_bsvm == True:  # If predicted as obs, add green rectangle
-            ax.add_patch(rect)
-
-    ax.set_title(f"Predicted obs tiles in green for image: {image_name}", fontsize=16, fontweight="bold")
+    ax.set_title(f"Predicted obs blobs in green for image: {image_name}", fontsize=16, fontweight="bold")
     ax.axis("off")
 
     plt.tight_layout()
@@ -366,140 +376,3 @@ for i, image_name in enumerate(image_names_unique):  # Show heatmap for each ima
         save_path = output_folder_heatmaps / f"{image_name}_heatmap.png"
         plt.savefig(save_path, dpi=300, bbox_inches="tight", pad_inches=0)
         plt.close(fig)
-
-#%% PCA for visualization of latent space
-pca = PCA(n_components=2)
-mu_pca = pca.fit_transform(mu_array)
-
-plt.figure(figsize=(12, 10))
-plt.scatter(mu_pca[labels_predicted, 0], mu_pca[labels_predicted, 1], s=50, c="blue", label="obs", alpha=0.6, edgecolors='black', linewidth=0.5)
-plt.scatter(mu_pca[~labels_predicted, 0], mu_pca[~labels_predicted, 1], s=50, c="orange", label="empty", alpha=0.6, edgecolors='black', linewidth=0.5)
-
-plt.xlabel("PCA 1", fontsize=24)
-plt.ylabel("PCA 2", fontsize=24)
-plt.legend(loc="best", fontsize=12)
-plt.title("Outlier detection in 2D latent space", fontsize=20, fontweight="bold")
-plt.grid()
-plt.show()
-
-
-bins = np.linspace(0, df_latent["d2"].max(), int(df_latent["d2"].max()/threshold*4 ))
-
-plt.figure(figsize=(6,4))
-plt.hist(df_latent.loc[df_latent.label_predicted_d2==0,'d2'], bins=bins, alpha=0.6, label='no_obs', color='orange')
-plt.hist(df_latent.loc[df_latent.label_predicted_d2==1,'d2'], bins=bins, alpha=0.6, label='obs', color='blue')
-plt.vlines(threshold, ymin=0, ymax=12000, colors='red', linestyles='dashed', label=f'Threshold (d2={threshold:.1f})')
-plt.xlabel("Mahalanobis distance (d2)", fontsize=16)
-plt.ylabel("Counts", fontsize=16)
-plt.ylim(0, 12000)
-plt.tight_layout()
-plt.grid()
-plt.legend()
-plt.title("Mahalanobis distance distributions predicted labels"); plt.show()
-
-#%% Test on single image and visualize the tiles with lowest and highest Mahalanobis distance (most likely obs vs most likely empty)
-empty_images_path = r"R:\LU24A1037-Jellyscope\Jellyscope\Monitoring data\Kristineberg_250915\Binary_classifier_test_data\checked\Hard_class\Without_jellyfish\Background"
-empty_images_list = list(Path(empty_images_path).glob("*.png"))
-random_empty_image = np.random.choice(empty_images_list)
-
-image_path = random_empty_image  # Test on the first image in the folder
-grid_size = tile_grid_size
-model = model
-
-grid_size = grid_size
-threshold = 50# threshold
-mu_g = mu_g
-cov_g = cov_g
-device=device
-batch_size=64
-image_size = image_size
-plot=True
-
-classify_image(image_path, model, grid_size, threshold, mu_g, cov_g, device, batch_size, image_size, plot)
-
-#%%
-empty_images_path = r"R:\LU24A1037-Jellyscope\Jellyscope\Monitoring data\Kristineberg_250915\Binary_classifier_test_data\checked\Hard_class\Without_jellyfish\Background"
-empty_images_list = list(Path(empty_images_path).glob("*.png"))
-random_empty_image = np.random.choice(empty_images_list)
-
-image_path = Path(random_empty_image)
-cov_inv = np.linalg.inv(np.asarray(cov_g))
-tile_size = 4512 // grid_size
-
-# 1. load & tile 
-image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
-if image is None:
-    raise FileNotFoundError(f"Could not load image: {image_path}")
-
-raw_tiles = split_image_into_tiles(image, grid_size=grid_size)  # list of (tile, row, col)
-dataset = [(tile, row, col) for tile, row, col in raw_tiles]
-
-# 3. encode & score 
-mu_list, d2_list, rows_list, cols_list = [], [], [], []
-model.eval()
-model.to(device)
-with torch.no_grad():
-    for raw_tile in raw_tiles:
-        tile, row, col = raw_tile
-        tile = preprocess_tile(tile)  # Apply same preprocessing as during training
-        tile = tile.to(device)  # Add batch dimension and move to device
-        mu, _ = model.encode(tile)
-        
-        mu_np = mu.cpu().numpy()
-        d2 = mahalanobis_distance(mu_np, mu_g, cov_inv)
-        mu_list.append(mu_np)
-        d2_list.append(d2)
-        rows_list.append(row)
-        cols_list.append(col)
-
-mu_array = np.concatenate(mu_list, axis=0)
-d2_array = np.concatenate(d2_list, axis=0)
-labels_array = d2_array > threshold
-
-# 4. build df 
-latent_cols = [f"latent_{i}" for i in range(mu_array.shape[1])]
-df_latent = pd.DataFrame(mu_array, columns=latent_cols)
-df_latent.insert(0, "image_name",     image_path.stem)
-df_latent.insert(1, "tile_row",       rows_list)
-df_latent.insert(2, "tile_col",       cols_list)
-df_latent.insert(3, "label_predicted", labels_array)
-df_latent.insert(4, "d2",             d2_array)
-
-# 5. heatmap plot 
-if plot:
-    likelihood_threshold = chi2.cdf(threshold, df=2)
-    cmap_ryg = mpl.colors.LinearSegmentedColormap.from_list(
-        "red_yellow_green", ["red", "yellow", "green"])
-    norm = mpl.colors.TwoSlopeNorm(
-        vmin=0.0, vcenter=likelihood_threshold, vmax=1.0)
-
-    image = cv2.imread(str(image_path))
-    fig, ax = plt.subplots(1, 1, figsize=(12, 12))
-    ax.imshow(image)
-    ax.axis("off")
-    ax.set_title(f"Observation likelihood: {image_path.stem}",
-                 fontsize=16, fontweight="bold")
-
-    for _, row in df_latent.iterrows():
-        obs_likelihood = chi2.cdf(row["d2"], df=2)
-        color = cmap_ryg(norm(obs_likelihood))
-        x0 = int(row["tile_col"] * tile_size)
-        y0 = int(row["tile_row"] * tile_size)
-        rect = Rectangle(
-            (x0, y0), tile_size, tile_size,
-            linewidth=0, edgecolor="none",
-            facecolor=color, alpha=0.45)
-        ax.add_patch(rect)
-
-    sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap_ryg)
-    sm.set_array([])
-    ticks = np.linspace(0, 1, 6)
-    cbar = fig.colorbar(sm, ax=ax, fraction=0.02, pad=0.01,
-                            aspect=30, location="right")
-    cbar.set_ticks(ticks)
-    cbar.set_ticklabels([f"{t:.1f}" for t in ticks], fontsize=16)
-    cbar.set_label("Observation likelihood",
-                    rotation=90, fontsize=16, fontweight="bold")
-    plt.tight_layout()
-    plt.show()
-# %%
