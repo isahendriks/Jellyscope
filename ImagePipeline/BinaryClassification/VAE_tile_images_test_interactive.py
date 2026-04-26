@@ -13,7 +13,7 @@ print("="*60)
 
 #%% Cell 2: Define User Parameters
 
-grid_size = 32
+grid_size = 16
 tile_size = int(4512 / grid_size)
 monitoring_effort = 'Kristineberg_260424'  #
 

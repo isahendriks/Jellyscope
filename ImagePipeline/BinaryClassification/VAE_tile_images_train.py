@@ -18,7 +18,7 @@ ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data\Binary_classifie
 ROOT_DIR_C = r"C:\Users\Admin\Documents\Jellyscope\Training data\Binary_classifier"   
 
 # Tile parameters
-grid_size = 32  # number of tiles along one side (e.g. 6 means 6x6=36 tiles per image)
+grid_size = 16  # number of tiles along one side (e.g. 6 means 6x6=36 tiles per image)
 tile_size = int(4512/grid_size)  # dimensions of tiles, clean divisions: 2, 3, 4, 6, 8, 9, 12, 16, 18, 24, 32, 36, 48, 72, 96, 144, 288, 576, 1152, 2304, 4512
 AUGMENTATION = False
 
@@ -48,7 +48,6 @@ expected_total_tiles = total_images * tiles_per_image
 if AUGMENTATION:
     output_folder += "_aug"
     
-
 #%% Cell 3: Define input and output paths
 
 # Create output folder

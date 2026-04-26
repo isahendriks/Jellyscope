@@ -61,7 +61,7 @@ N_DEBUG = 5000
 EPOCHS_DEBUG = 10
 
 monitoring_effort = "Kristineberg_260424"  # for titles and saved model names, e.g. "kristineberg_251128" 
-grid_size = 32  # number of tiles along one side (e.g. 6 means 6x6=36 tiles per image)
+grid_size = 16  # number of tiles along one side (e.g. 6 means 6x6=36 tiles per image)
 
 # model hyperparameters
 image_size = 128
@@ -92,8 +92,8 @@ model_output_path.parent.mkdir(parents=True, exist_ok=True)
 # training hyperparameters
 batch_size = 64
 learning_rate = 1e-4 * (batch_size / 64)  # scale learning rate with batch size
-epochs = 50
-warmup_epochs = 30  # Number of epochs to linearly increase learning rate (helps stabilize early training)
+epochs = 70
+warmup_epochs = 40  # Number of epochs to linearly increase learning rate (helps stabilize early training)
 if DEBUG:
     print(f"DEBUG MODE: Using only {N_DEBUG} tiles and training for {EPOCHS_DEBUG} epochs \n if saving enabled model name will be: {model_output_path.name}")
 #%% Load train data
@@ -515,3 +515,5 @@ plt.show()
 
 print(f"Bby you are done stop running cells and relax a lil")
 
+
+# %%

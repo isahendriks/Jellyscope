@@ -57,9 +57,9 @@ print(f"Using device:      {device}")
 # ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data\Binary_classifier"
 ROOT_DIR_C = r"C:\Users\Admin\Documents\Jellyscope\Training data\Binary_classifier"   
 # monitoring_effort = "Kristineberg_251128" 
-monitoring_effort = "Kristineberg_250915" 
+monitoring_effort = "Kristineberg_260424" 
 
-test_images_folder = os.path.join(ROOT_DIR_C, monitoring_effort, "test", "OG_images")
+test_images_folder = os.path.join(ROOT_DIR_C, monitoring_effort, "val", "OG_images")
 tile_grid_size = 32 # how many tiles along one side (e.g. 6 means 6x6=36 tiles per image)
 tile_size = 4512 // tile_grid_size # size of the tiles that the original image is split into
 latent_dim = 32 # how many tiles along one side 
@@ -271,11 +271,11 @@ print(f"Class distribution for Binary SVM method: {df_latent['label_predicted_bs
 #%% chose method for predicted labels (d2 threshold vs SVM)
 # labels_predicted = df_latent["label_predicted_d2"].values
 labels_predicted = df_latent["label_predicted_bsvm"].values.astype(bool)
-observation_metric = "bsvm_scores"  # Choose which metric to visualize in the heatmap (e.g. "d2" or "svm_scores")
+observation_metric = "svm_scores"  # Choose which metric to visualize in the heatmap (e.g. "d2" or "svm_scores")
 
 #%% Show the original test image with the predicted obs tiles overlaid as blob outlines
 
-method = "bsvm"  # Choose which metric to visualize in the heatmap (e.g. "d2" or "svm_scores")
+method = "svm"  # Choose which metric to visualize in the heatmap (e.g. "d2" or "svm_scores")
 label_method = "label_predicted_" + method  # Choose which predicted label to visualize (e.g. "label_predicted_d2" or "label_predicted_svm")
 score_method = method + "_scores"  # Choose which score to visualize in the heatmap (e.g. "d2" or "svm_scores")
 
@@ -337,14 +337,30 @@ obs_likelihood = df_latent[score_method]
 obs_min = obs_likelihood.min()
 obs_max = obs_likelihood.max()
 obs_likelihood_scaled = (obs_likelihood - obs_min) / (obs_max - obs_min)  # Normalize to [0,1] for color mapping
+
+print(f"Score range: [{obs_min:.3f}, {obs_max:.3f}], Loaded threshold: {binary_svm_threshold:.3f}")
+
+# Smart threshold handling: if threshold is outside score range, recalculate
+if binary_svm_threshold < obs_min or binary_svm_threshold > obs_max:
+    print(f"⚠ WARNING: Threshold {binary_svm_threshold:.3f} is outside score range [{obs_min:.3f}, {obs_max:.3f}]")
+    print("  Using median of scores as threshold instead.")
+    binary_svm_threshold = obs_likelihood.median()
+    print(f"  New threshold (median): {binary_svm_threshold:.3f}")
+else:
+    print(f"✓ Threshold {binary_svm_threshold:.3f} is within score range")
+
+# Optional: Allow manual threshold override
+MANUAL_THRESHOLD = None  # Set to a value (e.g., 0.5) to override the loaded threshold
+if MANUAL_THRESHOLD is not None:
+    print(f"⚠ Using manual threshold override: {MANUAL_THRESHOLD:.3f}")
+    binary_svm_threshold = MANUAL_THRESHOLD
+
 threshold_heatmap = (binary_svm_threshold - obs_min) / (obs_max - obs_min)  # Normalize threshold to [0,1]
-threshold_heatmap = threshold_heatmap  # Adjust threshold for heatmap visualization (e.g., 80% of the way to the threshold to show more gradation in colors below the threshold)
 
 cmap = mpl.colors.LinearSegmentedColormap.from_list("red_yellow_green", ["red", "yellow", "green"])
 norm = mpl.colors.TwoSlopeNorm(vmin=threshold_heatmap*0.8, vcenter=threshold_heatmap, vmax=threshold_heatmap*1.2) # for midpoint at threshold
 
-print(f"Observation likelihood threshold: {threshold_heatmap:.3f}")
-print(f"Score range: [{obs_min:.3f}, {obs_max:.3f}], Binary SVM threshold: {binary_svm_threshold:.3f}")
+print(f"Final threshold (normalized): {threshold_heatmap:.3f}")
 
 ### Loop through each unique image and plot the tiles with a heatmap 
 
@@ -365,7 +381,7 @@ for i, image_name in enumerate(image_names_unique):  # Show heatmap for each ima
         y0 = int(df_tile.tile_row * tile_size)
         
         # Get the score value for this specific tile and normalize it
-        tile_score = getattr(df_tile, score_method)
+        tile_score = float(getattr(df_tile, score_method))
         tile_score_normalized = (tile_score - obs_min) / (obs_max - obs_min)
         
         color = cmap(norm(tile_score_normalized))

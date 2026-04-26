@@ -10,7 +10,6 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 
-import pickle as pkl
 from pathlib import Path
 import cv2
 
@@ -18,8 +17,7 @@ from matplotlib.patches import Rectangle
 from sklearn.decomposition import PCA
 import matplotlib as mpl
 
-from functions import VariationalAutoencoder, test_image_pipeline, extract_tiles_with_offset, extract_tiles_with_offset, find_local_maxima, flood_fill_region
-
+from functions import VariationalAutoencoder, ObservationScorer, test_image_pipeline, extract_tiles_with_offset, extract_tiles_with_offset, find_local_maxima, flood_fill_region
 
 #%% Activate GPU
 
@@ -72,20 +70,64 @@ SAVE_PREDICTION_IMAGES = False
 # Offset grid parameters
 offsets = [0, tile_size // 5, 2 * tile_size // 5, 3 * tile_size // 5, 4 * tile_size // 5]  # 0, 1/5, 2/5, 3/5, 4/5 offsets
 
+# NN Scorer mode: 'binary' or 'one_class'
+# Change this parameter to compare performance between modes
+scorer_mode_preference = 'auto'  # 'auto' tries binary first, then one_class
 
-# Fall back to SVM
-svm_model_name = model_name.replace("vae_model", "oc_svm_model").replace(".pth", ".pkl")
-svm_data = pkl.load(open(svm_model_name, "rb"))
-svm_model = svm_data[0]
-scaler = svm_data[1]
-weight_recon_error = svm_data[2]
-nu = svm_data[3] if len(svm_data) > 3 else None
-svm_score_threshold_original = svm_data[4] if len(svm_data) > 4 else None
-svm_score_threshold = svm_score_threshold_original
-    
-print(f"Loaded OneClass SVM model from: {svm_model_name} with parameters:", end="\n")
-print(f"weight_recon_error={weight_recon_error}, nu={nu}")
-print(f"Original threshold_svm={svm_data[4]:.8f}")
+print(f"\n{'='*70}")
+print("Loading Neural Network Scorer")
+print(f"{'='*70}")
+print(f"Mode preference: {scorer_mode_preference}")
+
+# Try to load scorer based on mode preference
+scorer = None
+scorer_mode_actual = None
+scorer_threshold = 0.5
+
+if scorer_mode_preference in ['auto', 'binary']:
+    # Try BINARY mode first
+    scorer_binary_name = model_name.replace("vae_model", "scorer_binary_model").replace(".pth", ".pth")
+    try:
+        checkpoint = torch.load(scorer_binary_name, map_location=device, weights_only=False)
+        scorer_mode_actual = checkpoint.get('mode', 'binary')
+        scorer = ObservationScorer(latent_dim=latent_dim, hidden_dim=256, dropout=0.3, 
+                                   grid_size=tile_grid_size, mode=scorer_mode_actual)
+        scorer.load_state_dict(checkpoint['model_state_dict'])
+        scorer_threshold = checkpoint.get('threshold', 0.5)
+        scorer.to(device)
+        scorer.eval()
+        print(f"✓ Loaded BINARY NN scorer")
+        print(f"  Model: {scorer_binary_name}")
+        print(f"  Threshold: {scorer_threshold:.4f}")
+    except FileNotFoundError:
+        pass
+
+if scorer is None and scorer_mode_preference in ['auto', 'one_class']:
+    # Try ONE-CLASS mode
+    scorer_oneclass_name = model_name.replace("vae_model", "scorer_oneclass_model").replace(".pth", ".pth")
+    try:
+        checkpoint = torch.load(scorer_oneclass_name, map_location=device, weights_only=False)
+        scorer_mode_actual = checkpoint.get('mode', 'one_class')
+        scorer = ObservationScorer(latent_dim=latent_dim, hidden_dim=256, dropout=0.3, 
+                                   grid_size=tile_grid_size, mode=scorer_mode_actual)
+        scorer.load_state_dict(checkpoint['model_state_dict'])
+        scorer_threshold = checkpoint.get('threshold', 0.5)
+        scorer.to(device)
+        scorer.eval()
+        print(f"✓ Loaded ONE-CLASS NN scorer")
+        print(f"  Model: {scorer_oneclass_name}")
+        print(f"  Threshold: {scorer_threshold:.4f}")
+    except FileNotFoundError:
+        pass
+
+if scorer is None:
+    print(f"✗ ERROR: No NN scorer models found!")
+    print(f"  Please train a scorer first:")
+    print(f"    - python train_scorer_oneclass.py   (one-class mode)")
+    print(f"    - python train_scorer_network.py    (binary mode)")
+    exit(1)
+
+print(f"Using {scorer_mode_actual.upper()} mode for inference")
     
 test_images_path = list(Path(test_images_folder).glob("*.png"))
 
@@ -119,8 +161,8 @@ model.eval()
 #%% Load many images (folder) and process with offset grids
 """
 The code below loads all test images from the specified folder and processes them using offset grids.
-For each offset (0, 1/3, 2/3 of tile_size), tiles are extracted and processed through the VAE/SVM pipeline.
-Results are aggregated by summing probabilities from overlapping regions.
+For each offset (0, 1/5, 2/5, 3/5, 4/5 of tile_size), tiles are extracted and processed through the VAE/NN pipeline.
+Results are aggregated by averaging probabilities from overlapping regions.
 """
 
 # Dictionary to store results for each offset
@@ -164,11 +206,8 @@ for offset_idx, offset in enumerate(offsets):
     
     mu_list = []
     image_names_list = []
-    d2_list = []
     recon_list = []
     svm_scores_list = []
-    label_list_d2 = []
-    label_list_svm = []
     path_label_list = []
     tile_rows = []
     tile_cols = []
@@ -199,16 +238,20 @@ for offset_idx, offset in enumerate(offsets):
         tiles_numpy = tiles.cpu().numpy()
         tile_list.append(tiles_numpy)
         
-        # Predict using SVM 
+        # Predict using NN scorer
         rows_numpy = rows.cpu().numpy()
         cols_numpy = cols.cpu().numpy()
         recon_err_np = recon_err.cpu().detach().numpy()
 
-        svm_features = np.hstack([mu, recon_err_np.reshape(-1, 1)])
-        svm_features = scaler.transform(svm_features)
-        svm_features[:, -1] *= weight_recon_error
-        svm_scores = -svm_model.decision_function(svm_features)
-        label_svm_is_obs = (svm_scores >= svm_score_threshold)
+        mu_tensor = torch.from_numpy(mu).float().to(device)
+        recon_err_tensor = torch.from_numpy(recon_err_np).float().to(device)
+        rows_tensor = torch.from_numpy(rows_numpy).long().to(device)
+        cols_tensor = torch.from_numpy(cols_numpy).long().to(device)
+        
+        svm_scores, label_svm_is_obs = scorer.predict_batch(mu_tensor, recon_err_tensor, rows_tensor, cols_tensor, 
+                                                             threshold=scorer_threshold)
+        svm_scores = svm_scores.cpu().numpy()
+        label_svm_is_obs = label_svm_is_obs.cpu().numpy()
 
         svm_scores_list.append(svm_scores)
         label_list_svm.append(label_svm_is_obs)
@@ -234,8 +277,8 @@ for offset_idx, offset in enumerate(offsets):
     df_latent.insert(1, "tile_row", tile_rows_array)
     df_latent.insert(2, "tile_col", tile_cols_array)
     df_latent.insert(3, "recon_error", recon_array)
-    df_latent.insert(4, "label_predicted_svm", labels_array_svm)
-    df_latent.insert(5, "svm_scores", svm_scores_array)
+    df_latent.insert(4, "label_predicted_nn", labels_array_svm)
+    df_latent.insert(5, "nn_scores", svm_scores_array)
     
     offset_results[offset] = df_latent
     
@@ -243,9 +286,9 @@ for offset_idx, offset in enumerate(offsets):
 
 #%% ######### SEGMENTATION AND VISUALIZATION ##########
 
-# Select threshold method
-threshold_method = svm_score_threshold
-method_name = "SVM (Fallback)"
+# Use NN scorer threshold
+threshold_method = scorer_threshold
+method_name = f"NN ({scorer_mode_actual.upper()})"
 
 print(f"Using {method_name} with threshold: {threshold_method:.4f}")
 

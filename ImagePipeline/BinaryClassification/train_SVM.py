@@ -26,7 +26,7 @@ from matplotlib.patches import Rectangle
 from sklearn.metrics import average_precision_score, classification_report, confusion_matrix, ConfusionMatrixDisplay, precision_recall_curve, roc_auc_score, roc_curve, auc
 from sklearn.decomposition import PCA
 
-from functions import Autoencoder, VariationalAutoencoder, mahalanobis_distance, eval_image_pipeline
+from functions import Autoencoder, VariationalAutoencoder, eval_image_pipeline
 
 print("Packages imported successfully.")
 
@@ -64,9 +64,9 @@ SAMPLE_IMAGE_IDX_TEST = 0
 DEBUG = False
 n_debug = 0.2
 
-monitoring_effort = "Kristineberg_251128"
+monitoring_effort = "Kristineberg_260424" #"Kristineberg_251128"
 # monitoring_effort = "Kristineberg_250915"
-grid_size = 32
+grid_size = 16
 latent_dim = 32
 batch_size = 1024
 
@@ -275,11 +275,10 @@ y_true_svm = df_svm_eval_sampled['label_manual'].values
 train_no_obs_mask_sampled = (df_svm_train_sampled['label_manual'] == False) # select only no_obs tiles for training
 train_no_obs_mask_sampled = train_no_obs_mask_sampled.values
 
-
 # Grid search for best (weight_recon_error, nu)
 # Split dataset for SVM training/eval
-weight_grid = [20, 25, 30, 35, 40]  # Adjust weights for reconstruction error as needed (e.g. 1, 2, 5, 10, 20)
-nu_grid = [0.01, 0.02, 0.03, 0.04, 0.05]  # Adjust nu values as needed, nu = number of datapoints within boundary / total number of datapoints (e.g. 0.1 means 10% of data is expected to be within the boundary, so smaller nu = tighter boundary = fewer obs predictions)
+weight_grid = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]  # Adjust weights for reconstruction error as needed (e.g. 1, 2, 5, 10, 20)
+nu_grid = [0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0006, 0.0007, 0.0008, 0.0009, 0.001] #, 0.002, 0.005, 0.０1, ０.０15] #０.０2, ０.０3, ０.０4, ０.０5]  # Adjust nu values as needed, nu = number of datapoints within boundary / total number of datapoints (e.g. ０.１ means １０% of data is expected to be within the boundary, so smaller nu = tighter boundary = fewer obs predictions)
 
 search_results = []
 for w in weight_grid:
@@ -327,8 +326,8 @@ print(search_df.head(10))
 print(f"\nSelected -> weight_recon_error={weight_recon_error}, nu={nu}, APS={best_row['aps']:.4f}")
 
 #%% Train final SVM with best hyperparameters, evaluate on eval set, plot ROC curve and confusion matrix, save model
-weight_recon_error = 20 # float(best_row["weight"])
-nu = 0.05 # float(best_row["nu"])
+weight_recon_error = float(best_row["weight"])
+nu = float(best_row["nu"])
 
 # fit scalar to full distribution of latent features in the eval set
 scaler = StandardScaler()
@@ -402,6 +401,16 @@ disp = ConfusionMatrixDisplay(confusion_matrix=cm_svm, display_labels=["no_obs",
 disp.plot(cmap=plt.cm.Blues, values_format=".2f")
 plt.title("Confusion Matrix for SVM")
 plt.show()
+
+#%% Save SVM model and parameters
+### One class SVM
+svm_model_name = model_name.replace("vae_model", "oc_svm_model").replace(".pth", ".pkl")
+print(f"\nSaving SVM model to: {svm_model_name} with paramters:", end = "\n")
+print(f"weight_recon_error={weight_recon_error}, nu={nu}, threshold_svm={threshold_svm:.8f}")
+with open(svm_model_name, "wb") as f:
+    pkl.dump((svm, scaler, weight_recon_error, nu, threshold_svm), f)
+print(f"\n One class SVM model trained and saved to: {svm_model_name}")
+
 
 #%% METHOD 2: Binary SVM on latent features + reconstruction error
 
@@ -524,17 +533,7 @@ plt.grid(alpha=0.3)
 plt.show()
 
 
-#%% Save SVM models
-
-### One class SVM
-svm_model_name = model_name.replace("vae_model", "oc_svm_model").replace(".pth", ".pkl")
-print(f"\nSaving SVM model to: {svm_model_name} with paramters:", end = "\n")
-print(f"weight_recon_error={weight_recon_error}, nu={nu}, threshold_svm={threshold_svm:.8f}")
-with open(svm_model_name, "wb") as f:
-    pkl.dump((svm, scaler, weight_recon_error, nu, threshold_svm), f)
-print(f"\n One class SVM model trained and saved to: {svm_model_name}")
-
-### Binary SVM
+#%% Save Binary SVM
 bsvm_model_name = model_name.replace("vae_model", "binary_svm_model").replace(".pth", ".pkl")
 print(f"\nSaving Binary SVM model to: {bsvm_model_name} with paramters:", end = "\n")
 print(f"threshold_bsvm={threshold_bsvm:.8f}")
