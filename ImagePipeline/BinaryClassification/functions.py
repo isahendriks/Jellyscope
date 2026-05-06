@@ -1,21 +1,15 @@
 
 import re
-
 import cv2
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib as mpl
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
-from scipy.stats import chi2
-from pathlib import Path
-from torch.utils.data import DataLoader
 from scipy.ndimage import maximum_filter
+from pathlib import Path
+import pandas as pd
 
-# Define convolutional encoder and decoder
+# Encoder 
 class Encoder(nn.Module):
     def __init__(self, latent_dims=2, image_size=128, hidden_channels=32, grid_size=16):
         super().__init__()
@@ -66,9 +60,9 @@ class Encoder(nn.Module):
         z = self.fc(h)
         return z
 
-
+### Variational Encoder for segmentation, with multi-level positional embeddings 
 class VariationalEncoder(nn.Module):
-    """Variational Encoder with multi-level positional embeddings (Method 2)"""
+    """Variational Encoder with continuous positional features"""
     def __init__(self, latent_dims=2, image_size=128, hidden_channels=32, grid_size=16):
         super().__init__()
         self.image_size = image_size
@@ -87,10 +81,9 @@ class VariationalEncoder(nn.Module):
             nn.ReLU(inplace=True),
         )
         
-        # Position embeddings (multi-level)
-        embedding_dim = hidden_channels * 4
-        self.row_embedding = nn.Embedding(grid_size, embedding_dim)
-        self.col_embedding = nn.Embedding(grid_size, embedding_dim)
+        # Shared positional embedding module
+        embedding_total_dim = hidden_channels * 8
+        self.pos_embedding = PositionalEmbedding(input_dim=10, output_dim=embedding_total_dim)
         
         # Compute output feature shape
         with torch.no_grad():
@@ -98,8 +91,6 @@ class VariationalEncoder(nn.Module):
             feat = self.conv(dummy)
         self.feat_shape = feat.shape[1:]
         self.feat_dim = feat.numel()
-        
-        embedding_total_dim = embedding_dim * 2  # row + col
         
         # Multi-level position fusion layers
         self.pos_fc1 = nn.Linear(embedding_total_dim, hidden_channels * 8)
@@ -124,13 +115,8 @@ class VariationalEncoder(nn.Module):
         h = torch.flatten(h, start_dim=1)
 
         if row is not None and col is not None:
-            row = row.to(x.device).long()
-            col = col.to(x.device).long()
-
-            # Get position embeddings
-            row_emb = self.row_embedding(row)
-            col_emb = self.col_embedding(col)
-            pos_emb = torch.cat([row_emb, col_emb], dim=1)
+            pos_features = compute_position_features(row, col, self.grid_size, x.device)
+            pos_emb = self.pos_embedding(pos_features)
             
             # LEVEL 1: Process position embeddings through FC
             pos_processed = self.pos_fc1(pos_emb)
@@ -173,13 +159,8 @@ class VariationalEncoder(nn.Module):
         h = torch.flatten(h, start_dim=1)
         
         if row is not None and col is not None:
-            row = row.to(x.device).long()
-            col = col.to(x.device).long()
-            
-            # Get position embeddings
-            row_emb = self.row_embedding(row)
-            col_emb = self.col_embedding(col)
-            pos_emb = torch.cat([row_emb, col_emb], dim=1)
+            pos_features = compute_position_features(row, col, self.grid_size, x.device)
+            pos_emb = self.pos_embedding(pos_features)
             
             # LEVEL 1: Process position embeddings through FC
             pos_processed = self.pos_fc1(pos_emb)
@@ -199,16 +180,14 @@ class VariationalEncoder(nn.Module):
             h = self.fusion_bn2(h)
             h = F.relu(h)
             h = self.fusion_dropout2(h)
-            
+
         mu = self.fc_mu(h)
         logvar = self.fc_logvar(h)
         return mu, logvar
 
-
-             
-        mu = self.fc_mu(h)
-        logvar = self.fc_logvar(h)
-        return mu, logvar
+    def _position_features(self, row, col, device):
+        """Deprecated: use compute_position_features() instead."""
+        return compute_position_features(row, col, self.grid_size, device)
 
 class Decoder(nn.Module):
     def __init__(self, latent_dims, feat_shape, image_size=128, hidden_channels=32):
@@ -241,7 +220,7 @@ class Decoder(nn.Module):
 
         return x_hat
 
-
+### Autoencoder that combines the Encoder and Decoder
 class Autoencoder(nn.Module):
     def __init__(self, latent_dims, image_size=128, in_channels=1, hidden_channels=32):
         super().__init__()
@@ -263,7 +242,7 @@ class Autoencoder(nn.Module):
         z = self.encoder(x, row=row, col=col)
         return self.decoder(z)
 
-
+### Variational Autoencoder that combines the VariationalEncoder and Decoder
 class VariationalAutoencoder(nn.Module):
     def __init__(self, latent_dims, image_size=128, hidden_channels=32, grid_size=16):
         super().__init__()
@@ -293,22 +272,23 @@ class ObservationScorer(nn.Module):
     - 'binary': Binary classification (observation vs empty)
     - 'one_class': One-class learning (detect anomalies when only empty data available)
     
-    Includes explicit position encoding to suppress corner/edge artifacts.
+    Uses shared positional encoding to ensure consistency with VAE.
     Designed for GPU-accelerated inference and training.
     
-    Input: latent_features (latent_dim) + recon_error (1) + position_features (3)
+    Input: latent_features (latent_dim) + recon_error (1) + processed position embedding
     Output: probability (1) of being observation (binary) or anomaly score (one_class)
     """
-    def __init__(self, latent_dim=32, hidden_dim=256, dropout=0.3, grid_size=16, mode='binary'):
+    def __init__(self, latent_dim=32, hidden_dim=256, dropout=0.3, grid_size=16):
         super().__init__()
         self.latent_dim = latent_dim
         self.grid_size = grid_size
-        self.mode = mode  # 'binary' or 'one_class'
         
-        assert mode in ['binary', 'one_class'], f"Mode must be 'binary' or 'one_class', got {mode}"
+        # Shared positional embedding module — matches VAE's pos_embedding
+        pos_emb_dim = max(16, 10 * 2)  # output dim of PositionalEmbedding with input_dim=10
+        self.pos_embedding = PositionalEmbedding(input_dim=10, output_dim=pos_emb_dim)
         
-        # Input: latent_dim + recon_error + 3 position features
-        input_dim = latent_dim + 1 + 3
+        # Input: latent_dim + recon_error (1) + pos_emb_dim
+        input_dim = latent_dim + 1 + pos_emb_dim
         
         # Dense layers with batch norm and dropout for regularization
         self.fc1 = nn.Linear(input_dim, hidden_dim)
@@ -325,6 +305,7 @@ class ObservationScorer(nn.Module):
         
         # Output probability [0, 1]
         self.fc_out = nn.Linear(hidden_dim // 4, 1)
+
         
     def forward(self, mu, recon_err, rows, cols):
         """
@@ -339,30 +320,13 @@ class ObservationScorer(nn.Module):
         Returns:
             Probability of observation (batch_size,) - values in [0, 1]
         """
-        batch_size = mu.shape[0]
+        # Use shared positional feature computation and embedding
+        pos_features = compute_position_features(rows, cols, self.grid_size, mu.device)
+        pos_emb = self.pos_embedding(pos_features)
         
-        # Compute position features
-        center = (self.grid_size - 1) / 2.0
-        rows_f = rows.float() if isinstance(rows, torch.Tensor) else torch.tensor(rows, dtype=torch.float32, device=mu.device)
-        cols_f = cols.float() if isinstance(cols, torch.Tensor) else torch.tensor(cols, dtype=torch.float32, device=mu.device)
-        
-        # Normalize to [-1, 1]
-        rows_norm = (rows_f - center) / center
-        cols_norm = (cols_f - center) / center
-        
-        # Distance from center [0, 1]
-        dist_from_center = torch.sqrt(rows_norm**2 + cols_norm**2) / np.sqrt(2)
-        dist_from_center = torch.clamp(dist_from_center, 0, 1)
-        
-        # Stack features: latent + recon_error + position features
+        # Stack features: latent + recon_error + processed position embedding
         recon_err_expanded = recon_err.unsqueeze(1) if recon_err.dim() == 1 else recon_err
-        features = torch.cat([
-            mu,
-            recon_err_expanded,
-            rows_norm.unsqueeze(1),
-            cols_norm.unsqueeze(1),
-            dist_from_center.unsqueeze(1)
-        ], dim=1)
+        features = torch.cat([mu, recon_err_expanded, pos_emb], dim=1)
         
         # Forward through dense network
         x = self.fc1(features)
@@ -385,502 +349,87 @@ class ObservationScorer(nn.Module):
         prob = torch.sigmoid(x).squeeze(-1)
         
         return prob
-    
+
     def predict_batch(self, mu, recon_err, rows, cols, threshold=0.5):
         """
         Batch prediction with thresholding.
-        
-        Args:
-            mu: Latent representations
-            recon_err: Reconstruction error
-            rows: Row indices
-            cols: Column indices
-            threshold: Classification threshold
-        
-        Returns:
-            Binary predictions and probabilities
-            
-        Note: In one-class mode, the network outputs probability of "normal" (empty).
-              We invert to get observation probability for consistency.
         """
+        
         with torch.no_grad():
-            probs = self.forward(mu, recon_err, rows, cols)
-            
-            # In one-class mode, invert prob (high prob = normal/empty, so 1-prob = observation)
-            if self.mode == 'one_class':
-                probs = 1.0 - probs
-            
+            probs = self.forward(mu, recon_err, rows, cols)            
             preds = (probs >= threshold).long()
+            
         return preds, probs
 
+### Shared Positional Encoding Components ###
+def compute_position_features(rows, cols, grid_size, device):
+    """
+    Compute continuous 10-D position features from tile row/col coordinates.
+    This function is shared across VAE and ObservationScorer to ensure consistency.
+    
+    Features: [x, y, x^2, y^2, x*y, r, sin(x), cos(x), sin(y), cos(y)]
+    where x,y are normalized to [0,1], and r is radial distance from center.
+    
+    Args:
+        rows: Tensor of row indices (B,)
+        cols: Tensor of column indices (B,)
+        grid_size: int, number of tiles along one dimension
+        device: torch device
+    
+    Returns:
+        pos_features: Tensor of shape (B, 10) with continuous positional features
+    """
+    rows_t = rows.to(device).float() if isinstance(rows, torch.Tensor) else torch.tensor(rows, dtype=torch.float32, device=device)
+    cols_t = cols.to(device).float() if isinstance(cols, torch.Tensor) else torch.tensor(cols, dtype=torch.float32, device=device)
 
-class SVM_NN(nn.Module):
+    denom = float(grid_size - 1)
+    y = rows_t / denom
+    x = cols_t / denom
+
+    # Radial distance from center (normalized) to deal with vignetting/illumination gradients
+    r = torch.sqrt((x - 0.5) ** 2 + (y - 0.5) ** 2)
+    
+    # Sin and cos positional features to capture periodicity and suppress edge/corner artifacts
+    sin_x = torch.sin(x * 2 * torch.pi)
+    cos_x = torch.cos(x * 2 * torch.pi)
+    sin_y = torch.sin(y * 2 * torch.pi)
+    cos_y = torch.cos(y * 2 * torch.pi)
+
+    return torch.stack([
+        x, y, x ** 2, y ** 2, x * y,
+        r, sin_x, cos_x, sin_y, cos_y
+    ], dim=1)
+
+
+class PositionalEmbedding(nn.Module):
     """
-    One-Class SVM implemented as a neural network for GPU acceleration.
-    Learns a nonlinear transformation to separate normal data from outliers.
+    Learnable MLP that processes raw positional features into an embedding.
+    Shared across VAE and ObservationScorer.
+    
+    Args:
+        input_dim: int, dimension of raw position features (default 10)
+        output_dim: int, dimension of output embedding
     """
-    def __init__(self, input_dim, hidden_dim=128, dropout=0.2):
+    def __init__(self, input_dim=10, output_dim=256):
         super().__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        
-        # Feature transformation layers
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
-        self.dropout1 = nn.Dropout(dropout)
-        
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
-        self.bn2 = nn.BatchNorm1d(hidden_dim // 2)
-        self.dropout2 = nn.Dropout(dropout)
-        
-        # Decision boundary
-        self.fc3 = nn.Linear(hidden_dim // 2, 1)
-        
-        self.threshold = 0.0
-        self.is_fitted = False
-        
-    def forward(self, x):
-        """Forward pass through the network"""
-        x = self.fc1(x)
-        x = self.bn1(x)
-        x = torch.relu(x)
-        x = self.dropout1(x)
-        
-        x = self.fc2(x)
-        x = self.bn2(x)
-        x = torch.relu(x)
-        x = self.dropout2(x)
-        
-        x = self.fc3(x)
-        return x.squeeze(-1)
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, max(16, input_dim * 2)),
+            nn.ReLU(inplace=True),
+            nn.Linear(max(16, input_dim * 2), output_dim),
+            nn.ReLU(inplace=True),
+        )
     
-    def fit(self, X, nu=0.05, epochs=100, batch_size=256, learning_rate=0.001, device='cuda'):
+    def forward(self, pos_features):
         """
-        Train the one-class SVM model using deep SVDD approach.
-        
         Args:
-            X: Training features (numpy array or tensor)
-            nu: Upper bound on fraction of outliers (default 0.05)
-            epochs: Number of training epochs
-            batch_size: Batch size for training
-            learning_rate: Learning rate for optimizer
-            device: Device to train on ('cuda' or 'cpu')
-        """
-        self.to(device)
-        self.train()
+            pos_features: Tensor of shape (B, 10) from compute_position_features
         
-        # Convert to tensor
-        if isinstance(X, np.ndarray):
-            X = torch.from_numpy(X).float()
-        
-        X = X.to(device)
-        
-        # Initialize optimizer
-        optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
-        
-        # Training loop
-        n_samples = X.shape[0]
-        for epoch in range(epochs):
-            # Shuffle data
-            perm = torch.randperm(n_samples)
-            X_shuffled = X[perm]
-            
-            epoch_loss = 0.0
-            for i in range(0, n_samples, batch_size):
-                X_batch = X_shuffled[i:i+batch_size]
-                
-                optimizer.zero_grad()
-                
-                # Forward pass
-                scores = self(X_batch)
-                
-                # One-class SVM loss (minimize mean score, penalize negative scores)
-                # This pushes the decision boundary to enclose most of the data
-                margin_loss = -scores.mean()  # Minimize mean distance to center
-                penalty_loss = torch.mean(torch.clamp(scores + 1.0, min=0))  # Penalize large negative scores
-                loss = margin_loss + 0.1 * penalty_loss
-                
-                loss.backward()
-                optimizer.step()
-                
-                epoch_loss += loss.item()
-            
-            if (epoch + 1) % max(1, epochs // 10) == 0:
-                print(f"  Epoch {epoch + 1}/{epochs}, Loss: {epoch_loss / (n_samples // batch_size):.4f}")
-        
-        self.eval()
-        
-        # Set threshold based on nu parameter
-        with torch.no_grad():
-            train_scores = self(X).cpu().numpy()
-            self.threshold = np.quantile(train_scores, 1 - nu)
-        
-        self.is_fitted = True
-        print(f"Training complete. Threshold set to: {self.threshold:.4f}")
-    
-    def decision_function(self, X, device='cuda'):
-        """
-        Get decision scores for samples.
-        Positive scores = normal, Negative scores = outliers
-        
-        Args:
-            X: Input features (numpy array or tensor)
-            device: Device to run on ('cuda' or 'cpu')
-            
         Returns:
-            Decision scores (numpy array)
+            pos_emb: Tensor of shape (B, output_dim)
         """
-        self.eval()
-        
-        if isinstance(X, np.ndarray):
-            X = torch.from_numpy(X).float()
-        
-        X = X.to(device)
-        
-        with torch.no_grad():
-            scores = self(X).cpu().numpy()
-        
-        return scores
-    
-    def predict(self, X, device='cuda'):
-        """
-        Predict class labels.
-        1 = normal (inlier), -1 = outlier
-        
-        Args:
-            X: Input features
-            device: Device to run on
-            
-        Returns:
-            Class labels (-1 or 1)
-        """
-        if not self.is_fitted:
-            raise RuntimeError("Model must be fitted before prediction")
-        
-        scores = self.decision_function(X, device)
-        return np.where(scores >= self.threshold, 1, -1)
-    
-    def predict_proba(self, X, device='cuda'):
-        """
-        Get probability-like scores (normalized to [0, 1]).
-        
-        Args:
-            X: Input features
-            device: Device to run on
-            
-        Returns:
-            Scores in range [0, 1] where higher = more normal
-        """
-        scores = self.decision_function(X, device)
-        # Normalize scores to [0, 1] using sigmoid
-        return 1.0 / (1.0 + np.exp(-scores))
-    
-    def save(self, path):
-        """Save model to disk"""
-        torch.save({
-            'model_state_dict': self.state_dict(),
-            'threshold': self.threshold,
-            'input_dim': self.input_dim,
-            'hidden_dim': self.hidden_dim,
-            'is_fitted': self.is_fitted
-        }, path)
-        print(f"Model saved to {path}")
-    
-    def load(self, path, device='cuda'):
-        """Load model from disk"""
-        checkpoint = torch.load(path, map_location=device)
-        
-        self.input_dim = checkpoint['input_dim']
-        self.hidden_dim = checkpoint['hidden_dim']
-        
-        # Rebuild model if dimensions don't match
-        if self.fc1.in_features != self.input_dim:
-            self.__init__(checkpoint['input_dim'], checkpoint['hidden_dim'])
-        
-        self.load_state_dict(checkpoint['model_state_dict'])
-        self.threshold = checkpoint['threshold']
-        self.is_fitted = checkpoint['is_fitted']
-        self.to(device)
-        self.eval()
-        print(f"Model loaded from {path}")
+        return self.mlp(pos_features)
 
-
-class BSVM_NN(nn.Module):
-    """
-    Binary SVM implemented as a neural network for GPU acceleration.
-    Classifies data into two classes (e.g., empty vs observation).
-    """
-    def __init__(self, input_dim, hidden_dim=128, dropout=0.2):
-        super().__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        
-        # Feature transformation layers
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
-        self.dropout1 = nn.Dropout(dropout)
-        
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
-        self.bn2 = nn.BatchNorm1d(hidden_dim // 2)
-        self.dropout2 = nn.Dropout(dropout)
-        
-        # Binary classification output
-        self.fc3 = nn.Linear(hidden_dim // 2, 1)
-        
-        self.threshold = 0.5
-        self.is_fitted = False
-        
-    def forward(self, x):
-        """Forward pass through the network"""
-        x = self.fc1(x)
-        x = self.bn1(x)
-        x = torch.relu(x)
-        x = self.dropout1(x)
-        
-        x = self.fc2(x)
-        x = self.bn2(x)
-        x = torch.relu(x)
-        x = self.dropout2(x)
-        
-        x = self.fc3(x)
-        return torch.sigmoid(x).squeeze(-1)  # Output probability in [0, 1]
-    
-    def fit(self, X, y, epochs=100, batch_size=256, learning_rate=0.001, device='cuda', validation_split=0.2):
-        """
-        Train the binary classification model.
-        
-        Args:
-            X: Training features (numpy array or tensor)
-            y: Training labels (0 or 1, numpy array or tensor)
-            epochs: Number of training epochs
-            batch_size: Batch size for training
-            learning_rate: Learning rate for optimizer
-            device: Device to train on ('cuda' or 'cpu')
-            validation_split: Fraction of data to use for validation
-        """
-        self.to(device)
-        self.train()
-        
-        # Convert to tensors
-        if isinstance(X, np.ndarray):
-            X = torch.from_numpy(X).float()
-        if isinstance(y, np.ndarray):
-            y = torch.from_numpy(y).float()
-        
-        X = X.to(device)
-        y = y.to(device)
-        
-        # Split into train and validation
-        n_samples = X.shape[0]
-        n_train = int(n_samples * (1 - validation_split))
-        
-        perm = torch.randperm(n_samples)
-        X_train = X[perm[:n_train]]
-        y_train = y[perm[:n_train]]
-        X_val = X[perm[n_train:]]
-        y_val = y[perm[n_train:]]
-        
-        # Initialize optimizer and loss
-        optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
-        criterion = nn.BCELoss()
-        
-        best_val_loss = float('inf')
-        patience_counter = 0
-        patience = 10
-        
-        # Training loop
-        for epoch in range(epochs):
-            self.train()
-            train_loss = 0.0
-            
-            # Shuffle training data
-            perm = torch.randperm(n_train)
-            X_train_shuffled = X_train[perm]
-            y_train_shuffled = y_train[perm]
-            
-            for i in range(0, n_train, batch_size):
-                X_batch = X_train_shuffled[i:i+batch_size]
-                y_batch = y_train_shuffled[i:i+batch_size]
-                
-                optimizer.zero_grad()
-                
-                # Forward pass
-                outputs = self(X_batch)
-                loss = criterion(outputs, y_batch)
-                
-                loss.backward()
-                optimizer.step()
-                
-                train_loss += loss.item()
-            
-            # Validation
-            self.eval()
-            with torch.no_grad():
-                val_outputs = self(X_val)
-                val_loss = criterion(val_outputs, y_val).item()
-            
-            # Early stopping
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                patience_counter = 0
-            else:
-                patience_counter += 1
-            
-            if (epoch + 1) % max(1, epochs // 10) == 0:
-                print(f"  Epoch {epoch + 1}/{epochs}, Train Loss: {train_loss / (n_train // batch_size):.4f}, Val Loss: {val_loss:.4f}")
-            
-            if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch + 1}")
-                break
-        
-        self.eval()
-        self.is_fitted = True
-        print(f"Training complete. Validation loss: {best_val_loss:.4f}")
-    
-    def decision_function(self, X, device='cuda'):
-        """
-        Get decision scores for samples (before sigmoid).
-        This is the raw output from the network.
-        
-        Args:
-            X: Input features (numpy array or tensor)
-            device: Device to run on ('cuda' or 'cpu')
-            
-        Returns:
-            Raw decision scores (numpy array)
-        """
-        self.eval()
-        
-        if isinstance(X, np.ndarray):
-            X = torch.from_numpy(X).float()
-        
-        X = X.to(device)
-        
-        with torch.no_grad():
-            # Get raw output before sigmoid
-            x = self.fc1(X)
-            x = self.bn1(x)
-            x = torch.relu(x)
-            x = self.dropout1(x)
-            
-            x = self.fc2(x)
-            x = self.bn2(x)
-            x = torch.relu(x)
-            x = self.dropout2(x)
-            
-            scores = self.fc3(x).squeeze(-1).cpu().numpy()
-        
-        return scores
-    
-    def predict_proba(self, X, device='cuda'):
-        """
-        Get probability predictions for both classes.
-        
-        Args:
-            X: Input features (numpy array or tensor)
-            device: Device to run on ('cuda' or 'cpu')
-            
-        Returns:
-            Probabilities for class 1 (numpy array)
-        """
-        self.eval()
-        
-        if isinstance(X, np.ndarray):
-            X = torch.from_numpy(X).float()
-        
-        X = X.to(device)
-        
-        with torch.no_grad():
-            probs = self(X).cpu().numpy()
-        
-        return probs
-    
-    def predict(self, X, threshold=None, device='cuda'):
-        """
-        Predict class labels.
-        0 = class 0, 1 = class 1
-        
-        Args:
-            X: Input features
-            threshold: Classification threshold (default 0.5)
-            device: Device to run on
-            
-        Returns:
-            Class labels (0 or 1)
-        """
-        if not self.is_fitted:
-            raise RuntimeError("Model must be fitted before prediction")
-        
-        if threshold is None:
-            threshold = self.threshold
-        
-        probs = self.predict_proba(X, device)
-        return (probs >= threshold).astype(int)
-    
-    def set_threshold(self, X_val, y_val, metric='f1', device='cuda'):
-        """
-        Find optimal threshold using validation data.
-        
-        Args:
-            X_val: Validation features
-            y_val: Validation labels
-            metric: 'f1' (default), 'balanced_accuracy', or 'roc_auc'
-            device: Device to run on
-        """
-        from sklearn.metrics import f1_score, balanced_accuracy_score
-        
-        probs = self.predict_proba(X_val, device)
-        
-        best_score = -1.0
-        best_threshold = 0.5
-        
-        for threshold in np.arange(0.1, 0.9, 0.01):
-            preds = (probs >= threshold).astype(int)
-            
-            if metric == 'f1':
-                score = f1_score(y_val, preds)
-            elif metric == 'balanced_accuracy':
-                score = balanced_accuracy_score(y_val, preds)
-            else:
-                raise ValueError(f"Unknown metric: {metric}")
-            
-            if score > best_score:
-                best_score = score
-                best_threshold = threshold
-        
-        self.threshold = best_threshold
-        print(f"Optimal threshold: {best_threshold:.4f}, {metric}: {best_score:.4f}")
-    
-    def save(self, path):
-        """Save model to disk"""
-        torch.save({
-            'model_state_dict': self.state_dict(),
-            'threshold': self.threshold,
-            'input_dim': self.input_dim,
-            'hidden_dim': self.hidden_dim,
-            'is_fitted': self.is_fitted
-        }, path)
-        print(f"Model saved to {path}")
-    
-    def load(self, path, device='cuda'):
-        """Load model from disk"""
-        checkpoint = torch.load(path, map_location=device)
-        
-        self.input_dim = checkpoint['input_dim']
-        self.hidden_dim = checkpoint['hidden_dim']
-        
-        # Rebuild model if dimensions don't match
-        if self.fc1.in_features != self.input_dim:
-            self.__init__(checkpoint['input_dim'], checkpoint['hidden_dim'])
-        
-        self.load_state_dict(checkpoint['model_state_dict'])
-        self.threshold = checkpoint['threshold']
-        self.is_fitted = checkpoint['is_fitted']
-        self.to(device)
-        self.eval()
-        print(f"Model loaded from {path}")
-
-
+### Utility functions for image processing, tile extraction, local maxima detection, and region growing
 def flood_fill_region(prob_map, start_y, start_x, secondary_threshold):
     """
     Flood-fill from a peak to find the connected region above secondary_threshold.
@@ -950,6 +499,7 @@ def extract_tiles_with_offset(image, tile_size, grid_size, offset_x=0, offset_y=
     Returns:
         list of (tile, row, col) tuples
     """
+    
     tiles = []
     image_h, image_w = image.shape[:2]
     
@@ -965,94 +515,217 @@ def extract_tiles_with_offset(image, tile_size, grid_size, offset_x=0, offset_y=
             if tile.shape[0] < tile_size or tile.shape[1] < tile_size:
                 tile = np.pad(tile, ((0, tile_size - tile.shape[0]), (0, tile_size - tile.shape[1])), mode='edge')
             
-            tiles.append((tile, row, col))
+            tiles.append((tile, row+offset_y , col+offset_x))
     
     return tiles
 
-def train_image_pipeline(batch_paths, image_size=128):
-    images = []
-    rows = []
-    cols = []
-
-    for path in batch_paths:
-        row = int(re.search(r'_r(\d+)_c\d+', path.name).group(1))
-        col = int(re.search(r'_r\d+_c(\d+)', path.name).group(1))
-        img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-        img = preprocess_tile(img, image_size=image_size)
-
-        if img is None:
-            continue
-
-        images.append(img)
-        rows.append(row)
-        cols.append(col)
-
-    x = torch.stack(images, dim=0)
-    rows = torch.tensor(rows, dtype=torch.long)
-    cols = torch.tensor(cols, dtype=torch.long)
-    return x, x, rows, cols
-
-
-def eval_image_pipeline(batch_paths, image_size=128):
-    images = []
-    labels = []
-    cols = []
-    rows = []
+def load_tiles_from_paths(batch_paths, include_labels=False):
+    """
+    Unified image pipeline for loading tiles from disk.
     
+    Args:
+        batch_paths: Single Path or list of Path objects to load from disk
+        image_size: Target size for preprocessing
+        include_labels: Whether to extract labels from path names (True for eval, False for train/test)
+    
+    Returns:
+        Dataframe with columns: 'image', 'path', 'row', 'col', 'label' (if include_labels=True)
+    """
+
+    # Handle single path input
+    single_input = isinstance(batch_paths, (str, Path))
+    if single_input:
+        batch_paths = [batch_paths]
+    
+    images, rows, cols, labels, paths = [], [], [], [], []
     for path in batch_paths:
-        # if path is in obs folder, label=TrUE, else FALSE (empty)
-        label = False if "no_obs" in str(path).lower() else True
+        path = Path(path) if isinstance(path, str) else path
         
-        # get tile col and row
-        tile_match = re.search(r'_r(\d+)_c(\d+)', path.name)
-
-        row = int(tile_match.group(1))
-        col = int(tile_match.group(2))
-
-        img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-        img = preprocess_tile(img, image_size=image_size)
-        if img is None:
+        if not path.exists():
+            print(f"⚠ Warning: File not found {path}, skipping")
             continue
+        
+        # Extract row/col from filename
+        tile_match = re.search(r'_r(\d+)_c(\d+)', path.name)
+        if not tile_match:
+            print(f"⚠ Warning: Could not extract row/col from {path.name}, skipping")
+            continue
+        
+        row, col = int(tile_match.group(1)), int(tile_match.group(2))
+        
+        if include_labels:
+            if path.parent.name.lower() == "no_obs":
+                label = False
+            elif path.parent.name.lower() == "obs":
+                label = True
+            else:
+                print(f"⚠ Warning: Could not determine label from path {path}, skipping")
+                continue
 
-        labels.append(label)
+            labels.append(label)
+                    
+        img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        
         rows.append(row)
         cols.append(col)
         images.append(img)
-
-    images = torch.stack(images, dim=0)
-    labels = torch.tensor(labels, dtype=torch.bool)
-    rows = torch.tensor(rows, dtype=torch.long)
-    cols = torch.tensor(cols, dtype=torch.long)
+        paths.append(path)
     
-    return images, labels, rows, cols
-
-def test_image_pipeline(batch, image_size=128):
-    """Collate fn for test tiles already split as (tile, row, col, image_name)."""
-
-    all_tiles = []
-    cols = []
-    rows = []
-    image_names = []
+    # Create dataframe with tile info for debugging/analysis
+    df_tile_info = pd.DataFrame({
+        'image': images,
+        'path': paths,
+        'row': rows,
+        'col': cols,
+        'label': labels if include_labels else [None] * len(rows),
+    })
     
-    for item in batch:
-        tile, row, col, image_name = item
-        if tile is None:
+    return df_tile_info
+        
+def image_pipeline_df(df_tile_info, input_image_size_vae=128, include_labels=False):
+    """
+    Image pipeline that takes a DataFrame with tile information and applies preprocessing to convert images to tensors.
+    
+    Args:
+        df_tile_info: DataFrame containing tile information
+        input_image_size_vae: Target size for VAE preprocessing
+        include_labels: Whether to extract labels from path names (True for eval, False for train/test)
+    
+    Returns:
+        Tuple of tensors:
+        - If include_labels=True: (images, labels, rows, cols)
+        - If include_labels=False: (images, rows, cols)
+    """
+    
+    # Check dataframe structure
+    required_columns = {'image', 'row', 'col'}
+    if not required_columns.issubset(df_tile_info.columns):
+        raise ValueError(f"DataFrame must contain columns {required_columns}, but got {df_tile_info.columns}")
+    
+    # Check for invalid entries in dataframe
+    if df_tile_info['image'].isnull().any() or df_tile_info['row'].isnull().any() or df_tile_info['col'].isnull().any():
+        raise ValueError("⚠ Warning: Some entries in 'image', 'row', or 'col' columns are null")  
+    
+    # Check if labels are present in the DataFrame when include_labels=True, and warn if not
+    if df_tile_info['label'].isnull().all() and include_labels:
+        raise ValueError("⚠ Warning: include_labels=True but no labels found in DataFrame, returning None for labels")
+    elif include_labels==False and not df_tile_info['label'].isnull().all():
+        print("⚠ Warning: include_labels=False but labels found in DataFrame, ignoring labels")
+    
+    images, rows, cols, labels = [], [], [], []
+    for tile_info in df_tile_info.itertuples():
+        img = tile_info.image
+        row = tile_info.row
+        col = tile_info.col
+        label = tile_info.label
+
+        img_tensor = preprocess_tile(img, image_size=input_image_size_vae)
+        
+        if img_tensor is None:
             continue
+        
+        images.append(img_tensor) 
+        rows.append(row)
+        cols.append(col)
+        labels.append(label)
+        
+    # Stack tensors
+    images_tensor = torch.stack(images, dim=0) if images else torch.tensor([])
+    rows_tensor = torch.tensor(rows, dtype=torch.long)
+    cols_tensor = torch.tensor(cols, dtype=torch.long)
+    labels_tensor = torch.tensor(labels, dtype=torch.bool) if include_labels else None
+    
+    if len(df_tile_info) == 1:
+        if images_tensor.numel() == 0:
+            if include_labels:
+                return images_tensor, torch.tensor(False, dtype=torch.bool), torch.tensor(-1, dtype=torch.long), torch.tensor(-1, dtype=torch.long)
+            return images_tensor, torch.tensor(-1, dtype=torch.long), torch.tensor(-1, dtype=torch.long)
 
-        tile_tensor = preprocess_tile(tile, image_size=image_size)
-        if tile_tensor is None:
+        if include_labels:
+            assert labels_tensor is not None
+            return images_tensor[0], labels_tensor[0], rows_tensor[0], cols_tensor[0]
+        return images_tensor[0], rows_tensor[0], cols_tensor[0]
+
+    if include_labels:
+        return images_tensor, rows_tensor, cols_tensor, labels_tensor
+    else:
+        return images_tensor, rows_tensor, cols_tensor
+
+### Universal image pipeline for loading tiles from disk, with optional label extraction and position encoding
+def image_pipeline_paths(batch_paths, image_size=128, include_labels=False):
+    """
+    Unified image pipeline for loading tiles from disk.
+    
+    Args:
+        batch_paths: Single Path or list of Path objects to load from disk
+        image_size: Target size for preprocessing
+        include_labels: Whether to extract labels from path names (True for eval, False for train/test)
+    
+    Returns:
+        Tuple of tensors:
+        - If include_labels=True: (images, labels, rows, cols)
+        - If include_labels=False: (images, rows, cols)
+    """
+    
+    # Handle single path input
+    single_input = isinstance(batch_paths, (str, Path))
+    if single_input:
+        batch_paths = [batch_paths]
+    
+    images, rows, cols, labels = [], [], [], []
+    for path in batch_paths:
+        path = Path(path) if isinstance(path, str) else path
+        
+        if not path.exists():
+            print(f"⚠ Warning: File not found {path}, skipping")
             continue
+        
+        # Extract row/col from filename
+        tile_match = re.search(r'_r(\d+)_c(\d+)', path.name)
+        if not tile_match:
+            print(f"⚠ Warning: Could not extract row/col from {path.name}, skipping")
+            continue
+        
+        row, col = int(tile_match.group(1)), int(tile_match.group(2))
+        
+        # Load and preprocess image
+        img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        img_tensor = preprocess_tile(img, image_size=image_size)
+        
+        if img_tensor is None:
+            continue
+        
+        images.append(img_tensor) 
+        rows.append(row)
+        cols.append(col)
+        
+        # Extract label if requested
+        if include_labels:
+            label = False if "no_obs" in str(path).lower() else True
+            labels.append(label)
+    
+    # Stack tensors
+    images_tensor = torch.stack(images, dim=0) if images else torch.tensor([])
+    rows_tensor = torch.tensor(rows, dtype=torch.long)
+    cols_tensor = torch.tensor(cols, dtype=torch.long)
+    labels_tensor = torch.tensor(labels, dtype=torch.bool) if include_labels else None
+    
+    if single_input:
+        if images_tensor.numel() == 0:
+            if include_labels:
+                return images_tensor, torch.tensor(False, dtype=torch.bool), torch.tensor(-1, dtype=torch.long), torch.tensor(-1, dtype=torch.long)
+            return images_tensor, torch.tensor(-1, dtype=torch.long), torch.tensor(-1, dtype=torch.long)
 
-        rows.append(int(row))
-        cols.append(int(col))
-        image_names.append(image_name)
-        all_tiles.append(tile_tensor)
+        if include_labels:
+            assert labels_tensor is not None
+            return images_tensor[0], labels_tensor[0], rows_tensor[0], cols_tensor[0]
+        return images_tensor[0], rows_tensor[0], cols_tensor[0]
 
-    tiles_tensor = torch.stack(all_tiles, dim=0)
-    rows = torch.tensor(rows, dtype=torch.long)
-    cols = torch.tensor(cols, dtype=torch.long)
-
-    return tiles_tensor, rows, cols, image_names
+    if include_labels:
+        return images_tensor, labels_tensor, rows_tensor, cols_tensor
+    
+    else:
+        return images_tensor, rows_tensor, cols_tensor
 
 
 def preprocess_tile(tile, image_size=128):
@@ -1086,7 +759,7 @@ def split_image_into_tiles(image, grid_size):
     list of tuples
         List of (tile_image, row_idx, col_idx) tuples
     """
-    tiles = []
+    tiles_info = []
     
     im_shape = image.shape
     if im_shape[0] != 4512 or im_shape[1] != 4512:
@@ -1106,6 +779,125 @@ def split_image_into_tiles(image, grid_size):
             x_end = x_start + tile_size
             
             tile = image[y_start:y_end, x_start:x_end]
-            tiles.append((tile, row, col))
+            tiles_info.append((tile, row, col))
     
-    return tiles
+    return tiles_info
+
+
+# def train_image_pipeline(batch_paths, image_size=128):
+#     images = []
+#     rows = []
+#     cols = []
+
+#     for path in batch_paths:
+#         if not path.exists():
+#             print(f"⚠ Warning: File not found {path}, skipping")
+#             continue
+        
+#         row_match = re.search(r'_r(\d+)_c\d+', path.name)
+#         col_match = re.search(r'_r\d+_c(\d+)', path.name)
+        
+#         if not row_match or not col_match:
+#             print(f"⚠ Warning: Could not extract row/col from {path.name}, skipping")
+#             continue
+        
+#         row = int(row_match.group(1))
+#         col = int(col_match.group(1))
+#         img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+#         img = preprocess_tile(img, image_size=image_size)
+
+#         if img is None:
+#             continue
+
+#         images.append(img)
+#         rows.append(row)
+#         cols.append(col)
+
+#     x = torch.stack(images, dim=0)
+#     rows = torch.tensor(rows, dtype=torch.long)
+#     cols = torch.tensor(cols, dtype=torch.long)
+#     return x, x, rows, cols
+
+
+# def eval_image_pipeline(batch_paths, image_size=128):
+#     images = []
+#     labels = []
+#     cols = []
+#     rows = []
+    
+#     for path in batch_paths:
+#         if not path.exists():
+#             print(f"⚠ Warning: File not found {path}, skipping")
+#             continue
+
+#         # if path is in obs folder, label=TrUE, else FALSE (empty)
+#         label = False if "no_obs" in str(path).lower() else True
+        
+#         # get tile col and row
+#         tile_match = re.search(r'_r(\d+)_c(\d+)', path.name)
+        
+#         if not tile_match:
+#             print(f"⚠ Warning: Could not extract row/col from {path.name}, skipping")
+#             continue
+        
+#         row = int(tile_match.group(1))
+#         col = int(tile_match.group(2))
+
+#         img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+#         img = preprocess_tile(img, image_size=image_size)
+#         if img is None:
+#             continue
+
+#         labels.append(label)
+#         rows.append(row)
+#         cols.append(col)
+#         images.append(img)
+
+#     images = torch.stack(images, dim=0)
+#     labels = torch.tensor(labels, dtype=torch.bool)
+#     rows = torch.tensor(rows, dtype=torch.long)
+#     cols = torch.tensor(cols, dtype=torch.long)
+    
+#     return images, labels, rows, cols
+
+# def test_image_pipeline(batch, image_size=128):
+#     """Collate fn for test tiles already split as (tile, row, col, image_name)."""
+
+#     all_tiles = []
+#     cols = []
+#     rows = []
+#     image_names = []
+    
+#     for item in batch:
+#         tile, row, col, image_name = item
+#         if tile is None:
+#             continue
+
+#         tile_tensor = preprocess_tile(tile, image_size=image_size)
+#         if tile_tensor is None:
+#             continue
+
+#         rows.append(int(row))
+#         cols.append(int(col))
+#         image_names.append(image_name)
+#         all_tiles.append(tile_tensor)
+
+#     tiles_tensor = torch.stack(all_tiles, dim=0)
+#     rows = torch.tensor(rows, dtype=torch.long)
+#     cols = torch.tensor(cols, dtype=torch.long)
+
+#     return tiles_tensor, rows, cols, image_names
+
+### Dataset class for loading images from file paths and applying preprocessing
+# class ImagePathDataset(Dataset):
+#     """Dataset that loads images from file paths and applies a preprocessing function."""
+#     def __init__(self, image_paths, preprocess_fn):
+#         self.image_paths = image_paths
+#         self.preprocess_fn = preprocess_fn
+    
+#     def __len__(self):
+#         return len(self.image_paths)
+    
+#     def __getitem__(self, idx):
+#         image_path = self.image_paths[idx]
+#         return self.preprocess_fn(image_path)
