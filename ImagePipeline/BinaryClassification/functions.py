@@ -3,6 +3,7 @@ import re
 import cv2
 import numpy as np
 import torch
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy.ndimage import maximum_filter
@@ -265,7 +266,81 @@ class VariationalAutoencoder(nn.Module):
         return self.decoder(z)
 
 
-class ObservationScorer(nn.Module):
+class OneClassScorer(nn.Module):
+    """
+    One-class neural network for anomaly detection in VAE latent space.
+
+    The model learns a compact embedding representation of normal (empty) tiles.
+    During training, embeddings of empty tiles are encouraged to cluster around
+    a learned center in embedding space.
+
+    At inference:
+        - tiles close to the center are considered normal/background
+        - tiles far from the center are considered anomalous/observations
+
+    Inputs:
+        mu          : VAE latent representation (latent_dim)
+        recon_err   : VAE reconstruction error (1)
+        rows, cols  : tile positions for positional encoding
+
+    Architecture:
+        [latent + recon_error + position_embedding]
+            → MLP
+            → low-dimensional embedding (emb_dim)
+
+    Anomaly score:
+        squared Euclidean distance to the learned center:
+            score = ||z - c||²
+
+    Higher scores indicate higher likelihood of containing observations.
+    """
+    def __init__(self, latent_dim=32, hidden_dim=128, emb_dim=16, grid_size=16):
+        super().__init__()
+
+        self.latent_dim = latent_dim
+        self.grid_size = grid_size
+
+        pos_emb_dim = max(16, 10 * 2)
+        self.pos_embedding = PositionalEmbedding(input_dim=10, output_dim=pos_emb_dim)
+
+        input_dim = latent_dim + 1 + pos_emb_dim
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim // 2),
+
+            nn.Linear(hidden_dim // 2, emb_dim),
+        )
+
+    def forward(self, mu, recon_err, rows, cols):
+        pos_features = compute_position_features(rows, cols, self.grid_size, mu.device)
+        pos_emb = self.pos_embedding(pos_features)
+
+        recon_err = recon_err.unsqueeze(1) if recon_err.dim() == 1 else recon_err
+
+        x = torch.cat([mu, recon_err, pos_emb], dim=1)
+
+        z = self.net(x)
+        return z
+
+    def anomaly_score(self, mu, recon_err, rows, cols, center):
+        z = self.forward(mu, recon_err, rows, cols)
+        score = ((z - center) ** 2).sum(dim=1)
+        return score
+
+    def predict_batch(self, mu, recon_err, rows, cols, center, threshold):
+        with torch.no_grad():
+            scores = self.anomaly_score(mu, recon_err, rows, cols, center)
+            preds = (scores >= threshold).long()
+
+        return preds, scores
+
+class TwoClassScorer(nn.Module):
     """
     Dense neural network for classifying tiles as observation or empty.
     Supports two modes:
@@ -305,6 +380,8 @@ class ObservationScorer(nn.Module):
         
         # Output probability [0, 1]
         self.fc_out = nn.Linear(hidden_dim // 4, 1)
+        
+        
 
         
     def forward(self, mu, recon_err, rows, cols):
@@ -434,7 +511,13 @@ def flood_fill_region(prob_map, start_y, start_x, secondary_threshold):
     """
     Flood-fill from a peak to find the connected region above secondary_threshold.
     Returns a list of (y, x) coordinates in the region.
+    
+    input:
+    - prob_map: 2D array of probabilities
+    - start_y, start_x: coordinates of the starting point (peak)
+    - secondary_threshold: minimum probability to include in the region
     """
+    
     region = set()
     stack = [(start_y, start_x)]
     visited = set()
@@ -458,6 +541,55 @@ def flood_fill_region(prob_map, start_y, start_x, secondary_threshold):
                 if dy != 0 or dx != 0:
                     stack.append((y + dy, x + dx))
     
+    return region
+
+def robust_flood_fill(
+    prob_map,
+    peak_y,
+    peak_x,
+    peak_threshold=0.98,
+    secondary_threshold=0.75,
+    min_region_size=9,
+    min_region_mean=0.85,
+    min_core_pixels=4,
+    core_threshold=0.9,
+):
+    if prob_map[peak_y, peak_x] < peak_threshold:
+        return set()
+
+    visited = set()
+    region = set()
+    stack = [(peak_y, peak_x)]
+
+    h, w = prob_map.shape
+
+    while stack:
+        y, x = stack.pop()
+        if (y, x) in visited:
+            continue
+        visited.add((y, x))
+
+        if prob_map[y, x] < secondary_threshold:
+            continue
+
+        region.add((y, x))
+
+        for dy, dx in [(-1,0), (1,0), (0,-1), (0,1)]:
+            yy, xx = y + dy, x + dx
+            if 0 <= yy < h and 0 <= xx < w:
+                stack.append((yy, xx))
+
+    if len(region) < min_region_size:
+        return set()
+
+    values = np.array([prob_map[y, x] for y, x in region])
+
+    if values.mean() < min_region_mean:
+        return set()
+
+    if np.sum(values >= core_threshold) < min_core_pixels:
+        return set()
+
     return region
 
 def find_local_maxima(prob_map, peak_threshold):
@@ -485,7 +617,7 @@ def find_local_maxima(prob_map, peak_threshold):
     return list(zip(y_coords, x_coords, values))
 
 
-def extract_tiles_with_offset(image, tile_size, grid_size, offset_x=0, offset_y=0):
+def extract_tiles_with_offset(image, tile_size, grid_size, offset_pxl_x=0, offset_pxl_y=0, offset_norm_x = 0, offset_norm_y = 0):
     """
     Extract tiles from image with specified offset.
     
@@ -493,8 +625,10 @@ def extract_tiles_with_offset(image, tile_size, grid_size, offset_x=0, offset_y=
         image: input image
         tile_size: size of each tile
         grid_size: number of tiles along one side
-        offset_x: horizontal offset (in pixels)
-        offset_y: vertical offset (in pixels)
+        offset_pxl_x: horizontal offset (in pixels)
+        offset_pxl_y: vertical offset (in pixels)
+        offset_norm_x: horizontal offset (normalized as fraction of row)
+        offset_norm_y: vertical offset (normalize as fraction of row)
     
     Returns:
         list of (tile, row, col) tuples
@@ -502,11 +636,11 @@ def extract_tiles_with_offset(image, tile_size, grid_size, offset_x=0, offset_y=
     
     tiles = []
     image_h, image_w = image.shape[:2]
-    
+        
     for row in range(grid_size):
         for col in range(grid_size):
-            y0 = offset_y + row * tile_size
-            x0 = offset_x + col * tile_size
+            y0 = offset_pxl_y + row * tile_size
+            x0 = offset_pxl_x + col * tile_size
             y1 = min(y0 + tile_size, image_h)
             x1 = min(x0 + tile_size, image_w)
             
@@ -515,11 +649,17 @@ def extract_tiles_with_offset(image, tile_size, grid_size, offset_x=0, offset_y=
             if tile.shape[0] < tile_size or tile.shape[1] < tile_size:
                 tile = np.pad(tile, ((0, tile_size - tile.shape[0]), (0, tile_size - tile.shape[1])), mode='edge')
             
-            tiles.append((tile, row+offset_y , col+offset_x))
+            # Return tile coordinates as 1-based grid position + fractional offset.
+            # This encodes the tile center position in grid units for map aggregation.
+            model_row = row + offset_norm_y      # 0.0 to 15.8, or clip to 15
+            model_col = col + offset_norm_x
+            
+            tiles.append((tile, model_row, model_col))
     
     return tiles
 
 def load_tiles_from_paths(batch_paths, include_labels=False):
+    
     """
     Unified image pipeline for loading tiles from disk.
     
@@ -546,13 +686,17 @@ def load_tiles_from_paths(batch_paths, include_labels=False):
             continue
         
         # Extract row/col from filename
-        tile_match = re.search(r'_r(\d+)_c(\d+)', path.name)
+        tile_match = re.search(r'_r(\d+)_c(\d+)_o([\d]+)', path.name)
         if not tile_match:
             print(f"⚠ Warning: Could not extract row/col from {path.name}, skipping")
             continue
         
-        row, col = int(tile_match.group(1)), int(tile_match.group(2))
-        
+        row, col, offset = int(tile_match.group(1)), int(tile_match.group(2)), float(tile_match.group(3))
+
+        # add offset to row/col to encode tile center position in grid units for map aggregation
+        row += (offset/100)
+        col += (offset/100)
+
         if include_labels:
             if path.parent.name.lower() == "no_obs":
                 label = False
@@ -603,8 +747,8 @@ def image_pipeline_df(df_tile_info, input_image_size_vae=128, include_labels=Fal
         raise ValueError(f"DataFrame must contain columns {required_columns}, but got {df_tile_info.columns}")
     
     # Check for invalid entries in dataframe
-    if df_tile_info['image'].isnull().any() or df_tile_info['row'].isnull().any() or df_tile_info['col'].isnull().any():
-        raise ValueError("⚠ Warning: Some entries in 'image', 'row', or 'col' columns are null")  
+    if df_tile_info['row'].isnull().any() or df_tile_info['col'].isnull().any():
+        raise ValueError("⚠ Warning: Some entries in 'row' or 'col' columns are null")
     
     # Check if labels are present in the DataFrame when include_labels=True, and warn if not
     if df_tile_info['label'].isnull().all() and include_labels:
@@ -619,6 +763,16 @@ def image_pipeline_df(df_tile_info, input_image_size_vae=128, include_labels=Fal
         col = tile_info.col
         label = tile_info.label
 
+        # If image is None, load from disk using path
+        if img is None:
+            if not hasattr(tile_info, 'path') or tile_info.path is None:
+                print(f"⚠ Warning: Image is None and no path available, skipping")
+                continue
+            print(f"⚠ Info: Image is None, loading from disk using path {tile_info.path}")
+            img = cv2.imread(str(tile_info.path), cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                print(f"⚠ Warning: Could not load image from {tile_info.path}, skipping")
+                continue
         img_tensor = preprocess_tile(img, image_size=input_image_size_vae)
         
         if img_tensor is None:
@@ -631,8 +785,8 @@ def image_pipeline_df(df_tile_info, input_image_size_vae=128, include_labels=Fal
         
     # Stack tensors
     images_tensor = torch.stack(images, dim=0) if images else torch.tensor([])
-    rows_tensor = torch.tensor(rows, dtype=torch.long)
-    cols_tensor = torch.tensor(cols, dtype=torch.long)
+    rows_tensor = torch.tensor(rows, dtype=torch.float32)
+    cols_tensor = torch.tensor(cols, dtype=torch.float32)
     labels_tensor = torch.tensor(labels, dtype=torch.bool) if include_labels else None
     
     if len(df_tile_info) == 1:
@@ -706,8 +860,8 @@ def image_pipeline_paths(batch_paths, image_size=128, include_labels=False):
     
     # Stack tensors
     images_tensor = torch.stack(images, dim=0) if images else torch.tensor([])
-    rows_tensor = torch.tensor(rows, dtype=torch.long)
-    cols_tensor = torch.tensor(cols, dtype=torch.long)
+    rows_tensor = torch.tensor(rows, dtype=torch.float32)
+    cols_tensor = torch.tensor(cols, dtype=torch.float32)
     labels_tensor = torch.tensor(labels, dtype=torch.bool) if include_labels else None
     
     if single_input:
@@ -741,7 +895,6 @@ def preprocess_tile(tile, image_size=128):
     tile_resized = cv2.resize(tile, (image_size, image_size), interpolation=cv2.INTER_AREA)
     tile_tensor = torch.from_numpy(tile_resized).float().unsqueeze(0) / 255.0
     return tile_tensor
-
 
 def split_image_into_tiles(image, grid_size):
     """
@@ -901,3 +1054,119 @@ def split_image_into_tiles(image, grid_size):
 #     def __getitem__(self, idx):
 #         image_path = self.image_paths[idx]
 #         return self.preprocess_fn(image_path)
+
+def load_tiles_from_paths_fast(batch_paths, image_size=128, include_labels=False, batch_size=256, num_workers=16, to_device=None, return_generator=False):
+    """
+    Args:
+        batch_paths: list of Path or single Path to tile images
+        image_size: target size for `preprocess_tile`
+        include_labels: whether to extract labels from path parent folder
+        batch_size: number of images to transfer to `to_device` at once (if provided)
+        num_workers: number of threads for parallel reading and preprocessing
+        to_device: if provided (e.g., 'cuda' or torch.device('cuda')), tensors will be moved to this device in batches
+
+    Returns:
+        If to_device is None: (images_tensor_cpu, rows_tensor, cols_tensor, labels_tensor?)
+        If to_device provided: generator that yields batches (images_on_device, rows, cols, labels) for downstream processing
+    """
+
+    single_input = isinstance(batch_paths, (str, Path))
+    if single_input:
+        batch_paths = [batch_paths]
+
+    def _process_path(path):
+        path = Path(path) if isinstance(path, str) else path
+        if not path.exists():
+            return None
+
+        tile_match = re.search(r'_r(\d+)_c(\d+)_o?([\d]*)', path.name)
+        if not tile_match:
+            return None
+
+        # parse row/col and optional offset
+        row = int(tile_match.group(1))
+        col = int(tile_match.group(2))
+        offset = tile_match.group(3)
+        try:
+            offset = float(offset) / 100.0 if offset != '' else 0.0
+        except Exception:
+            offset = 0.0
+
+        row_f = row + offset
+        col_f = col + offset
+
+        if include_labels:
+            label = False if "no_obs" in str(path).lower() else True
+        else:
+            label = None
+
+        img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return None
+
+        img_tensor = preprocess_tile(img, image_size=image_size)
+        if img_tensor is None:
+            return None
+
+        # Return preprocessed tensor for batching, and raw image for generator
+        return (img_tensor, row_f, col_f, label, path, img)
+
+    results = []
+    
+    with ThreadPoolExecutor(max_workers=num_workers) as ex:
+        futures = {ex.submit(_process_path, p): p for p in batch_paths}
+        for fut in as_completed(futures):
+            try:
+                res = fut.result()
+            except Exception:
+                res = None
+            if res is None:
+                continue
+            results.append(res)
+
+    if not results:
+        # return empty tensors consistent with other APIs
+        empty = torch.tensor([])
+        rows_t = torch.tensor([], dtype=torch.long)
+        cols_t = torch.tensor([], dtype=torch.long)
+        labels_t = torch.tensor([], dtype=torch.bool) if include_labels else None
+        return (empty, labels_t, rows_t, cols_t) if include_labels else (empty, rows_t, cols_t)
+
+    # unzip: tensors, rows, cols, labels, paths, raw images
+    tensor_list, rows_list, cols_list, labels_list, paths_list, raw_list = zip(*results)
+
+    # Stack into single CPU tensor (used for optional generator)
+    images_tensor = torch.stack(list(tensor_list), dim=0)
+    rows_tensor = torch.tensor(list(rows_list), dtype=torch.float32)
+    cols_tensor = torch.tensor(list(cols_list), dtype=torch.float32)
+    labels_tensor = torch.tensor(list(labels_list), dtype=torch.bool) if include_labels else None
+
+    # Build a DataFrame for compatibility with existing code that expects a DataFrame
+    # Note: 'image' column contains loaded raw images; image_pipeline_df will use these or load from disk if None
+    n = len(paths_list)
+    df_tile_info = pd.DataFrame({
+        'image': list(raw_list),
+        'path': list(paths_list),
+        'row': rows_list,  # keep as-is (floats from row_f = row + offset)
+        'col': cols_list,  # keep as-is (floats from col_f = col + offset)
+        'label': list(labels_list) if include_labels else [None] * n,
+    })
+
+    # Always return DataFrame for backward compatibility; ignore to_device unless return_generator=True
+    if not return_generator or to_device is None:
+        return df_tile_info
+
+    # If caller requested a generator moved to device, yield batches moved to device to avoid large allocations
+    dev = torch.device(to_device) if not isinstance(to_device, torch.device) else to_device
+
+    def _batch_generator():
+        total = images_tensor.shape[0]
+        for i in range(0, total, batch_size):
+            j = min(i + batch_size, total)
+            batch_imgs = images_tensor[i:j].to(dev)
+            batch_rows = rows_tensor[i:j].to(dev)
+            batch_cols = cols_tensor[i:j].to(dev)
+            batch_labels = labels_tensor[i:j].to(dev) if (include_labels and labels_tensor is not None) else None
+            yield batch_imgs, batch_rows, batch_cols, batch_labels
+
+    return _batch_generator()

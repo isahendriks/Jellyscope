@@ -18,7 +18,7 @@ from tqdm.auto import tqdm
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from functions import Autoencoder, VariationalAutoencoder, image_pipeline_df, load_tiles_from_paths, preprocess_tile
+from functions import Autoencoder, VariationalAutoencoder, image_pipeline_df, load_tiles_from_paths_fast, preprocess_tile
 
 torch.manual_seed(0)
 plt.rcParams["figure.dpi"] = 200
@@ -62,7 +62,7 @@ DEBUG = False
 N_DEBUG = 5000
 EPOCHS_DEBUG = 10
 
-monitoring_effort = "Kristineberg_260424"  # for titles and saved model names, e.g. "kristineberg_251128" 
+monitoring_effort = "Kristineberg_251128"  # for titles and saved model names, e.g. "kristineberg_251128" 
 grid_size = 16  # number of tiles along one side (e.g. 6 means 6x6=36 tiles per image)
 
 # model hyperparameters
@@ -70,8 +70,8 @@ image_size = 128
 latent_dims = 32
 hidden_channels = 32
 
-train_tiles_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train", f"tiles{grid_size}")
-train_og_images_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train", "OG_images")
+train_tiles_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train_VAE", f"tiles{grid_size}")
+train_og_images_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train_VAE", "OG_images")
 
 print(f"train_tiles_path: {train_tiles_path}")
 print(f"train_og_images_path: {train_og_images_path}")
@@ -92,10 +92,10 @@ model_output_path = Path(model_name)
 model_output_path.parent.mkdir(parents=True, exist_ok=True)
 
 # training hyperparameters
-batch_size = 64
+batch_size = 128
 learning_rate = 1e-4 * (batch_size / 64)  # scale learning rate with batch size
-epochs = 200
-warmup_epochs = 70  # Number of epochs to linearly increase learning rate (helps stabilize early training)
+epochs = 100
+warmup_epochs = 40  # Number of epochs to linearly increase learning rate (helps stabilize early training)
 if DEBUG:
     print(f"DEBUG MODE: Using only {N_DEBUG} tiles and training for {EPOCHS_DEBUG} epochs \n if saving enabled model name will be: {model_output_path.name}")
     
@@ -111,21 +111,9 @@ for ind, img_path in enumerate(images_train):
         raise ValueError(f"Could not read image: {img_path}")
     og_img_array[ind] = img
 
-# Caclulate median background image across all training images (for plotting later)
-print(f"\nCalculating median background image across {len(images_train)} training images...")
-img_bkg_median = None
-# img_bkg_median = np.median(og_img_array, axis=0).astype(np.uint8)
-
 print(f"Calculating mean background image across {len(images_train)} training images...")
 img_bkg_mean = None
 img_bkg_mean = np.mean(og_img_array, axis=0).astype(np.uint8)
-
-# Plot median background image
-if img_bkg_median is not None:
-    plt.figure(figsize=(6, 6))
-    plt.imshow(img_bkg_median, cmap="gray")
-    plt.title(f"Median background image across {len(images_train)} training images", fontsize=14)
-    plt.axis("off")
 
 # plot mean background image across all training images
 if img_bkg_mean is not None:
@@ -134,9 +122,7 @@ if img_bkg_mean is not None:
     plt.title(f"Mean background image across {len(images_train)} training images", fontsize=14)
     plt.axis("off")    
 
-if img_bkg_median is not None:
-    img_bkg = img_bkg_median
-elif img_bkg_mean is not None:
+if img_bkg_mean is not None:
     img_bkg = img_bkg_mean
 else:
     raise ValueError("Could not calculate background image (both median and mean failed)")
@@ -149,8 +135,8 @@ if DEBUG:
     train_tiles = train_tiles[:N_DEBUG]
     epochs = EPOCHS_DEBUG
 
-print(f"Loading training tiles from: {train_tiles_path} \nTotal tiles found: {len(train_tiles)}")    
-df_train_tiles = load_tiles_from_paths(train_tiles, include_labels=False)  # Load tile paths and metadata into a DataFrame
+print(f"Loading training tiles from: {train_tiles_path}, total tiles found: {len(train_tiles)}")    
+df_train_tiles = load_tiles_from_paths_fast(train_tiles, include_labels=False, to_device=device)  # Load tile paths and metadata into a DataFrame
 
 print(f"Applying image pipeline to training tiles and creating dataset...")
 images_tensor, rows_tensor, cols_tensor = image_pipeline_df(df_train_tiles, input_image_size_vae=image_size)  # type: ignore # Create dataset with preprocessing pipeline applied to each tile
@@ -174,14 +160,9 @@ print("="*120)
 # Sanity-check one batch to verify row/col loading
 tile_chk, rows_chk, cols_chk = next(iter(train_loader))
 
-print(
-    f"Sanity batch -> x: {tuple(tile_chk.shape)}, rows: {tuple(rows_chk.shape)} ({rows_chk.dtype}), "
-    f"cols: {tuple(cols_chk.shape)} ({cols_chk.dtype})"
-)
-print(
-    f"row range: [{rows_chk.min().item()}, {rows_chk.max().item()}], "
-    f"col range: [{cols_chk.min().item()}, {cols_chk.max().item()}]"
-)
+print(f"Sanity batch -> x: {tuple(tile_chk.shape)}, rows: {tuple(rows_chk.shape)} ({rows_chk.dtype}), cols: {tuple(cols_chk.shape)} ({cols_chk.dtype})")
+print(f"row range: [{rows_chk.min().item()}, {rows_chk.max().item()}], col range: [{cols_chk.min().item()}, {cols_chk.max().item()}]")
+
 assert rows_chk.ndim == 1 and cols_chk.ndim == 1, "rows/cols must be 1D batch tensors"
 assert rows_chk.shape[0] == tile_chk.shape[0] and cols_chk.shape[0] == tile_chk.shape[0], "rows/cols must match batch size"
 assert rows_chk.min().item() >= 0 and rows_chk.max().item() < grid_size, "row indices out of range"
@@ -204,15 +185,11 @@ sample_image_tiles_path_train = sorted({
     for r_pat in _r_patterns
     for c_pat in _c_patterns
     for path in Path(train_tiles_path).glob(
-        f"{sample_image_name_train}_r{r_pat}_c{c_pat}.png"
+        f"{sample_image_name_train}_r{r_pat}_c{c_pat}_o0.png"
     )
 })
 
-# Sort images by r and then c indices (extract from filename)
-sample_image_tiles_path_train = sorted(
-    sample_image_tiles_path_train,
-    key=lambda p: (int(p.stem.split("_")[-2][1:]), int(p.stem.split("_")[-1][1:]))  # Extract r and c indices and convert to integers
-)
+
 
 print(f"Loaded sample train image: {sample_image_name_train}, #tiles: {len(sample_image_tiles_path_train)}")
  
@@ -232,34 +209,34 @@ plt.imshow(sample_image_train, cmap="gray")
 plt.title(f"Original image: {sample_image_name_train}")
 plt.axis("off")
 
-### plot original tiles
-fig,axis = plt.subplots(grid_size, grid_size, figsize=(grid_size*2.4, grid_size*2.4))
-for i in range(num_tiles):
-    tile_path = sample_image_tiles_path_train[i]
-    tile_image = cv2.imread(str(tile_path))
-    if tile_image is None:
-        raise ValueError(f"Could not read tile image: {tile_path}")
-    row, col = divmod(i, grid_size)
-    axis[row, col].imshow(tile_image, cmap="gray", vmin=0, vmax=1)
-    axis[row, col].axis("off")
+#%% plot original tiles
 
+sample_image_df = load_tiles_from_paths_fast(sample_image_tiles_path_train, include_labels=False, to_device=device)  # type: ignore # Load tile paths and metadata into a DataFrame
+
+fig,axis = plt.subplots(grid_size, grid_size, figsize=(grid_size*2.4, grid_size*2.4))
+
+for tile_df in sample_image_df.itertuples():
+    tile_img =tile_df.image.astype(np.uint8)  # Convert to uint8 for correct display
+    row = int(tile_df.row)
+    col = int(tile_df.col)
+    axis[row, col].imshow(tile_img, cmap="gray", vmin=0, vmax=255)
+    axis[row, col].axis("off")
+    
 fig.suptitle(f"Original {grid_size}x{grid_size} tiles from {sample_image_name_train}", fontsize=20, fontweight="bold")
 plt.tight_layout()
 
-### plot tiles after image pipeline
-fig,axis = plt.subplots(grid_size, grid_size, figsize=(grid_size*2.4, grid_size*2.4))
-for i in range(num_tiles):
-    tile_path = sample_image_tiles_path_train[i]
-    tile_image_raw = cv2.imread(str(tile_path), cv2.IMREAD_GRAYSCALE)
-    tile_tensor = preprocess_tile(tile_image_raw, image_size=image_size)
-    if tile_tensor is None:
-        raise ValueError(f"Could not preprocess tile image: {tile_path}")
-    tile_image_pip = tile_tensor.squeeze().numpy()
-    row, col = divmod(i, grid_size)
-    axis[row, col].imshow(tile_image_pip, cmap="gray", vmin=0, vmax=1)
-    axis[row, col].axis("off")
+#%% plot tiles after image pipeline
+sample_image_processed_tensor, rows_tensor, cols_tensor = image_pipeline_df(sample_image_df, input_image_size_vae=image_size)  # type: ignore # Apply image pipeline to sample image tiles
 
-fig.suptitle(f"Processed {grid_size}x{grid_size} tiles from {sample_image_name_train}", fontsize=20, fontweight="bold")
+fig,axis = plt.subplots(grid_size, grid_size, figsize=(grid_size*2.4, grid_size*2.4))
+for tile_tensor, row, col in zip(sample_image_processed_tensor, rows_tensor, cols_tensor):
+    row = int(row.item())
+    col = int(col.item())
+    tile_img = (tile_tensor.numpy()[0] * 255).astype(np.uint8)  # Convert back to uint8 for display
+    axis[row, col].imshow(tile_img, cmap="gray", vmin=0, vmax=255)
+    axis[row, col].axis("off")
+    
+fig.suptitle(f"Processed in pipeline {grid_size}x{grid_size} tiles from {sample_image_name_train}", fontsize=20, fontweight="bold")
 plt.tight_layout()
 
 #%% Plot example train images from dataloader
@@ -269,7 +246,7 @@ images = batch[0]  # Take the first 64 images from the batch
 sample_images = images[:batch_size]  # Ensure we only take batch_size images
 _, im_height, im_width = sample_images[0].shape
 
-print(f"Image shape:", im_width, im_height)
+print(f"Image shape: {im_width} x {im_height}")
 
 N_hor = 8 #int(np.sqrt(batch_size))
 N_ver = 3 #int(N_hor/2)
@@ -305,154 +282,78 @@ print("Model architecture:")
 print(model)
 
 #%% Train model
-
-
 epoch_losses, recon_losses, kl_losses = [], [], []
 step_losses, step_recon_losses, step_kl_losses = [], [], []
-kl_per_dim_history = []  # For tracking KL per latent dim over time
+kl_per_dim_history = []
+
 model.train()
 
-# before training
 n_batches = len(train_loader)
-total_steps = epochs * n_batches        # total batches across all epochs
-global_step = 0
 start_time = time()
 
-# OUTER: epoch-level progress (one bar)
-outer = tqdm(
-    total=epochs,                    # outer counts epochs now
-    desc="Epochs",
-    position=0,
-    leave=True,
-    dynamic_ncols=True,
-    smoothing=0.1,
-    bar_format="{l_bar}{bar:28} [{elapsed}<{remaining}, {rate_fmt}]",
-)
-
 for epoch in range(epochs):
+    print(f"Epoch {epoch + 1}/{epochs}")
+
+    # Learning rate warmup
     if epoch < warmup_epochs:
         lr = learning_rate * (epoch + 1) / warmup_epochs
     else:
         lr = learning_rate
 
     for g in opt.param_groups:
-        g['lr'] = lr
-        
+        g["lr"] = lr
+
     running_loss = 0.0
     running_recon = 0.0
     running_kl = 0.0
 
-    # INNER: per-epoch (batches) progress
-    inner = tqdm(
-        train_loader,
-        desc=f" Epoch {epoch + 1:02d}/{epochs:02d}",
-        total=n_batches,
-        position=1,
-        leave=False,                # inner disappears after epoch
-        dynamic_ncols=True,
-        smoothing=0.1,
-        bar_format="{l_bar}{bar:28} [{elapsed}<{remaining}, {rate_fmt}]",
-    )
-
-    for batch_idx, (x, rows, cols) in enumerate(inner, start=1):
+    for x, rows, cols in train_loader:
         x = x.to(device, non_blocking=True)
         rows = rows.to(device, non_blocking=True)
         cols = cols.to(device, non_blocking=True)
 
+        # reset gradients
         opt.zero_grad()
+
+        # calculate reconstruction error
         x_hat = model(x, row=rows, col=cols)
-
         recon = ((x - x_hat) ** 2).sum()
-        
-        if isinstance(model, Autoencoder):  
-            loss = recon
-            kl = torch.tensor(0.0)
-        elif isinstance(model, VariationalAutoencoder):
-            kl = model.encoder.kl
-            beta = min(1.0, (epoch + 1) / warmup_epochs)  # Linear warmup of KL weight
-            loss = recon + beta * kl
-            
-        else:
-            raise ValueError(f"Unknown model type: {type(model).__name__}")
 
+        # calculate KL divergence and total loss with warmup
+        kl = model.encoder.kl
+        beta = min(1.0, (epoch + 1) / warmup_epochs)
+        
+        # calculate total loss
+        loss = recon + beta * kl
+
+        # backpropagate and optimize
         loss.backward()
         opt.step()
-
+        
         running_loss += loss.item()
         running_recon += recon.item()
         running_kl += kl.item()
 
+        # Log per-step losses (for plotting later)
         step_losses.append(loss.item())
         step_recon_losses.append(recon.item())
         step_kl_losses.append(kl.item())
 
-        global_step += 1
-        # NOTE: removed outer.update(1) here (outer is epoch-level)
-
-        # compute ETA (seconds left) for entire training — shown on inner
-        elapsed = time() - start_time
-        if global_step > 0:
-            secs_per_step = elapsed / global_step
-            steps_left = max(total_steps - global_step, 0)
-            eta_seconds = int(secs_per_step * steps_left)
-            hrs, rem = divmod(eta_seconds, 3600)
-            mins, secs = divmod(rem, 60)
-            eta_str = f"{hrs:d}:{mins:02d}:{secs:02d}"
-        else:
-            eta_str = "?:?:?"
-
-        step = batch_idx
-        postfix = {
-            "loss": f"{loss.item():.2f}",
-            "recon": f"{recon.item():.2f}",
-            "kl": f"{kl.item():.2f}",
-            "avg": f"{running_loss / step:.2f}",
-            "lr": f"{opt.param_groups[0]['lr']:.1e}",
-            "ETA": eta_str,            # ETA for whole training shown here
-        }
-        if torch.cuda.is_available():
-            postfix["gpuGB"] = f"{torch.cuda.memory_allocated(device) / 1e9:.2f}"
-
-        inner.set_postfix(postfix)
-    
-    inner.close()
-
-    # per-epoch averages
+    # Per-epoch averages
     epoch_losses.append(running_loss / n_batches)
     recon_losses.append(running_recon / n_batches)
     kl_losses.append(running_kl / n_batches)
-    if isinstance(model, VariationalAutoencoder):
-        kl_per_dim_history.append(model.encoder.kl_per_dim.cpu().numpy())
-
-    # one epoch done -> advance epoch-level outer bar
-    outer.update(1)
-
-    # recompute ETA for whole training and show on outer summary
-    total_elapsed = time() - start_time
-    if global_step > 0:
-        secs_per_step = total_elapsed / global_step
-        steps_left = max(total_steps - global_step, 0)
-        eta_seconds = int(secs_per_step * steps_left)
-        hrs, rem = divmod(eta_seconds, 3600)
-        mins, secs = divmod(rem, 60)
-        eta_str = f"{hrs:d}:{mins:02d}:{secs:02d}"
-    else:
-        eta_str = "?:?:?"
-
-    outer.set_postfix({
-        "epoch": f"{epoch+1}/{epochs}",
-        "ep_loss": f"{epoch_losses[-1]:.3f}",
-        "ETA": eta_str
-    })
-
-    print(
-        f"Epoch {epoch+1}/{epochs} | loss={epoch_losses[-1]:.3f} "
-        f"| recon={recon_losses[-1]:.3f} | kl={kl_losses[-1]:.3f}"
-    )
-
-outer.close()
+    kl_per_dim_history.append(model.encoder.kl_per_dim.detach().cpu().numpy())
+    
+    avg_epoch_time = (time() - start_time) / (epoch + 1)
+    expected_time_remaining = avg_epoch_time * (epochs - epoch - 1)
+    expected_finish_time = time() + expected_time_remaining
+    
+    print(f"  loss={epoch_losses[-1]:.3f} (recon={recon_losses[-1]:.3f}, kl={kl_losses[-1]:.3f}, beta={beta:.2f}), average epoch time: {avg_epoch_time:.1f}s, expected finish time: {time():.1f}s + {expected_time_remaining/60:.1f}m = {expected_finish_time:.1f}s")
+    
 total_elapsed = time() - start_time
-print(f"Training finished in {int(total_elapsed//60)}m {int(total_elapsed%60)}s")
+
+print(f"Training finished in {int(total_elapsed // 60)}m {int(total_elapsed % 60)}s")
 
 
 #%% Plot training curves
@@ -573,6 +474,7 @@ plt.show()
 
 # Use background image as input
 img_bkg_tensor = torch.from_numpy(img_bkg).unsqueeze(0).unsqueeze(0).float() / 255.0  # shape: (1, 1, H, W)
+
 empty_tile_result = preprocess_tile(img_bkg, image_size=image_size)
 empty_tile = empty_tile_result.unsqueeze(0).to(device)  # type: ignore # shape: (1, 1, H, W)
 
@@ -583,8 +485,8 @@ reconstructed_grid = np.zeros((test_grid_size, test_grid_size, image_size, image
 
 with torch.no_grad():
     # Batch processing: create all (r, c) pairs at once
-    rows_all = torch.arange(test_grid_size, device=device).repeat(test_grid_size)  # shape: (test_grid_size^2,)
-    cols_all = torch.arange(test_grid_size, device=device).repeat_interleave(test_grid_size)  # shape: (test_grid_size^2,)
+    rows_all = torch.arange(test_grid_size, device=device).repeat_interleave(test_grid_size)  # shape: (test_grid_size^2,)
+    cols_all = torch.arange(test_grid_size, device=device).repeat(test_grid_size)  # shape: (test_grid_size^2,)
     
     # Replicate the same tile for all positions
     empty_tile_batch = empty_tile.repeat(test_grid_size * test_grid_size, 1, 1, 1)  # shape: (test_grid_size^2, 1, H, W)
@@ -605,15 +507,21 @@ print(f"Reconstructed grid value range: [{vmin:.3f}, {vmax:.3f}]")
 
 #%% Plot reconstructed grid with mean value of each tile (to see overall trends without visualizing each tile)
 mean_reconstructed_grid = reconstructed_grid.mean(axis=(2, 3))  # shape: (test_grid_size, test_grid_size)
-plt.figure(figsize=(6, 5))
-plt.imshow(mean_reconstructed_grid, cmap='viridis', vmin=mean_reconstructed_grid.min(), vmax=mean_reconstructed_grid.max())
-plt.colorbar(label="Mean reconstructed pixel value")
-plt.xlabel("Column index (c)", fontsize=12)
-plt.ylabel("Row index (r)", fontsize=12)
-plt.title("Mean reconstructed value across row/col positions", fontsize=16)
+
+fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+ax[0].imshow(mean_reconstructed_grid, cmap='viridis', vmin=mean_reconstructed_grid.min(), vmax=mean_reconstructed_grid.max(), origin='upper')
+ax[0].set_xlabel("Column index (c)", fontsize=12)
+ax[0].set_ylabel("Row index (r)", fontsize=12)
+ax[0].set_title("Mean reconstructed value across row/col positions", fontsize=16)
+
+ax[1].imshow(img_bkg, cmap='gray', origin='upper')
+ax[1].axis('off')
+ax[1].set_title("Background Image", fontsize=16)
+
 plt.show()
 
 #%% Plot reconstructed grid for a few selected row/col positions to see how the actual tile reconstructions change across positions
+# Plot nexto t
 
 fig, axes = plt.subplots(test_grid_size, test_grid_size, figsize=(12, 12))
 for r in range(test_grid_size):
@@ -628,6 +536,10 @@ for r in range(test_grid_size):
 plt.suptitle("Reconstructed tiles from empty input across row/col positions", fontsize=16)
 plt.tight_layout()
 plt.show()
+
+#%% Reconstruct the background image while split up in tiles
+
+
 #%% Model summary
 
 print(f"Bby you are done stop running cells and relax a lil")

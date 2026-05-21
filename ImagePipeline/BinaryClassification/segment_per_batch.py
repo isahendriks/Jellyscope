@@ -16,14 +16,14 @@ from matplotlib.patches import Rectangle
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from functions import (  # noqa: E402
-    ObservationScorer,
+    TwoClassScorer,
+    OneClassScorer,
     VariationalAutoencoder,
     extract_tiles_with_offset,
     find_local_maxima,
     flood_fill_region,
     preprocess_tile,
 )
-
 
 def report_torch_environment() -> torch.device:
     print("=" * 40)
@@ -98,12 +98,21 @@ def load_scorer_model(device: torch.device, model_name: str, scorer_mode: str, l
 
     checkpoint = torch.load(scorer_name, map_location=device, weights_only=False)
 
-    scorer = ObservationScorer(
-        latent_dim=latent_dim,
-        hidden_dim=256,
-        dropout=0.3,
-        grid_size=tile_grid_size,
-    )
+    if scorer_mode == "one_class":
+        scorer = OneClassScorer(
+            latent_dim=latent_dim,
+            hidden_dim=256,
+            emb_dim=16,
+            grid_size=tile_grid_size,
+        )
+        
+    else:  # binary
+        scorer = TwoClassScorer(
+            latent_dim=latent_dim,
+            hidden_dim=256,
+            dropout=0.3,
+            grid_size=tile_grid_size,
+        )
     scorer.load_state_dict(checkpoint["model_state_dict"])
     scorer_threshold = float(checkpoint.get("threshold", 0.5))
     scorer.to(device)
@@ -120,10 +129,10 @@ def aggregate_scores_to_map(rows_list, cols_list, scores, tile_grid_size: int, o
     coverage_map_small = np.zeros((grid_size_small, grid_size_small), dtype=np.float32)
 
     for tile_row, tile_col, pred_score in zip(rows_list, cols_list, scores):
-        small_row = int(round((float(tile_row) - 1.0) * offsets_count))
-        small_col = int(round((float(tile_col) - 1.0) * offsets_count))
-        small_row = max(0, min(small_row, grid_size_small - offsets_count))
-        small_col = max(0, min(small_col, grid_size_small - offsets_count))
+        small_row = int(round(float(tile_row) * offsets_count))
+        small_col = int(round(float(tile_col) * offsets_count))
+        small_row = max(0, min(small_row, grid_size_small - 1))
+        small_col = max(0, min(small_col, grid_size_small - 1))
 
         prob_map_small[small_row : small_row + offsets_count, small_col : small_col + offsets_count] += float(pred_score)
         coverage_map_small[small_row : small_row + offsets_count, small_col : small_col + offsets_count] += 1.0
@@ -155,14 +164,15 @@ def image_to_probability_map(
     cols_list = []
 
     for offset, offset_norm in zip(offsets, offsets_norm):
-        tiles = extract_tiles_with_offset(image, tile_size, tile_grid_size, offset_x=offset, offset_y=offset)
+        print(f"offset = {offset} pixels, ({offset_norm:.2f} of tile size)")
+        tiles = extract_tiles_with_offset(image, tile_size, tile_grid_size, offset_pxl_x=offset, offset_pxl_y=offset, offset_norm_x=offset_norm, offset_norm_y = offset_norm )
         for tile, row, col in tiles:
             tile_tensor = preprocess_tile(tile, image_size=image_size)
             if tile_tensor is None:
                 continue
             tiles_list.append(tile_tensor)
-            rows_list.append(row + 1 + offset_norm)
-            cols_list.append(col + 1 + offset_norm)
+            rows_list.append(row)
+            cols_list.append(col)
 
     if not tiles_list:
         return None
@@ -232,14 +242,15 @@ def batch_extract_tiles_from_images(images_list, tile_size, tile_grid_size, offs
         cols_list = []
 
         for offset, offset_norm in zip(offsets, offsets_norm):
-            tiles = extract_tiles_with_offset(image_gray, tile_size, tile_grid_size, offset_x=offset, offset_y=offset)
+            tiles = extract_tiles_with_offset(image_gray, tile_size, tile_grid_size, offset_pxl_x=offset, offset_pxl_y=offset, offset_norm_x=offset_norm, offset_norm_y=offset_norm)
             for tile, row, col in tiles:
                 tile_tensor = preprocess_tile(tile, image_size=image_size)
                 if tile_tensor is None:
                     continue
                 tiles_list.append(tile_tensor)
-                rows_list.append(row + 1 + offset_norm)
-                cols_list.append(col + 1 + offset_norm)
+                # row/col already include the fractional offset and are 0-based.
+                rows_list.append(row)
+                cols_list.append(col)
         
         if tiles_list:
             all_tiles.extend(tiles_list)
@@ -272,30 +283,25 @@ def batch_run_inference(tiles_tensor, rows_tensor, cols_tensor, model, scorer, s
     with torch.inference_mode():
         for start_idx in range(0, len(tiles_tensor), batch_size):
             end_idx = min(start_idx + batch_size, len(tiles_tensor))
-            # print(f"    → Batch {start_idx//batch_size + 1}: tiles {start_idx}-{end_idx}...", flush=True)
-            
+
             tiles_batch = tiles_tensor[start_idx:end_idx].to(device, non_blocking=True)
             rows_batch = rows_tensor[start_idx:end_idx].to(device, non_blocking=True)
             cols_batch = cols_tensor[start_idx:end_idx].to(device, non_blocking=True)
             
             torch.cuda.synchronize()  # Ensure GPU is ready
             
-            # print(f"      Encoding...", flush=True)
+    
             mu, _ = model.encode(tiles_batch, row=rows_batch, col=cols_batch)
-            
-            # print(f"      Decoding...", flush=True)
+
             x_hat = model(tiles_batch, row=rows_batch, col=cols_batch)
             
-            # print(f"      Computing reconstruction error...", flush=True)
             recon_err = ((tiles_batch - x_hat) ** 2).flatten(1).mean(dim=1)
             
-            # print(f"      Scoring...", flush=True)
             scores = scorer(mu, recon_err, rows_batch, cols_batch)
             preds = scores >= scorer_threshold
 
             torch.cuda.synchronize()  # Ensure all ops complete
             
-            # print(f"      Transferring to CPU...", flush=True)
             mu_list.append(mu.detach().cpu().numpy())
             recon_list.append(recon_err.detach().cpu().numpy())
             scores_list.append(scores.detach().cpu().numpy())
@@ -308,9 +314,7 @@ def batch_run_inference(tiles_tensor, rows_tensor, cols_tensor, model, scorer, s
                 pass
             torch.cuda.empty_cache()
             
-            # print(f"      ✓ Batch complete", flush=True)
 
-    # print(f"    Concatenating results...", flush=True)
     scores_array = np.concatenate(scores_list, axis=0)
     preds_array = np.concatenate(preds_list, axis=0)
     mu_array = np.concatenate(mu_list, axis=0)
@@ -352,9 +356,10 @@ def split_results_by_image(scores_array, rows_list, cols_list, tile_grid_size, o
 
 
 def save_crop_metadata_rows(csv_path: Path, rows: list[dict]):
-
     if not rows:
         return
+    
+    csv_path = Path(csv_path)
     df = pd.DataFrame(rows)
     write_header = not csv_path.exists()
     df.to_csv(csv_path, index=False, mode="a", header=write_header)
@@ -365,15 +370,21 @@ def main():
 
     # Define paths and parameters
     ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Monitoring data"
-    monitoring_effort = "Kristineberg_260424"
+    monitoring_effort = "Kristineberg_251128"  # for titles and saved model names, e.g. "kristineberg_251128"
     images_folder = os.path.join(ROOT_DIR_R, monitoring_effort)
     IMAGE_SIZE_PX = 4512  # All images are square 4512x4512
     tile_grid_size = 16
     
     tile_size = IMAGE_SIZE_PX // tile_grid_size
     latent_dim = 32
-    model_name = f"../models/VAE/{monitoring_effort}_vae_model{tile_grid_size}_l{latent_dim}.pth"
-    output_folder = Path(f"C:/Users/Admin/Documents/Jellyscope/Segmentation_results_{monitoring_effort}")
+    model_name = f"models/VAE/{monitoring_effort}_vae_model{tile_grid_size}_l{latent_dim}.pth"
+    scorer_mode = "binary"
+    
+    images_path = sorted(str(p) for p in Path(images_folder).glob("*.png"))
+    # Load models and thresholds
+    model, _, _, grid_size_loaded = load_vae_model(device, model_name, latent_dim)
+    scorer, scorer_threshold, _ = load_scorer_model(device, model_name, scorer_mode, latent_dim, tile_grid_size)
+    output_folder = Path(f"C:/Users/Admin/Documents/Jellyscope/Segmentation_results/{monitoring_effort}")
 
     batch_size = 4096*2  # Process 8192 tiles per batch (adjust based on GPU memory)
     batch_size_images = 32  # Process 32 images per batch (32 * 1280 tiles = 40960)
@@ -384,38 +395,49 @@ def main():
     total_processing_time = 0.0
     total_image_load_time = 0.0
 
-    offsets_norm = [0, 0.2, 0.4, 0.6, 0.8]
+    offsets_norm = [0, 0.5]
     offsets = [int(norm * tile_size) for norm in offsets_norm]
 
     grid_size_small = tile_grid_size * len(offsets)
     upscale_factor = IMAGE_SIZE_PX/grid_size_small 
-    min_region_size_patches = 1
+    min_region_size_patches = 3
     crop_padding_pixels = 10
     
     # set preak detection parameters
-    peak_threshold = 0.8
-    secondary_threshold = 0.3
+    peak_threshold = 0.99
+    secondary_threshold = 0.7
+    mean_threshold = 0.9
     
     # Set scorer mode (binary or one_class) and load corresponding model and threshold
-    scorer_mode = "binary"
-    print(f"Using scorer mode: {scorer_mode}")
-    
-    images_path = sorted(str(p) for p in Path(images_folder).glob("*.png"))
-    print(f"Found {len(images_path)} images in: {images_folder}")
-
-    model, _, hidden_channels, grid_size_loaded = load_vae_model(device, model_name, latent_dim)
-    scorer, scorer_threshold, _ = load_scorer_model(device, model_name, scorer_mode, latent_dim, tile_grid_size)
-
     if grid_size_loaded != tile_grid_size:
         raise ValueError(f"⚠ Warning: VAE model grid_size={grid_size_loaded} does not match expected tile_grid_size={tile_grid_size}. ")
 
-    output_folder_crops = output_folder / "crops_peak_detection"
+    output_folder_crops = output_folder / monitoring_effort / "crops_peak_detection"
     output_folder_crops.mkdir(parents=True, exist_ok=True)
 
     crop_metadata_csv = output_folder_crops / "crop_metadata.csv"
     if crop_metadata_csv.exists():
-        crop_metadata_csv.unlink()
+        try:
+            crop_metadata_csv.unlink()
+        except PermissionError:
+            print(f"⚠ Warning: Could not delete {crop_metadata_csv} (file may be locked). Appending to existing file.")
+            pass
 
+
+    ### Print initial summary of processing plan
+    print("\n" + "=" * 70)
+    print("Starting Batch Image Processing for Anomaly Detection")
+    print("=" * 70)
+    
+    print(f"Monitoring effort:       {monitoring_effort}")
+    print(f"Input images folder:    {images_folder}")
+    print(f"Number of images:       {len(images_path)}")
+    print(f"Image size (px):        {IMAGE_SIZE_PX}x{IMAGE_SIZE_PX}")
+    print(f"Tile grid size:         {tile_grid_size}x{tile_grid_size} (tile size: {tile_size}px)")
+    print(f"VAE model:              {model_name}")
+    print(f"Scorer mode:            {scorer_mode}")
+    print(f"Threshold:              {peak_threshold}" )
+    
     print(f"\nStarting processing of {len(images_path)} tiles with {len(offsets)} offsets...\n")
 
     crop_counter = 0
@@ -482,6 +504,9 @@ def main():
                             continue
 
                         region_small_points = np.asarray(list(region_small), dtype=np.int32)
+                        region_mean = prob_map_small[region_small_points[:, 0], region_small_points[:, 1]].mean() if len(region_small_points) > 0 else 0.0
+                        if region_mean < mean_threshold:
+                            continue
 
                         min_y_small = int(region_small_points[:, 0].min())
                         max_y_small = int(region_small_points[:, 0].max())
@@ -498,6 +523,34 @@ def main():
                         crop_x0 = max(0, x0 - crop_padding_pixels)
                         crop_y1 = min(IMAGE_SIZE_PX, y1 + crop_padding_pixels)
                         crop_x1 = min(IMAGE_SIZE_PX, x1 + crop_padding_pixels)
+
+                        # Ensure crop is square by taking max dimension and re-centering
+                        crop_h = crop_y1 - crop_y0
+                        crop_w = crop_x1 - crop_x0
+                        crop_size = max(crop_h, crop_w)
+                        
+                        y_center = (crop_y0 + crop_y1) // 2
+                        x_center = (crop_x0 + crop_x1) // 2
+                        
+                        crop_y0 = y_center - crop_size // 2
+                        crop_x0 = x_center - crop_size // 2
+                        crop_y1 = crop_y0 + crop_size
+                        crop_x1 = crop_x0 + crop_size
+                        
+                        # Clip to image boundaries
+                        if crop_y0 < 0:
+                            crop_y0 = 0
+                            crop_y1 = min(crop_size, IMAGE_SIZE_PX)
+                        if crop_y1 > IMAGE_SIZE_PX:
+                            crop_y1 = IMAGE_SIZE_PX
+                            crop_y0 = max(0, crop_y1 - crop_size)
+                        
+                        if crop_x0 < 0:
+                            crop_x0 = 0
+                            crop_x1 = min(crop_size, IMAGE_SIZE_PX)
+                        if crop_x1 > IMAGE_SIZE_PX:
+                            crop_x1 = IMAGE_SIZE_PX
+                            crop_x0 = max(0, crop_x1 - crop_size)
 
                         candidates.append({"region_small_points": region_small_points,
                                             "peak_val": float(peak_val),
@@ -548,20 +601,22 @@ def main():
                         crop_w = crop_x1 - crop_x0
 
                         region_mean = prob_map_small[region_points[:, 0], region_points[:, 1]].mean() if len(region_points) > 0 else 0.0
-                        region_max = prob_map_small[region_points[:, 0], region_points[:, 1]].max() if len(region_points) > 0 else 0.0
                     
-                        crop_rows.append({  "image_name": image_name,
-                                            "crop_id": crop_idx,
+                        crop_image = image_gray[crop_y0:crop_y1, crop_x0:crop_x1]
+                        crop_name = f"{image_name}_crop_{crop_idx:03d}.png"
+                        crop_path = output_folder_crops / crop_name
+                        
+
+                        crop_rows.append({  "image_name": crop_name,
                                             "crop_width": crop_w,
                                             "crop_height": crop_h,
                                             "crop_y0": crop_y0,
                                             "crop_x0": crop_x0,
                                             "crop_y1": crop_y1,
                                             "crop_x1": crop_x1,
-                                            "region_size_pixels": int(region_points.shape[0]),
+                                            "region_size_pixels": len(region_points),
                                             "peak_intensity": peak_val,
-                                            "region_mean_intensity": region_mean,
-                                            "region_max_intensity": region_max})
+                                            "region_mean_intensity": region_mean})
                         
                         crop_image = image_gray[crop_y0:crop_y1, crop_x0:crop_x1]
                         crop_path = output_folder_crops / f"{image_name}_crop_{crop_idx:03d}.png"

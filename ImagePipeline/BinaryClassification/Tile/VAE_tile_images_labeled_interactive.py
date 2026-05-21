@@ -3,8 +3,10 @@ import os
 import cv2
 import numpy as np
 from pathlib import Path
+from collections import defaultdict
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from matplotlib import cm
 import pandas as pd
 
 print("\n" + "="*60)
@@ -15,42 +17,51 @@ print("="*60)
 
 grid_size = 16
 tile_size = int(4512 / grid_size)
-monitoring_effort = 'Kristineberg_260424'  #
+monitoring_effort = 'Kristineberg_251128' 
 
+OFFSET_NORMALIZED = [0.0, 0.2, 0.4, 0.6, 0.8]
+ANY_OBS_WINS = True
+
+sort_species = False
 ROOT_C = r"C:\Users\Admin\Documents\Jellyscope\Training data\Binary_classifier"
 ROOT_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data\Binary_classifier"
 
-input_folder = r"{}\test\OG_images".format(monitoring_effort)
-output_folder = r"{}\test\tiles{}".format(monitoring_effort, grid_size)
+input_folder = r"{}\train_DNN\OG_images".format(monitoring_effort)
+output_folder = r"{}\train_DNN\tiles{}_offsets{}".format(monitoring_effort, grid_size, len(OFFSET_NORMALIZED))
 
 input_path = Path(ROOT_C).joinpath(Path(input_folder))
 output_path = Path(ROOT_C).joinpath(Path(output_folder))
 
 all_image_files = sorted(list(Path(input_path).rglob('*.png')))
-species_names = [str(img_name)[126:-4] for img_name in all_image_files]  # Extract species name from filename
-species_names = np.unique(species_names)  # Get unique species names
 
-species_names_to_exclude =  ['dentritus', 'dentritus_glo', 'filament', 'macro_filament', 'filament_glo'] # Set this to a subset of species if you want to filter
-species_names_to_include = [str(name) for name in species_names if name not in species_names_to_exclude] 
+if sort_species: 
+    species_names = [str(img_name)[132:-4] for img_name in all_image_files]  # Extract species name from filename
+    species_names = np.unique(species_names)  # Get unique species names
 
-# exclude images that do not match the included species names
-all_image_files_filtered = []
-for img in all_image_files:
-    species_name = str(img)[126:-4]  # Extract species name from filename
-    if species_name in species_names_to_include:
-        all_image_files_filtered.append(img)
+    species_names_to_exclude =  ['dentritus', 'dentritus_glo', 'filament', 'macro_filament', 'filament_glo'] # Set this to a subset of species if you want to filter
+    species_names_to_include = ['mnemeopsis'] #[str(name) for name in species_names if name not in species_names_to_exclude] 
 
-print(f"Excluded species names: {species_names_to_exclude}, corresponding to {len(all_image_files) - len(all_image_files_filtered)} images")
-print(f"Images after filtering: {len(all_image_files_filtered)}")
+    # exclude images that do not match the included species names
+    all_image_files_filtered = []
+    for img in all_image_files:
+        species_name = str(img)[126:-4]  # Extract species name from filename
+        if species_name in species_names_to_include:
+            all_image_files_filtered.append(img)
 
+    print(f"Excluded species names: {species_names_to_exclude}, corresponding to {len(all_image_files) - len(all_image_files_filtered)} images")
+    print(f"Images after filtering: {len(all_image_files_filtered)}")
+
+else:
+    all_image_files_filtered = all_image_files
+    
 # Check if images are already in output folder, exclude those images.
 obs_folder = output_path / Path('obs')
 no_obs_folder = output_path / Path('no_obs')
 
 processed_images = set()
-for patch in obs_folder.glob('*_r0_c0.png'):
+for patch in obs_folder.glob('*.png'):
     processed_images.add(patch.stem.rsplit('_r', 1)[0])
-for patch in no_obs_folder.glob('*_r0_c0.png'):
+for patch in no_obs_folder.glob('*.png'):
     processed_images.add(patch.stem.rsplit('_r', 1)[0])
 
 ## Filter out images that are already processed
@@ -64,6 +75,7 @@ print(f"  Input folder:  {input_path}")
 print(f"  Output folder: {output_path}")
 print(f"  Tile size:     {tile_size}x{tile_size}")
 print(f"  Grid size:     {grid_size}x{grid_size}")
+print(f"  Offsets:       {len(OFFSET_NORMALIZED)} layers: {OFFSET_NORMALIZED}")
 print(f"  Total images:  {len(all_image_files)}")
 print(f"  Images after filtering by species: {len(all_image_files_filtered)}")
 print(f"  Already processed images: {len(processed_images)}")
@@ -83,28 +95,42 @@ output_path.mkdir(parents=True, exist_ok=True)
 #%% Cell 4: Simple Grid-Based Tile Labeler Class
 
 class GridTileLabeler:
-    def __init__(self, image_path, grid_size=32, tile_size=141, fig=None, ax=None, img_idx=0, total_images=1):
+    def __init__(self, image_path, grid_size=32, tile_size=141, offsets_normalized=None, fig=None, ax=None, img_idx=0, total_images=1):
         self.image_path = image_path
         self.grid_size = grid_size
         self.tile_size = tile_size
+        self.offsets_normalized = list(offsets_normalized or [0.0])
         self.img_idx = img_idx
         self.total_images = total_images
+        self.image_tile_extent = self.grid_size + len(self.offsets_normalized) - 1
+        self.panel_stride = self.img_w if 'img_w' in self.__dict__ else None
         
         # Read image
-        self.img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
-        if self.img is None:
+        img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
             raise FileNotFoundError(f"Could not read {image_path}")
+        self.img = img
         
         self.img_h, self.img_w = self.img.shape[:2]
-        self.img_rgb = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
+        self.panel_stride = self.img_w
+        # High-resolution grid parameters
+        self.k = len(self.offsets_normalized)
+        self.hr_rows = self.grid_size * self.k
+        self.hr_cols = self.grid_size * self.k
+        self.hr_cell_h = float(self.img_h) / float(self.hr_rows)
+        self.hr_cell_w = float(self.img_w) / float(self.hr_cols)
+        color_img = cv2.imread(str(image_path))
+        if color_img is None:
+            raise FileNotFoundError(f"Could not read {image_path}")
+        self.img_rgb = cv2.cvtColor(color_img, cv2.COLOR_BGR2RGB)
         
-        # Store all tile data for the full grid
-        self.all_tiles = {}  # {linear_idx: {'row': row, 'col': col, 'x': x, 'y': y, 'data': tile_data}}
+        # Store all tile data for the full offset-aware grid
+        self.all_tiles = {}  # {(offset_idx, row, col): {'offset_idx': idx, 'offset': offset, 'row': row, 'col': col, 'x': x, 'y': y, 'data': tile_data}}
         self._extract_all_tiles()
         
-        # Tracking selected obs tiles
-        self.obs_indices = set()  # Linear indices of tiles marked as obs
-        self.undo_stack = []  # Stack of previous selections for undo
+        # Tracking selected high-resolution grid cells (hr_row, hr_col)
+        self.hr_selected = set()
+        self.undo_stack = []  # Stack of previous selections for undo (stores hr_selected snapshots)
         
         # Reuse figure or create new one
         if fig is None or ax is None:
@@ -115,70 +141,118 @@ class GridTileLabeler:
         # Add margin at top to prevent title overlap
         self.fig.subplots_adjust(top=0.93)
         
-        self.tile_rects = {}  # {linear_idx: rect_patch}
+        self.tile_rects = {}  # {(offset_idx, row, col): rect_patch}
         self.image_confirmed = False  # Flag to track when user presses 'c'
         self.user_requested_exit = False  # Flag to track when user presses 'e'
         self.show_grid()
         
         # Connect event handlers
         self.click_cid = self.fig.canvas.mpl_connect('button_press_event', self.on_click)
+        self.motion_cid = self.fig.canvas.mpl_connect('motion_notify_event', self.on_motion)
+        self.release_cid = self.fig.canvas.mpl_connect('button_release_event', self.on_release)
         self.key_cid = self.fig.canvas.mpl_connect('key_press_event', self.on_key)
+
+        # Drag selection state
+        self.dragging = False
+        self.drag_start = None
+        self.drag_rect = None
     
     def _extract_all_tiles(self):
-        """Extract all tiles from the full grid."""
-        for row in range(self.grid_size):
-            for col in range(self.grid_size):
-                tile_x = col * self.tile_size
-                tile_y = row * self.tile_size
-                tile_x_end = tile_x + self.tile_size
-                tile_y_end = tile_y + self.tile_size
-                
-                linear_idx = row * self.grid_size + col
-                tile_data = self.img[tile_y:tile_y_end, tile_x:tile_x_end]
-                
-                self.all_tiles[linear_idx] = {
-                    'row': row,
-                    'col': col,
-                    'x': tile_x,
-                    'y': tile_y,
-                    'data': tile_data
-                }
+        """Extract all sampled tiles for a full kxk subdivision per base tile.
+
+        For display we will create a composite image of the same size as the original
+        but subdivided into (grid_size * k) cells per axis, where k = len(offsets).
+        Each sampled tile (size tile_size) is resized to a small cell (tile_size // k)
+        for rendering and placed at: (row*tile_size + oy_idx*small, col*tile_size + ox_idx*small).
+        """
+        k = len(self.offsets_normalized)
+        small = max(1, self.tile_size // k)
+
+        for oy_idx, oy in enumerate(self.offsets_normalized):
+            oy_px = int(round(self.tile_size * oy))
+            for ox_idx, ox in enumerate(self.offsets_normalized):
+                ox_px = int(round(self.tile_size * ox))
+
+                for row in range(self.grid_size):
+                    for col in range(self.grid_size):
+                        tile_x = col * self.tile_size + ox_px
+                        tile_y = row * self.tile_size + oy_px
+                        tile_x_end = tile_x + self.tile_size
+                        tile_y_end = tile_y + self.tile_size
+
+                        if tile_x_end > self.img_w or tile_y_end > self.img_h:
+                            continue
+
+                        tile_data = self.img[tile_y:tile_y_end, tile_x:tile_x_end]
+                        # compute display position (within original image coordinates)
+                        disp_x = col * self.tile_size + ox_idx * small
+                        disp_y = row * self.tile_size + oy_idx * small
+
+                        tile_key = (oy_idx, ox_idx, row, col)
+                        self.all_tiles[tile_key] = {
+                            'oy_idx': oy_idx,
+                            'ox_idx': ox_idx,
+                            'offset_y': oy,
+                            'offset_x': ox,
+                            'row': row,
+                            'col': col,
+                            'x': disp_x,
+                            'y': disp_y,
+                            'small': small,
+                            'data': tile_data,
+                        }
         
     def show_grid(self):
         """Display image with grid and labeled tiles."""
+        # Display the original image and overlay a high-resolution grid of size (grid_size * k)
         self.ax.clear()
         self.ax.imshow(self.img_rgb)
         self.tile_rects = {}
-        
-        # Draw all tiles with dark blue borders and green hue for selected tiles
-        for linear_idx, tile_info in self.all_tiles.items():
-            row, col = tile_info['row'], tile_info['col']
-            x, y = tile_info['x'], tile_info['y']
-            
-            # Dark blue border for all tiles
-            edge_color = '#00008B'
-            
-            # Fill color based on selection - slight green hue for obs tiles
-            if linear_idx in self.obs_indices:
-                facecolor = '#90EE90'  # Light green
-                alpha_fill = 0.1
-            else:
-                facecolor = 'none'
-                alpha_fill = 0
-            
-            rect = patches.Rectangle((x, y), self.tile_size, self.tile_size,
-                                    linewidth=1, edgecolor=edge_color, facecolor=facecolor, 
-                                    alpha=0.7, zorder=2)
+
+        # Draw HR grid with a distinct color for each offset pair
+        k = self.k
+        hr_h = self.hr_cell_h
+        hr_w = self.hr_cell_w
+
+        # Create a colormap for the offset pairs (oy_idx, ox_idx)
+        num_offset_pairs = k * k
+        try:
+            cmap = cm.get_cmap('tab20', num_offset_pairs)
+        except Exception:
+            cmap = cm.get_cmap('hsv', num_offset_pairs)
+        colors = [cmap(i) for i in range(num_offset_pairs)]
+
+        # Draw each HR cell border colored by its offset pair index
+        # oy_idx = hr_row % k, ox_idx = hr_col % k
+        for r in range(self.hr_rows):
+            for c in range(self.hr_cols):
+                oy_idx = r % k
+                ox_idx = c % k
+                color = colors[(oy_idx * k + ox_idx) % len(colors)]
+                x = c * hr_w
+                y = r * hr_h
+                rect = patches.Rectangle((x, y), hr_w, hr_h, linewidth=0.3, edgecolor=color, facecolor='none', alpha=0.6, zorder=1)
+                self.ax.add_patch(rect)
+
+        # Shade selected HR cells
+        for (r, c) in self.hr_selected:
+            x = c * hr_w
+            y = r * hr_h
+            rect = patches.Rectangle((x, y), hr_w, hr_h, linewidth=0, facecolor='#90EE90', alpha=0.5, zorder=3)
             self.ax.add_patch(rect)
-            self.tile_rects[linear_idx] = rect
+
+        self.ax.set_xlim(0, self.img_w)
+        self.ax.set_ylim(self.img_h, 0)
+        self.ax.set_aspect('equal')
         
-        # Extract species name from filename (last part after final underscore)
         species_name = self.image_path.stem.split('_')[-1]
+        sampled_tiles = self.hr_rows * self.hr_cols
         
         # Build title with better formatting
         title = f"\n{species_name}\n"
         title += f"Image {self.img_idx + 1} / {self.total_images}\n"
-        title += f"OBS (green): {len(self.obs_indices)} | NO_OBS (red): {self.grid_size * self.grid_size - len(self.obs_indices)}\n\n"
+        title += f"Selected OBS: {len(self.hr_selected)} | Unselected: {sampled_tiles - len(self.hr_selected)}\n"
+        title += f"Grid: {self.grid_size * self.k} x {self.grid_size * self.k} ({self.grid_size}x{self.grid_size} base tiles, {len(self.offsets_normalized)} offsets)\n\n"
         title += "LEFT-CLICK: mark/unmark | 'r': reset | 'u': undo | 'c': save & next | 'e': exit"
         
         self.ax.set_title(title, fontsize=9, fontweight='bold', pad=20)
@@ -186,35 +260,135 @@ class GridTileLabeler:
     
     def get_tile_at_click(self, x, y):
         """Find which tile was clicked based on coordinates."""
-        for linear_idx, tile_info in self.all_tiles.items():
-            tx, ty = tile_info['x'], tile_info['y']
-            if tx <= x < tx + self.tile_size and ty <= y < ty + self.tile_size:
-                return linear_idx
+        # Map click to high-resolution grid cell
+        if x < 0 or y < 0 or x >= self.img_w or y >= self.img_h:
+            return None
+        hr_col = int(x / self.hr_cell_w)
+        hr_row = int(y / self.hr_cell_h)
+        hr_col = min(max(hr_col, 0), self.hr_cols - 1)
+        hr_row = min(max(hr_row, 0), self.hr_rows - 1)
+        return (hr_row, hr_col)
         return None
     
     def on_click(self, event):
-        """Handle mouse clicks on tiles."""
+        """Handle mouse button press; start drag selection for left-button."""
         if event.xdata is None or event.button != 1:
             return
-        
-        x, y = int(event.xdata), int(event.ydata)
-        linear_idx = self.get_tile_at_click(x, y)
-        
-        if linear_idx is None:
-            return
-        
-        # Save current state to undo stack before making changes
-        self.undo_stack.append(self.obs_indices.copy())
-        
-        # Toggle tile selection
-        if linear_idx in self.obs_indices:
-            self.obs_indices.remove(linear_idx)
-            print(f"Unmarked tile at row {self.all_tiles[linear_idx]['row']}, col {self.all_tiles[linear_idx]['col']}")
+
+        # Begin dragging selection rectangle
+        self.dragging = True
+        self.drag_start = (event.xdata, event.ydata)
+
+        # Create a rectangle patch to show selection area
+        if self.drag_rect is None:
+            self.drag_rect = patches.Rectangle((event.xdata, event.ydata), 0, 0,
+                                               linewidth=1, edgecolor='cyan', facecolor='cyan', alpha=0.25, zorder=4)
+            self.ax.add_patch(self.drag_rect)
         else:
-            self.obs_indices.add(linear_idx)
-            print(f"Marked tile at row {self.all_tiles[linear_idx]['row']}, col {self.all_tiles[linear_idx]['col']}")
-        
-        self.show_grid()
+            self.drag_rect.set_xy((event.xdata, event.ydata))
+            self.drag_rect.set_width(0)
+            self.drag_rect.set_height(0)
+
+        self.fig.canvas.draw_idle()
+
+    def on_motion(self, event):
+        """Update drag rectangle visual while mouse moves."""
+        if not self.dragging or self.drag_start is None:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        x0, y0 = self.drag_start
+        x1, y1 = event.xdata, event.ydata
+        xmin, ymin = min(x0, x1), min(y0, y1)
+        w, h = abs(x1 - x0), abs(y1 - y0)
+
+        if self.drag_rect is not None:
+            self.drag_rect.set_xy((xmin, ymin))
+            self.drag_rect.set_width(w)
+            self.drag_rect.set_height(h)
+            self.fig.canvas.draw_idle()
+
+    def on_release(self, event):
+        """Handle mouse button release; finalize drag or treat as single click."""
+        if event.button != 1:
+            return
+        if not self.dragging:
+            return
+
+        self.dragging = False
+        if self.drag_start is None:
+            return
+
+        # If release outside axes, just clear rectangle
+        if event.xdata is None or event.ydata is None:
+            if self.drag_rect is not None:
+                try:
+                    self.drag_rect.remove()
+                except Exception:
+                    pass
+                self.drag_rect = None
+                self.fig.canvas.draw_idle()
+            self.drag_start = None
+            return
+
+        x0, y0 = self.drag_start
+        x1, y1 = event.xdata, event.ydata
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+
+        # Small movement -> treat as single click toggle
+        if dx < 4 and dy < 4:
+            x, y = int(event.xdata), int(event.ydata)
+            hr_cell = self.get_tile_at_click(x, y)
+            if hr_cell is not None:
+                self.undo_stack.append(self.hr_selected.copy())
+                if hr_cell in self.hr_selected:
+                    self.hr_selected.remove(hr_cell)
+                    print(f"Unmarked HR cell {hr_cell}")
+                else:
+                    self.hr_selected.add(hr_cell)
+                    print(f"Marked HR cell {hr_cell}")
+                self.show_grid()
+        else:
+            # Rectangle selection: add all HR cells overlapping the box
+            xmin = max(min(x0, x1), 0)
+            ymin = max(min(y0, y1), 0)
+            xmax = min(max(x0, x1), self.img_w)
+            ymax = min(max(y0, y1), self.img_h)
+
+            hr_r0 = int(ymin / self.hr_cell_h)
+            hr_r1 = int((ymax - 1) / self.hr_cell_h)
+            hr_c0 = int(xmin / self.hr_cell_w)
+            hr_c1 = int((xmax - 1) / self.hr_cell_w)
+
+            hr_r0 = min(max(hr_r0, 0), self.hr_rows - 1)
+            hr_r1 = min(max(hr_r1, 0), self.hr_rows - 1)
+            hr_c0 = min(max(hr_c0, 0), self.hr_cols - 1)
+            hr_c1 = min(max(hr_c1, 0), self.hr_cols - 1)
+
+            # Save state for undo
+            self.undo_stack.append(self.hr_selected.copy())
+
+            added = 0
+            for rr in range(hr_r0, hr_r1 + 1):
+                for cc in range(hr_c0, hr_c1 + 1):
+                    if (rr, cc) not in self.hr_selected:
+                        self.hr_selected.add((rr, cc))
+                        added += 1
+
+            print(f"Marked {added} HR cells from rectangle selection")
+            self.show_grid()
+
+        # Remove drag rectangle
+        if self.drag_rect is not None:
+            try:
+                self.drag_rect.remove()
+            except Exception:
+                pass
+            self.drag_rect = None
+
+        self.drag_start = None
     
     def on_key(self, event):
         """Handle keyboard input."""
@@ -230,15 +404,15 @@ class GridTileLabeler:
         
         elif event.key == 'r':
             # Reset all tiles
-            self.undo_stack.append(self.obs_indices.copy())
-            self.obs_indices = set()
+            self.undo_stack.append(self.hr_selected.copy())
+            self.hr_selected = set()
             print("✓ Reset all tiles")
             self.show_grid()
         
         elif event.key == 'u':
             # Undo last change
             if self.undo_stack:
-                self.obs_indices = self.undo_stack.pop()
+                self.hr_selected = self.undo_stack.pop()
                 print("✓ Undone last change")
                 self.show_grid()
             else:
@@ -249,7 +423,7 @@ class GridTileLabeler:
             print(f"\n✗ User exited at image index: {self.img_idx}")
             
             # Save current image's tiles before exiting
-            if self.obs_indices:
+            if self.hr_selected:
                 print("Saving current image's tiles...")
                 self.save_image()
             
@@ -261,33 +435,70 @@ class GridTileLabeler:
             plt.close('all')
     
     def save_image(self):
-        """Store all tiles (obs and no_obs) to be saved later."""
-        obs_count = len(self.obs_indices)
-        total_tiles = len(self.all_tiles)
-        
-        # Store all tiles in memory (to be saved at the end)
-        for linear_idx, tile_info in self.all_tiles.items():
-            row = tile_info['row']
-            col = tile_info['col']
-            tile_data = tile_info['data']
-            filename = f"{self.image_path.stem}_r{row}_c{col}.png"
-            
-            # Determine label
-            label = 'obs' if linear_idx in self.obs_indices else 'no_obs'
-            
-            # Add to global list
-            crops_to_save.append({
-                'filename': filename,
-                'row': row,
-                'col': col,
-                'data': tile_data,
-                'label': label
-            })
-        
-        no_obs_count = total_tiles - obs_count
-        print(f"✓ Saved {total_tiles} tiles from {self.image_path.name} to memory ({obs_count} obs, {no_obs_count} no_obs)")
-        print(f"  - Total crops queued: {len(crops_to_save)}")
-        
+        """Extract sampled tiles for each offset and decide obs/no_obs by HR overlap.
+
+        DECISION POINT: a sampled tile is labeled 'obs' if any high-resolution grid cell
+        that overlaps the sampled tile was selected by the user (hr_selected). Change
+        the logic here if you prefer majority voting instead.
+        """
+        queued_before = len(crops_to_save)
+        offsets = self.offsets_normalized
+        obs_count = 0
+        no_obs_count = 0
+
+        for off_idx, off in enumerate(offsets):
+            off_px = int(round(self.tile_size * off))
+            for row in range(self.grid_size):
+                for col in range(self.grid_size):
+                    y0 = row * self.tile_size + off_px
+                    x0 = col * self.tile_size + off_px
+                    y1 = y0 + self.tile_size
+                    x1 = x0 + self.tile_size
+
+                    if y1 > self.img_h or x1 > self.img_w:
+                        continue
+
+                    tile = self.img[y0:y1, x0:x1]
+
+                    # Map sampled tile bounds to HR grid indices
+                    hr_r0 = int(y0 / self.hr_cell_h)
+                    hr_r1 = int((y1 - 1) / self.hr_cell_h)
+                    hr_c0 = int(x0 / self.hr_cell_w)
+                    hr_c1 = int((x1 - 1) / self.hr_cell_w)
+
+                    # DECISION POINT: sampled tile is obs if any overlapping HR cell selected
+                    is_obs = False
+                    for rr in range(hr_r0, hr_r1 + 1):
+                        for cc in range(hr_c0, hr_c1 + 1):
+                            if (rr, cc) in self.hr_selected:
+                                is_obs = True
+                                break
+                        if is_obs:
+                            break
+
+                    label = 'obs' if is_obs else 'no_obs'
+                    if label == 'obs':
+                        obs_count += 1
+                    else:
+                        no_obs_count += 1
+
+                    filename = f"{self.image_path.stem}_r{row}_c{col}_o{int(off*100):02d}.png"
+                    crops_to_save.append({
+                        'filename': filename,
+                        'row': row,
+                        'col': col,
+                        'offset_idx': off_idx,
+                        'offset_norm': off,
+                        'data': tile,
+                        'label': label,
+                        'image': self.image_path.stem,
+                        'hr_overlap_count': sum(1 for rr in range(hr_r0, hr_r1 + 1) for cc in range(hr_c0, hr_c1 + 1) if (rr, cc) in self.hr_selected),
+                    })
+
+        queued_after = len(crops_to_save)
+        print(f"✓ Extracted tiles for {len(offsets)} offsets: {obs_count} obs, {no_obs_count} no_obs")
+        print(f"  - Total crops queued: {queued_after - queued_before}")
+
         # Update progress file
         self.save_progress(self.img_idx + 1)
     
@@ -344,6 +555,7 @@ try:
         
         try:
             labeler = GridTileLabeler(image_path, grid_size=grid_size, tile_size=tile_size, 
+                                     offsets_normalized=OFFSET_NORMALIZED,
                                      fig=fig, ax=ax, img_idx=img_idx, total_images=len(image_files_to_process))
             
             # Wait for user to confirm this image
@@ -384,6 +596,10 @@ if crops_to_save:
         col = crop_info['col']
         tile_data = crop_info['data']
         label = crop_info['label']
+        offset_idx = crop_info.get('offset_idx')
+        offset_norm = crop_info.get('offset_norm')
+        source_obs_count = crop_info.get('source_obs_count')
+        sampled_tiles_in_group = crop_info.get('sampled_tiles_in_group')
         
         # Print progress
         print(f"  Saving crop {crop_idx}/{len(crops_to_save)}: {filename}", end='\r')
@@ -400,8 +616,12 @@ if crops_to_save:
             'filename': filename,
             'row': row,
             'col': col,
+            'offset_idx': offset_idx,
+            'offset_norm': offset_norm,
             'label': label,
-            'image': filename.rsplit('_r', 1)[0]  # Extract image name
+            'image': crop_info.get('image', filename.rsplit('_r', 1)[0]),
+            'source_obs_count': source_obs_count,
+            'sampled_tiles_in_group': sampled_tiles_in_group,
         })
     
     print()  # New line after progress output

@@ -1,36 +1,37 @@
-#%% Cell 1: Import packages
-### PACKAGES ###
+#%% Train SVM Scorer (with both empty and observation data)
+"""
+Trains both One-Class and Binary SVM scorers on VAE latent features.
+Uses the same data loading and augmentation as train_DNN for consistency.
+
+Usage: python train_SVM.py
+Output: models/SVM/*/[oc/binary]_svm_model.pkl
+"""
+
 import os
 import torch
-from torch.utils.data import DataLoader
-
-import re
-
+from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
-from scipy.stats import chi2
-from sklearn.model_selection import train_test_split
-
+from torchvision.transforms import v2
 from sklearn.svm import SVC, OneClassSVM
-from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
-
+from sklearn.model_selection import train_test_split, GroupShuffleSplit
+from sklearn.metrics import (
+    average_precision_score, confusion_matrix, ConfusionMatrixDisplay,
+    precision_recall_curve, roc_curve, auc, f1_score
+)
 import pickle as pkl
 from pathlib import Path
-import cv2
-import seaborn as sns
+from typing import cast
+import sys
 
-from matplotlib.patches import Rectangle
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from sklearn.metrics import average_precision_score, classification_report, confusion_matrix, ConfusionMatrixDisplay, precision_recall_curve, roc_auc_score, roc_curve, auc
-from sklearn.decomposition import PCA
-
-from ..functions import Autoencoder, ImagePathDataset, VariationalAutoencoder, eval_image_pipeline
+from functions import VariationalAutoencoder, image_pipeline_df, load_tiles_from_paths, preprocess_tile
 
 print("Packages imported successfully.")
 
-#%% Cell 2: Activate GPU
 print("="*40)
 print("PyTorch Environment Report")
 print("="*40)
@@ -46,7 +47,6 @@ if torch.cuda.is_available():
     print(f"Current device:         {torch.cuda.current_device()}")
     print(f"Total memory (GB):      {torch.cuda.get_device_properties(gpu_index).total_memory / 1e9:.2f}")
 
-# Set device
 if torch.cuda.is_available():
     device = torch.device("cuda:0")
     torch.backends.cudnn.benchmark = True
@@ -56,621 +56,364 @@ else:
 print("="*40)
 print(f"Using device:      {device}")
 
-#%% Cell 3: Define paths and parameters
-ROOT_DIR_C = r"C:\Users\Admin\Documents\Jellyscope\Training data\Binary_classifier"   
-ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data\Binary_classifier"
-SAMPLE_IMAGE_IDX_TEST = 0
+#%% Configuration and Hyperparameters
 
-DEBUG = False
-n_debug = 0.2
-
-monitoring_effort = "Kristineberg_260424" #"Kristineberg_251128"
-# monitoring_effort = "Kristineberg_250915"
+ROOT_DIR_C = r"C:\Users\Admin\Documents\Jellyscope\Training data\Binary_classifier"
+monitoring_effort = "Kristineberg_251128"
 grid_size = 16
+tile_size = int(4512/grid_size)
+image_size_vae = 128
 latent_dim = 32
-batch_size = 1024
-
 model_name = f"../models/VAE/{monitoring_effort}_vae_model{grid_size}_l{latent_dim}.pth"
-if DEBUG:
-    model_name = model_name.replace(".pth", "_debug.pth")
-print(f"Model to load: {model_name}")
 
-test_tiles_path = os.path.join(ROOT_DIR_C, monitoring_effort, "test", f"tiles{grid_size}")
-test_og_images_path = os.path.join(ROOT_DIR_C, monitoring_effort, "test", "OG_images")
+batch_size = 512
+learning_rate = 0.001
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-images_test = list(Path(test_og_images_path).glob("*.png"))
-sample_image_path = Path(test_og_images_path) / images_test[SAMPLE_IMAGE_IDX_TEST].name
-sample_image = cv2.imread(sample_image_path, cv2.IMREAD_GRAYSCALE)
+print(f"Device: {device}")
+print(f"Model: {model_name}")
 
-if DEBUG:
-    n_test = int(len(images_test) * n_debug)
-    indices = np.random.choice(len(images_test), size=n_test, replace=False)
-    images_test = [images_test[i] for i in indices]
-    print(f"DEBUG MODE: Using only {n_test} test images ({n_test*grid_size**2} tiles) for evaluation")
-
-#%% Cell 4: Load model
+#%% Load VAE model
 checkpoint = torch.load(model_name, map_location=device, weights_only=False)
 
 latent_dims = checkpoint.get("latent_dim")
-if latent_dims!= latent_dim:
-    print(f"⚠ Warning: Loaded model latent_dims={latent_dims} does not match expected latent_dim={latent_dim}. Using loaded value.")
-    latent_dim = latent_dims
 image_size = checkpoint.get("image_size")
 hidden_channels = checkpoint.get("hidden_channels")
 grid_size = checkpoint.get("grid_size")
-state_dict = checkpoint["model_state_dict"]
 
-model = VariationalAutoencoder(latent_dims=latent_dims, image_size=image_size, hidden_channels=hidden_channels, grid_size=grid_size)
-model.load_state_dict(state_dict)
-model.to(device)
-model.eval()
+vae_model = VariationalAutoencoder(latent_dims=latent_dims, image_size=image_size,
+                                   hidden_channels=hidden_channels, grid_size=grid_size)
+vae_model.load_state_dict(checkpoint["model_state_dict"])
+vae_model.to(device)
+vae_model.eval()
 
-#%% Cell 5: Define test dataset and dataloader
-test_tiles_obs_path = os.path.join(test_tiles_path, "obs")
-test_tiles_no_obs_path = os.path.join(test_tiles_path, "no_obs")
+print(f"Loaded VAE model with latent_dim={latent_dims}, grid_size={grid_size}")
 
-test_tiles_obs = sorted(Path(test_tiles_obs_path).rglob("*.png"))
-test_tiles_no_obs = sorted(Path(test_tiles_no_obs_path).rglob("*.png"))
+#%% Load training data
+tiles_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train_DNN", f"tiles{grid_size}")
 
-test_dataset_obs = ImagePathDataset(test_tiles_obs_path, eval_image_pipeline)  # sanity check dataset can be created without errors
-test_dataset_no_obs = ImagePathDataset(test_tiles_no_obs_path, eval_image_pipeline)  # sanity check dataset can be created without errors
+tiles_path_obs = os.path.join(tiles_path, "obs")
+tiles_paths_obs = sorted(Path(tiles_path_obs).rglob("*.png"))
 
-if DEBUG:
-    n_test_obs = int(len(test_tiles_obs) * n_debug)
-    n_test_no_obs = int(len(test_tiles_no_obs) * n_debug)
-    indices_obs = np.random.choice(len(test_tiles_obs), size=n_test_obs, replace=False)
-    indices_no_obs = np.random.choice(len(test_tiles_no_obs), size=n_test_no_obs, replace=False)
-    test_tiles_obs = [test_tiles_obs[i] for i in indices_obs]
-    test_tiles_no_obs = [test_tiles_no_obs[i] for i in indices_no_obs]
-    print(f"DEBUG MODE: Using only {n_test_obs} obs tiles and {n_test_no_obs} no_obs tiles for evaluation")
+tiles_path_no_obs = os.path.join(tiles_path, "no_obs")
+tiles_paths_no_obs = sorted(Path(tiles_path_no_obs).rglob("*.png"))
 
-test_loader_obs = DataLoader(
-    test_dataset_obs,
-    batch_size=batch_size,
-    shuffle=False,
-    num_workers=0,
-    pin_memory=torch.cuda.is_available(),
-    persistent_workers=False,
+tiles_paths = tiles_paths_obs + tiles_paths_no_obs
+
+df_train_tiles = load_tiles_from_paths(tiles_paths, include_labels=True)
+df_train_tiles["group_id"] = df_train_tiles["path"].astype(str)
+
+
+#%% Augment observation tiles by including flipped and rotated versions
+df_train_tiles_obs = df_train_tiles[df_train_tiles['label'] == 1].copy()
+
+for i in range(len(df_train_tiles_obs)):
+    df = df_train_tiles_obs.iloc[[i]].copy()
+
+    df_flipped_hor = df.copy()
+    df_flipped_hor['image'] = v2.RandomVerticalFlip
+    df_flipped_hor['path'] = df_flipped_hor['path'].apply(lambda p: str(p).replace('.png', '_flipped.png'))
+    df_flipped_hor['label'] = 1
+
+    df_flipped_vert = df.copy()
+    df_flipped_vert['image'] = df_flipped_vert['image'].apply(lambda img: np.flipud(img))
+    df_flipped_vert['path'] = df_flipped_vert['path'].apply(lambda p: str(p).replace('.png', '_flippedvert.png'))
+    df_flipped_vert['label'] = 1
+
+    df_rotated_90 = df.copy()
+    df_rotated_90['path'] = df_rotated_90['path'].apply(lambda p: str(p).replace('.png', '_rotated.png'))
+    df_rotated_90['image'] = df_rotated_90['image'].apply(lambda img: np.rot90(img))
+    df_rotated_90['label'] = 1
+
+    df_rotated_180 = df.copy()
+    df_rotated_180['path'] = df_rotated_180['path'].apply(lambda p: str(p).replace('.png', '_rotated180.png'))
+    df_rotated_180['image'] = df_rotated_180['image'].apply(lambda img: np.rot90(img, k=2))
+    df_rotated_180['label'] = 1
+
+    df_rotated_270 = df.copy()
+    df_rotated_270['path'] = df_rotated_270['path'].apply(lambda p: str(p).replace('.png', '_rotated270.png'))
+    df_rotated_270['image'] = df_rotated_270['image'].apply(lambda img: np.rot90(img, k=3))
+    df_rotated_270['label'] = 1
+
+    df_contrast_high = df.copy()
+    df_contrast_high['image'] = df_contrast_high['image'].apply(lambda img: np.clip((img - img.mean()) * 1.25 + img.mean(), 0, 1))
+    df_contrast_high['path'] = df_contrast_high['path'].apply(lambda p: str(p).replace('.png', '_contrasthigh.png'))
+    df_contrast_high['label'] = 1
+
+    df_contrast_low = df.copy()
+    df_contrast_low['image'] = df_contrast_low['image'].apply(lambda img: np.clip((img - img.mean()) * 0.75 + img.mean(), 0, 1))
+    df_contrast_low['path'] = df_contrast_low['path'].apply(lambda p: str(p).replace('.png', '_contrastlow.png'))
+    df_contrast_low['label'] = 1
+
+    df_gamma_high = df.copy()
+    df_gamma_high['image'] = df_gamma_high['image'].apply(lambda img: np.clip(img ** 1.25, 0, 1))
+    df_gamma_high['path'] = df_gamma_high['path'].apply(lambda p: str(p).replace('.png', '_gammahigh.png'))
+    df_gamma_high['label'] = 1
+
+    df_gamma_low = df.copy()
+    df_gamma_low['image'] = df_gamma_low['image'].apply(lambda img: np.clip(img ** 0.75, 0, 1))
+    df_gamma_low['path'] = df_gamma_low['path'].apply(lambda p: str(p).replace('.png', '_gammalow.png'))
+    df_gamma_low['label'] = 1
+
+    df_noise = df.copy()
+    df_noise['image'] = df_noise['image'].apply(lambda img: np.clip(img + np.random.normal(0, 0.02, img.shape), 0, 1))
+    df_noise['path'] = df_noise['path'].apply(lambda p: str(p).replace('.png', '_noise.png'))
+    df_noise['label'] = 1
+
+    df_train_tiles = pd.concat([df_train_tiles, df_flipped_hor, df_flipped_vert, df_rotated_90, df_rotated_180, df_rotated_270, df_contrast_high, df_contrast_low, df_gamma_high, df_gamma_low, df_noise], ignore_index=True)
+
+print(f"After augmentation, total tiles: {len(df_train_tiles)} (obs={df_train_tiles['label'].sum():.0f}, empty={len(df_train_tiles) - df_train_tiles['label'].sum():.0f})")
+
+group_ids = df_train_tiles["group_id"].values
+
+images_tensor, rows_tensor, cols_tensor, labels_tensor = cast(
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    image_pipeline_df(df_train_tiles, input_image_size_vae=image_size, include_labels=True),
 )
+test_dataset = TensorDataset(images_tensor, rows_tensor, cols_tensor, labels_tensor)
 
-test_loader_no_obs = DataLoader(
-    test_dataset_no_obs,
-    batch_size=batch_size,
-    shuffle=False,
-    num_workers=0,
-    pin_memory=torch.cuda.is_available(),
-    persistent_workers=False,
-)
+dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
-print("\n" + "="*120)
-print(f"Loaded {len(test_tiles_obs)} observation test tiles from: {test_tiles_obs_path}")
-print(f"Loaded {len(test_tiles_no_obs)} empty test tiles from: {test_tiles_no_obs_path}")
-print("="*120)
+#%% Extract latent features from VAE
+latent_list = []
+recon_err_list = []
+labels = []
+rows_list = []
+cols_list = []
 
-#%% Cell 6: Plot sample test tiles from both classes
-batch_obs = next(iter(test_loader_obs))
-batch_no_obs = next(iter(test_loader_no_obs))
-
-test_tiles_obs_batch = batch_obs[0]
-test_tiles_no_obs_batch = batch_no_obs[0]
-
-# Plot observation tiles
-N_hor = 8
-N_ver = 3
-fig, axs = plt.subplots(N_ver, N_hor, figsize=(N_hor*1.2, N_ver*1.2))
-axs = axs.flatten()
-for idx, ax in enumerate(axs):
-    ax.axis("off")
-    if idx >= len(test_tiles_obs_batch):
-        continue
-    tile = test_tiles_obs_batch[idx].cpu().numpy()
-    ax.imshow(tile[0], cmap="gray", vmin=0, vmax=1)
-plt.suptitle("Sample obs tiles")
-plt.tight_layout()
-plt.show()
-    
-# Plot no_obs tiles
-fig, axs = plt.subplots(N_ver, N_hor, figsize=(N_hor*1.2, N_ver*1.2))
-axs = axs.flatten()
-for idx, ax in enumerate(axs):
-    ax.axis("off")
-    if idx >= len(test_tiles_no_obs_batch):
-        continue
-    tile = test_tiles_no_obs_batch[idx].cpu().numpy()
-    ax.imshow(tile[0], cmap="gray", vmin=0, vmax=1)
-plt.suptitle("Sample no_obs tiles")
-plt.tight_layout()
-plt.show()
-
-#%% Cell 7: Load all test data and get latent space representations
-model.eval()
-
-mu_list = []
-tile_labels = []
-tile_rows = []
-tile_cols = []
-tiles = []
-recon_errors = []
-
-# Enable cuDNN benchmarking and use async GPU transfers
-torch.backends.cudnn.benchmark = True
-
+print("\nExtracting features from tiles...")
 with torch.no_grad():
-    for test_loader in [test_loader_obs, test_loader_no_obs]:
-        class_name = "obs" if test_loader == test_loader_obs else "no_obs"
-        test_dataset = test_dataset_obs if test_loader == test_loader_obs else test_dataset_no_obs
-        print(f"\n\nProcessing {class_name} test tiles with {len(test_dataset)} tiles and {len(test_loader)} batches...")
+    for images, batch_rows, batch_cols, batch_labels in dataloader:
+        images = images.to(device, non_blocking=True)
+        batch_labels = batch_labels.to(device, non_blocking=True)
+        batch_rows = batch_rows.to(device, non_blocking=True)
+        batch_cols = batch_cols.to(device, non_blocking=True)
 
-        for batch_idx, (images, labels, rows, cols) in enumerate(test_loader):
-            # Move to device (non_blocking for async transfer)
-            images = images.to(device, non_blocking=True)
-            rows_gpu = rows.to(device, non_blocking=True)
-            cols_gpu = cols.to(device, non_blocking=True)
-            
-            # Encode and reconstruct
-            mu, _ = model.encode(images, row=rows_gpu, col=cols_gpu)
-            x_hat = model.decode(mu)
-            
-            # Compute reconstruction error
-            recon_err = ((images - x_hat) ** 2).flatten(1).mean(dim=1)
-            
-            # Move results back to CPU (async)
-            mu_list.append(mu.to('cpu', non_blocking=True))
-            recon_errors.append(recon_err.to('cpu', non_blocking=True))
-            tile_labels.append(labels)
-            tile_rows.append(rows)
-            tile_cols.append(cols)
-            tiles.append(images.to('cpu', non_blocking=True))
+        mu, _ = vae_model.encode(images, row=batch_rows, col=batch_cols)
+        x_hat = vae_model.decode(mu)
+        recon_err = ((images - x_hat) ** 2).flatten(1).mean(dim=1)
 
-            print(f"Processed batch {batch_idx + 1}/{len(test_loader)}", end="\r")
-        
-        # Synchronize GPU before moving to next class
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            
-        print(f"\nProcessing {class_name} test tiles... done!", end="\n")
-            
-print("\nFinished processing all test tiles.")
+        latent_list.append(mu.cpu())
+        recon_err_list.append(recon_err.cpu())
+        labels.extend(batch_labels.cpu().numpy())
+        rows_list.extend(batch_rows.cpu().numpy())
+        cols_list.extend(batch_cols.cpu().numpy())
 
-# Synchronize GPU before concatenating
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
+latent_features = torch.cat(latent_list, dim=0).numpy()
+recon_err_features = torch.cat(recon_err_list, dim=0).numpy()
+labels = np.array(labels, dtype=np.float32)
+rows = np.array(rows_list, dtype=np.int64)
+cols = np.array(cols_list, dtype=np.int64)
+group_ids = np.array(group_ids)
 
-mu_array = torch.cat(mu_list, dim=0).numpy()
-tile_labels = torch.cat(tile_labels, dim=0).numpy().astype(bool)
-tile_rows = torch.cat(tile_rows, dim=0).numpy()
-tile_cols = torch.cat(tile_cols, dim=0).numpy()
-tiles = torch.cat(tiles, dim=0).numpy()
-recon_errors = torch.cat(recon_errors, dim=0).numpy()
+print(f"Total samples: {len(labels)}")
+print(f"Observation samples: {labels.sum():.0f}")
+print(f"Empty samples: {len(labels) - labels.sum():.0f}")
 
-latent_cols = [f"latent_{i}" for i in range(mu_array.shape[1])]
-df_latent = pd.DataFrame(mu_array, columns=latent_cols)
-df_latent.insert(0, "label_manual", tile_labels)
-df_latent.insert(1, "tile_row", tile_rows)
-df_latent.insert(2, "tile_col", tile_cols)
-df_latent.insert(3, "recon_error", recon_errors)
-df_latent['tile'] = list(tiles)
+#%% Split into train/test by original tile group
+gss = GroupShuffleSplit(
+    n_splits=1,
+    test_size=0.3,
+    random_state=42
+)
 
-# Sanity check
-if len(df_latent[df_latent['label_manual']==True]) == len(test_tiles_obs) and len(df_latent[df_latent['label_manual']==False]) == len(test_tiles_no_obs):
-    print("\n" + "="*60)
-    print("Sanity check passed: Tile counts match")
-    print("="*60)
-    
-print(f"Class distribution: obs={len(df_latent[df_latent['label_manual']==True])}, no_obs={len(df_latent[df_latent['label_manual']==False])}")
+train_idx, test_idx = next(
+    gss.split(latent_features, labels, groups=group_ids)
+)
 
+X_latent_train = latent_features[train_idx]
+X_latent_test = latent_features[test_idx]
 
-#%% Split data into train and eval for SVM 
-svm_feature_cols_names = [f"latent_{i}" for i in range(mu_array.shape[1])] + ["recon_error"]
-df_svm_train, df_svm_eval = train_test_split(df_latent, test_size=0.5, stratify=df_latent['label_manual'], random_state=42)
+X_recon_train = recon_err_features[train_idx]
+X_recon_test = recon_err_features[test_idx]
 
-#%% METHOD 1: One class SVM on latent features + reconstruction error
+y_train = labels[train_idx]
+y_test = labels[test_idx]
 
-# Optional: Stratify dataset for faster grid search (only use a subset of empty tiles for training and eval, but keep all obs tiles since they are already rare)
-df_svm_train_oc = df_svm_train[df_svm_train['label_manual'] == False]  # Only use no_obs tiles for training the one-class SVM, once class
-df_svm_train_sampled = df_svm_train_oc.sample(frac=1, random_state=42)  # Stratify data for faster learning
-df_svm_eval_sampled = df_svm_eval.sample(frac=1, random_state=42)  # Sample eval set for faster evaluation, but keep all obs tiles
+print(f"\nTrain set: {len(y_train)} samples (obs={y_train.sum():.0f}, empty={(1-y_train).sum():.0f})")
+print(f"Test set: {len(y_test)} samples (obs={y_test.sum():.0f}, empty={(1-y_test).sum():.0f})")
+
+train_groups = set(group_ids[train_idx])
+test_groups = set(group_ids[test_idx])
+leaked_groups = train_groups.intersection(test_groups)
+if len(leaked_groups) > 0:
+    print(f"WARNING: Data leakage detected! {len(leaked_groups)} groups are in both train and test sets.")
+else:
+    print("No data leakage detected. Train and test groups are disjoint.")
+
+#%% Prepare SVM features (latent + reconstruction error)
+svm_feature_cols = np.concatenate([X_latent_train, X_recon_train.reshape(-1, 1)], axis=1)
+svm_feature_cols_test = np.concatenate([X_latent_test, X_recon_test.reshape(-1, 1)], axis=1)
 
 scaler = StandardScaler()
-X_train_base_sampled = scaler.fit_transform(df_svm_train_sampled[svm_feature_cols_names].values)
-X_eval_base_sampled = scaler.transform(df_svm_eval_sampled[svm_feature_cols_names].values)
-recon_col_idx_sampled = len(svm_feature_cols_names) - 1
-y_true_svm = df_svm_eval_sampled['label_manual'].values
+X_train_scaled = scaler.fit_transform(svm_feature_cols)
+X_test_scaled = scaler.transform(svm_feature_cols_test)
 
-train_no_obs_mask_sampled = (df_svm_train_sampled['label_manual'] == False) # select only no_obs tiles for training
-train_no_obs_mask_sampled = train_no_obs_mask_sampled.values
+print(f"\nPrepared SVM features: {X_train_scaled.shape[1]} dimensions")
 
-# Grid search for best (weight_recon_error, nu)
-# Split dataset for SVM training/eval
-weight_grid = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]  # Adjust weights for reconstruction error as needed (e.g. 1, 2, 5, 10, 20)
-nu_grid = [0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0006, 0.0007, 0.0008, 0.0009, 0.001] #, 0.002, 0.005, 0.０1, ０.０15] #０.０2, ０.０3, ０.０4, ０.０5]  # Adjust nu values as needed, nu = number of datapoints within boundary / total number of datapoints (e.g. ０.１ means １０% of data is expected to be within the boundary, so smaller nu = tighter boundary = fewer obs predictions)
 
-search_results = []
-for w in weight_grid:
-    for nu_val in nu_grid:
-        print(f"Testing weight_recon_error={w}, nu={nu_val}...", end="")
-        X_train_try = X_train_base_sampled.copy()
-        X_eval_try = X_eval_base_sampled.copy()
-        X_train_try[:, recon_col_idx_sampled] *= w
-        X_eval_try[:, recon_col_idx_sampled] *= w
-        
-        model_try = OneClassSVM(kernel='rbf', gamma='scale', nu=nu_val)
+#%% METHOD 1: One-Class SVM
 
-        model_try.fit(X_train_try[train_no_obs_mask_sampled])
+print("\n" + "="*70)
+print("Training One-Class SVM")
+print("="*70)
 
-        y_scores_try = -model_try.decision_function(X_eval_try)
-        precision_try, recall_try, thresholds_try = precision_recall_curve(y_true_svm, y_scores_try)
-        aps_try = average_precision_score(y_true_svm, y_scores_try)
-        
-        # Choose threshold by best F1
-        f1_try = 2 * precision_try[:-1] * recall_try[:-1] / (precision_try[:-1] + recall_try[:-1] + 1e-12)
-        trsh_idx_try = np.argmax(f1_try)
-        
-        best_precision = precision_try[trsh_idx_try]
-        best_recall = recall_try[trsh_idx_try]
-        best_f1 = f1_try[trsh_idx_try]
-        best_threshold = thresholds_try[trsh_idx_try]
-        
-        search_results.append({"weight": w, 
-                               "nu": nu_val,
-                               "aps": aps_try,
-                               "recall": best_recall,
-                               "f1": best_f1,
-                               "threshold": best_threshold})
-        
-        print(f" done! APS={aps_try:.4f}, Recall={best_recall:.4f}, best f1={best_f1:.4f}")
-        
-search_df = pd.DataFrame(search_results).sort_values("aps", ascending=False).reset_index(drop=True)
-best_row = search_df.iloc[0]
+oc_svm = OneClassSVM(kernel='rbf', gamma='scale', nu=0.05)
+train_mask_no_obs = (y_train == 0)
+oc_svm.fit(X_train_scaled[train_mask_no_obs])
 
-weight_recon_error = float(best_row["weight"])
-nu = float(best_row["nu"])
+y_scores_oc = -oc_svm.decision_function(X_test_scaled)
+fpr_oc, tpr_oc, thresholds_oc = roc_curve(y_test, y_scores_oc)
+roc_auc_oc = auc(fpr_oc, tpr_oc)
 
-print("\nTop hyperparameter combos (by PR-APS):")
-print(search_df.head(10))
-print(f"\nSelected -> weight_recon_error={weight_recon_error}, nu={nu}, APS={best_row['aps']:.4f}")
+fnr_oc = 1 - tpr_oc
+cost_oc = 0.4 * fpr_oc + 0.6 * fnr_oc
+threshold_idx_oc = np.argmin(cost_oc)
+threshold_oc = thresholds_oc[threshold_idx_oc]
 
-#%% Train final SVM with best hyperparameters, evaluate on eval set, plot ROC curve and confusion matrix, save model
-weight_recon_error = float(best_row["weight"])
-nu = float(best_row["nu"])
+print(f"One-Class SVM AUC: {roc_auc_oc:.4f}")
+print(f"Optimal threshold: {threshold_oc:.8f}")
 
-# fit scalar to full distribution of latent features in the eval set
-scaler = StandardScaler()
-scaler.fit(df_latent[svm_feature_cols_names].values)  # Fit on full distribution
+# Precision-Recall curve
+precision_oc, recall_oc, _ = precision_recall_curve(y_test, y_scores_oc)
+aps_oc = average_precision_score(y_test, y_scores_oc)
 
-# Now scale train and eval using this representative scaler
-X_train_base_full = scaler.transform(df_latent.loc[df_svm_train.index, svm_feature_cols_names].values)
-X_eval_base = scaler.transform(df_svm_eval[svm_feature_cols_names].values)
-
-# Get training and eval labels  
-y_train_full = df_latent.loc[df_svm_train.index, 'label_manual'].to_numpy()
-y_true_svm = df_svm_eval['label_manual'].to_numpy()
-
-# OneClassSVM trains only on no_obs, but use indices from df_latent to identify them
-train_is_no_obs = (y_train_full == False)
-recon_col_idx = len(svm_feature_cols_names) - 1
-
-X_train = X_train_base_full.copy()
-X_eval = X_eval_base.copy()
-X_train[:, recon_col_idx] *= weight_recon_error
-X_eval[:, recon_col_idx] *= weight_recon_error
-train_no_obs_mask = train_is_no_obs
-
-svm = OneClassSVM(kernel='rbf', gamma='scale', nu=nu)
-svm.fit(X_train[train_no_obs_mask])
-
-# ROC curve for SVM
-y_scores_svm = -svm.decision_function(X_eval)
-fpr_svm, tpr_svm, thresholds_svm = roc_curve(y_true_svm, y_scores_svm)
-
-roc_auc_svm = auc(fpr_svm, tpr_svm)
-
-#%% set treshold for outlier detection by setting fpr and fnr
-lambda_weight = 0.4  # Adjust this weight to balance FPR and FNR according to your needs (0.5 means equal weight)
-fnr_svm = 1 - tpr_svm
-cost = lambda_weight * fpr_svm + (1 - lambda_weight) * fnr_svm
-trsh_idx_svm = np.argmin(cost)
-threshold_svm = thresholds_svm[trsh_idx_svm]
-
-print(f"\nSVM Optimal threshold (Youden's J): {threshold_svm:.8f}")
-
-df_svm_eval['label_predicted_SVM'] = (y_scores_svm >= threshold_svm)
-
-plt.figure(figsize=(6,6))
-plt.plot(fpr_svm, tpr_svm, label=f"AUC = {roc_auc_svm:.3f}")
-plt.plot([0, 1], [0, 1], linestyle='--')
-plt.plot(fpr_svm[trsh_idx_svm], tpr_svm[trsh_idx_svm], marker='o', markersize=8, label=f"Optimal threshold = {threshold_svm:.8f}", color='red')
-plt.xlabel("False Positive Rate")
-plt.ylabel("True Positive Rate")
-plt.title("ROC Curve for SVM on VAE Latent Space")
+# ROC curve plot
+plt.figure(figsize=(6, 6))
+plt.plot(fpr_oc, tpr_oc, label=f'ROC curve (AUC = {roc_auc_oc:.4f})')
+plt.plot(fpr_oc[threshold_idx_oc], tpr_oc[threshold_idx_oc], 'ro', label=f'Threshold = {threshold_oc:.4f}')
+plt.plot([0, 1], [0, 1], 'k--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curve - One-Class SVM')
 plt.legend()
 plt.grid(alpha=0.3)
 plt.show()
 
-### PR curve for SVM
-precision_svm, recall_svm, thresholds_pr_svm = precision_recall_curve(y_true_svm, y_scores_svm)
-aps_svm = average_precision_score(y_true_svm, y_scores_svm)
-plt.figure(figsize=(6,6))
-plt.plot(recall_svm, precision_svm, label=f"APS = {aps_svm:.3f}")
-plt.xlabel("Recall")
-plt.ylabel("Precision")
-plt.title("Precision-Recall Curve for SVM on VAE Latent Space")
+# Precision-Recall curve plot
+plt.figure(figsize=(6, 6))
+plt.plot(recall_oc, precision_oc, label=f'Precision-Recall curve (AP = {aps_oc:.4f})')
+plt.xlabel('Recall')
+plt.ylabel('Precision')
+plt.title('Precision-Recall Curve - One-Class SVM')
 plt.legend()
 plt.grid(alpha=0.3)
 plt.show()
 
-# Confusion matrix for SVM
-y_pred_svm = (y_scores_svm >= threshold_svm).astype(bool)
-cm_svm = confusion_matrix(df_svm_eval['label_manual'], y_pred_svm, labels=[False, True], normalize='true')
-disp = ConfusionMatrixDisplay(confusion_matrix=cm_svm, display_labels=["no_obs", "obs"])
-disp.plot(cmap=plt.cm.Blues, values_format=".2f")
-plt.title("Confusion Matrix for SVM")
+# Confusion matrix
+y_pred_oc = (y_scores_oc >= threshold_oc).astype(int)
+cm_oc = confusion_matrix(y_test, y_pred_oc)
+disp_oc = ConfusionMatrixDisplay(confusion_matrix=cm_oc, display_labels=['Empty', 'Observation'])
+disp_oc.plot(cmap='Blues')
+plt.title('Confusion Matrix - One-Class SVM')
 plt.show()
 
-#%% Save SVM model and parameters
-### One class SVM
-svm_model_name = model_name.replace("VAE/", "SVM/oneclass/").replace("vae_model", "oc_svm_model").replace(".pth", ".pkl")
-Path(svm_model_name).parent.mkdir(parents=True, exist_ok=True)
-print(f"\nSaving SVM model to: {svm_model_name} with paramters:", end = "\n")
-print(f"weight_recon_error={weight_recon_error}, nu={nu}, threshold_svm={threshold_svm:.8f}")
-with open(svm_model_name, "wb") as f:
-    pkl.dump((svm, scaler, weight_recon_error, nu, threshold_svm), f)
-print(f"\n One class SVM model trained and saved to: {svm_model_name}")
+# Save One-Class SVM model
+oc_svm_model_name = model_name.replace("VAE/", "SVM/OneClass/").replace("vae_model", "oc_svm_model").replace(".pth", ".pkl")
+Path(oc_svm_model_name).parent.mkdir(parents=True, exist_ok=True)
+with open(oc_svm_model_name, "wb") as f:
+    pkl.dump((oc_svm, scaler, threshold_oc), f)
+print(f"\n✓ Saved One-Class SVM model to: {oc_svm_model_name}")
+print(f"  AUC: {roc_auc_oc:.4f}")
+print(f"  Average Precision: {aps_oc:.4f}")
 
 
-#%% METHOD 2: Binary SVM on latent features + reconstruction error
+#%% METHOD 2: Binary SVM
 
-# fit scalar to full distribution of latent features in the eval set
-scaler_bsvm = StandardScaler()
-scaler_bsvm.fit(df_latent[svm_feature_cols_names].values)  # Fit on full distribution
+print("\n" + "="*70)
+print("Training Binary SVM")
+print("="*70)
 
-# Now scale train and eval using this representative scaler
-latent_train = scaler_bsvm.transform(df_latent.loc[df_svm_train.index, svm_feature_cols_names].values)
-latent_eval = scaler_bsvm.transform(df_svm_eval[svm_feature_cols_names].values)
-
-# Get training and eval labels  
-labels_train= df_svm_train['label_manual'].to_numpy()
-labels_eval = df_svm_eval['label_manual'].to_numpy()
-
-# Define class weights
 class_weights = {
-    "obs": 1.0,
-    "empty": len(labels_train[labels_train == False]) / len(labels_train[labels_train == True])
+    0: (y_train == 1).sum() / (y_train == 0).sum(),
+    1: 1.0
 }
 
-class_weights = {0: class_weights["empty"], 1: class_weights["obs"]}
-
-model = SVC(
-    kernel='rbf',          # usually best starting point
+bin_svm = SVC(
+    kernel='rbf',
     class_weight=class_weights,
-    probability=True,      # needed for ROC / PR curves
+    probability=True,
     gamma='scale'
 )
 
-print(f"\nTraining Binary SVM with class weights: {class_weights}...")
-model.fit(latent_train, labels_train)
-print(f"\rTraining Binary SVM with class weights: {class_weights}... done!")
+print(f"Training Binary SVM with class weights: {class_weights}...")
+bin_svm.fit(X_train_scaled, y_train)
+print(f"Training complete!")
 
-# Predictions
-labels_eval_pred = model.predict(latent_eval)
-pred_score = model.predict_proba(latent_eval)[:, 1]
+# Get prediction scores
+y_scores_bin = bin_svm.decision_function(X_test_scaled)
+fpr_bin, tpr_bin, thresholds_bin = roc_curve(y_test, y_scores_bin)
+roc_auc_bin = auc(fpr_bin, tpr_bin)
 
-#%% confusion matrix for binary SVM
+# Precision-Recall curve
+precision_bin, recall_bin, thresholds_pr_bin = precision_recall_curve(y_test, y_scores_bin)
+aps_bin = average_precision_score(y_test, y_scores_bin)
 
-# Evaluation
-pred_scores = model.decision_function(latent_eval)
-fpr_bsvm, tpr_bsvm, thresholds_bsvm = roc_curve(labels_eval, pred_scores)
+# Find optimal threshold based on F-scores
+f0_25_scores = 1.0625 * (precision_bin[:-1] * recall_bin[:-1]) / (0.0625 * precision_bin[:-1] + recall_bin[:-1] + 1e-8)
+f0_5_scores = 1.25 * (precision_bin[:-1] * recall_bin[:-1]) / (0.25 * precision_bin[:-1] + recall_bin[:-1] + 1e-8)
+f1_scores = 2 * (precision_bin[:-1] * recall_bin[:-1]) / (precision_bin[:-1] + recall_bin[:-1] + 1e-8)
+f2_scores = 5 * (precision_bin[:-1] * recall_bin[:-1]) / (4 * precision_bin[:-1] + recall_bin[:-1] + 1e-8)
+f3_scores = 10 * (precision_bin[:-1] * recall_bin[:-1]) / (9 * precision_bin[:-1] + recall_bin[:-1] + 1e-8)
 
-roc_auc_bsvm = auc(fpr_bsvm, tpr_bsvm)
+best_idx_f3 = np.argmax(f3_scores)
+threshold_bin = thresholds_pr_bin[best_idx_f3]
 
-precision_bsvm, recall_bsvm, thresholds_pr_bsvm = precision_recall_curve(labels_eval, pred_scores)
-aps_bsvm = average_precision_score(labels_eval, pred_scores)
+print(f"\nBinary SVM Results:")
+print(f"  ROC AUC: {roc_auc_bin:.4f}")
+print(f"  Average Precision: {aps_bin:.4f}")
+print(f"  Optimal threshold (F3): {threshold_bin:.4f}")
+print(f"  F1 score at threshold: {f1_scores[best_idx_f3]:.4f}")
 
-#%% METHOD 2: Set threshold for binary classification
-
-# METHOD A: Using weighted FPR and FNR (original method)
-# lambda_weight_bsvm = 0.4  # Adjust this weight to balance FPR and FNR according to your needs (0.5 means equal weight)
-# fnr_bsvm = 1 - tpr_bsvm
-# cost_bsvm = lambda_weight_bsvm * fpr_bsvm + (1 - lambda_weight_bsvm) * fnr_bsvm
-# best_idx_roc = np.argmin(cost_bsvm)
-# threshold_bsvm = thresholds_bsvm[best_idx_roc]
-
-# METHOD B: Using maximum allowed False Discovery Rate (FDR)
-# FDR = False Positives / (True Positives + False Positives)
-# This means: out of all predictions marked as positive, what fraction are actually false positives
-# If you want 1% FDR, that means 99% precision (99 out of 100 positive predictions are correct)
-max_fdr_bsvm = 0.9  # 10% false positives allowed out of total positive predictions (= 90% precision)
-min_precision = 1 - max_fdr_bsvm  # minimum required precision
-
-# Find the threshold that achieves at least the minimum precision
-valid_indices = np.where(precision_bsvm >= min_precision)[0]
-if len(valid_indices) > 0:
-    # Among valid thresholds, choose the one with highest recall (most sensitive)
-    best_idx_precision = int(valid_indices[np.argmax(recall_bsvm[valid_indices])])
-    threshold_bsvm = thresholds_pr_bsvm[best_idx_precision]
-    actual_precision = precision_bsvm[best_idx_precision]
-    actual_recall = recall_bsvm[best_idx_precision]
-    print(f"\nBinary SVM threshold set by FDR: {threshold_bsvm:.8f}")
-    print(f"Achieved precision (1-FDR): {actual_precision:.4f} (target: {min_precision:.4f})")
-    print(f"Achieved recall: {actual_recall:.4f}")
-else:
-    print(f"⚠ Warning: Cannot achieve {max_fdr_bsvm:.2%} FDR with current model.")
-
-df_svm_eval['label_predicted_BinarySVM'] = (pred_scores >= threshold_bsvm).astype(int)
-
-# ROC curve for Binary SVM
-plt.figure(figsize=(6,6))
-plt.plot(fpr_bsvm, tpr_bsvm, label=f"AUC = {roc_auc_bsvm:.3f}")
-plt.plot([0, 1], [0, 1], linestyle='--')
-plt.plot(fpr_bsvm[best_idx_precision], tpr_bsvm[best_idx_precision], marker='o', markersize=8, label=f"Optimal threshold = {threshold_bsvm:.8f}", color='red')
-plt.xlabel("False Positive Rate")
-plt.ylabel("True Positive Rate")
-plt.title("ROC Curve for Binary SVM on VAE Latent Space")
+# ROC curve plot
+plt.figure(figsize=(6, 6))
+plt.plot(fpr_bin, tpr_bin, label=f'ROC curve (AUC = {roc_auc_bin:.4f})')
+x_threshold = fpr_bin[np.argmin(np.abs(thresholds_bin - threshold_bin))]
+y_threshold = tpr_bin[np.argmin(np.abs(thresholds_bin - threshold_bin))]
+plt.plot(x_threshold, y_threshold, 'ro', label=f'Threshold = {threshold_bin:.4f}')
+plt.plot([0, 1], [0, 1], 'k--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curve - Binary SVM')
 plt.legend()
 plt.grid(alpha=0.3)
 plt.show()
 
-## Confusion matrix using optimal threshold
-y_pred_bsvm_optimal = (pred_scores >= threshold_bsvm).astype(bool)
-cm_bsvm_optimal = confusion_matrix(df_svm_eval['label_manual'], y_pred_bsvm_optimal, labels=[False, True])
-disp_optimal = ConfusionMatrixDisplay(confusion_matrix=cm_bsvm_optimal, display_labels=["empty", "observation"])
-disp_optimal.plot(cmap=plt.cm.Blues, values_format=".2f")
-plt.title("Confusion Matrix for Binary SVM (Optimal Threshold)")
-plt.show()
-
-## Confusion matrix using optimal threshold
-y_pred_bsvm_optimal = (pred_scores >= threshold_bsvm).astype(bool)
-cm_bsvm_optimal = confusion_matrix(df_svm_eval['label_manual'], y_pred_bsvm_optimal, labels=[False, True], normalize='true')
-disp_optimal = ConfusionMatrixDisplay(confusion_matrix=cm_bsvm_optimal, display_labels=["empty", "observation"])
-disp_optimal.plot(cmap=plt.cm.Blues, values_format=".2f")
-plt.title("Confusion Matrix for Binary SVM (Optimal Threshold) normalized")
-plt.show()
-plt.savefig(f"confusion_matrix_binary_svm_{model_name[7:].replace('.pth', '')}.png", dpi=300)
-
-# PR curve for Binary SVM
-
-plt.figure(figsize=(6,6))
-plt.plot(recall_bsvm, precision_bsvm, label=f"APS = {aps_bsvm:.3f}")
-plt.xlabel("Recall")
-plt.ylabel("Precision")
-plt.title("Precision-Recall Curve for Binary SVM on VAE Latent Space")
+# Precision-Recall curve plot
+plt.figure(figsize=(6, 6))
+plt.plot(recall_bin, precision_bin, label=f'Precision-Recall curve (AP = {aps_bin:.4f})')
+plt.xlabel('Recall')
+plt.ylabel('Precision')
+plt.title('Precision-Recall Curve - Binary SVM')
 plt.legend()
 plt.grid(alpha=0.3)
 plt.show()
 
-
-#%% Save Binary SVM
-bsvm_model_name = model_name.replace("VAE/", "SVM/twoclass/").replace("vae_model", "binary_svm_model").replace(".pth", ".pkl")
-Path(bsvm_model_name).parent.mkdir(parents=True, exist_ok=True)
-print(f"\nSaving Binary SVM model to: {bsvm_model_name} with paramters:", end = "\n")
-print(f"threshold_bsvm={threshold_bsvm:.8f}")
-with open(bsvm_model_name, "wb") as f:
-    pkl.dump((model, scaler_bsvm, threshold_bsvm), f)
-print(f"\nBinary SVM model trained and saved to: {bsvm_model_name}")
-
-#%% Cell 10: Select model and plot false positives and false negatives
-# Choose which method to evaluate (uncomment one)
-USE_SVM = True  # Set to True for SVM, False for Mahalanobis
-
-
-df_eval = df_svm_eval.copy()
-predicted_labels_use = y_pred_svm
-method_name = "SVM"
-
-# Define false positives and negatives
-df_false_positives = df_eval[(df_eval['label_manual'] == False) & (predicted_labels_use == True)]
-df_false_negatives = df_eval[(df_eval['label_manual'] == True) & (predicted_labels_use == False)]
-
-print(f"\n{method_name} Results:")
-print(f"False Positives: {len(df_false_positives)}")
-print(f"False Negatives: {len(df_false_negatives)}")
-
-# Plot false positives
-N_fp = len(df_false_positives)
-N_hor = 8
-if N_fp > N_hor * 8:
-    N_ver = 8
-    df_false_positives_plot = df_false_positives.sample(n=N_hor*N_ver, random_state=42).reset_index(drop=True)
-    title_str = f"False Positives: empty tiles classified as obs (showing random subset of {N_hor*N_ver} out of {N_fp})"
-else:
-    N_ver = int(np.ceil(N_fp / N_hor))
-    df_false_positives_plot = df_false_positives.reset_index(drop=True)
-    title_str = f"False Positives: empty tiles classified as obs ({N_fp} total)"
-
-fig, axs = plt.subplots(N_ver, N_hor, figsize=(N_hor*1.2, N_ver*1.2))
-if N_ver == 1:
-    axs = axs.reshape(1, -1)
-axs = axs.flatten()
-for idx, ax in enumerate(axs):
-    ax.axis("off")
-    if idx >= len(df_false_positives_plot):
-        continue
-    
-    tile = df_false_positives_plot.iloc[idx]['tile']
-    ax.imshow(tile[0], cmap="gray", vmin=0, vmax=1)
-
-plt.suptitle(title_str, fontsize=14, fontweight="bold")
-plt.tight_layout()
+# Confusion matrix
+y_pred_bin = (y_scores_bin >= threshold_bin).astype(int)
+cm_bin = confusion_matrix(y_test, y_pred_bin)
+disp_bin = ConfusionMatrixDisplay(confusion_matrix=cm_bin, display_labels=['Empty', 'Observation'])
+disp_bin.plot(cmap='Blues')
+plt.title('Confusion Matrix - Binary SVM')
 plt.show()
 
-# Plot false negatives
-N_fn = len(df_false_negatives)
-if N_fn > N_hor * 8:
-    N_ver = 8
-    df_false_negatives_plot = df_false_negatives.sample(n=N_hor*N_ver, random_state=42).reset_index(drop=True)
-    title_str = f"False Negatives: obs tiles classified as empty (showing random subset of {N_hor*N_ver} out of {N_fn})"
-else:
-    N_ver = int(np.ceil(N_fn / N_hor))
-    df_false_negatives_plot = df_false_negatives.reset_index(drop=True)
-    title_str = f"False Negatives: obs tiles classified as empty ({N_fn} total)"
-
-fig, axs = plt.subplots(N_ver, N_hor, figsize=(N_hor*1.2, N_ver*1.2))
-if N_ver == 1:
-    axs = axs.reshape(1, -1)
-axs = axs.flatten()
-for idx, ax in enumerate(axs):
-    ax.axis("off")
-    if idx >= len(df_false_negatives_plot):
-        continue
-    
-    tile = df_false_negatives_plot.iloc[idx]['tile']
-    ax.imshow(tile[0], cmap="gray", vmin=0, vmax=1)
-
-plt.suptitle(title_str, fontsize=14, fontweight="bold")
-plt.tight_layout()
-plt.show()
-
-#%% Use Mahalanobic distance and reconstruction error to plot ROC curve and confusion matrix, save parameters
-manual_labels = df_latent["label_manual"].values.astype(bool)
-
-# Plot ROC curve
-y_true = df_latent["label_manual"].astype(int).values
-y_score = df_latent["recon_error"].values
-
-fpr, tpr, roc_thresholds = roc_curve(y_true, y_score)
-
-# set treshold for outlier detection by setting 
-lambda_weight = 0.4  # Adjust this weight to balance FPR and FNR according to your needs (0.5 means equal weight)
-fnr = 1 - tpr
-cost = lambda_weight * fpr + (1 - lambda_weight) * fnr
-trsh_idx = np.argmin(cost)
-threshold_recon = roc_thresholds[trsh_idx]
-
-roc_auc_recon = auc(fpr, tpr)
-
-plt.figure(figsize=(8, 8))
-plt.plot(fpr, tpr, color="blue", linewidth=2, label=f"ROC curve (AUC = {roc_auc_recon:.3f})")
-plt.plot([0, 1], [0, 1], color="gray", linestyle="--", linewidth=1, label="Random classifier")
-plt.scatter(
-    fpr[trsh_idx], tpr[trsh_idx],
-    color="red", s=90, zorder=5,
-    label=f"threshold={roc_thresholds[trsh_idx]:.3f}\nTPR={tpr[trsh_idx]:.3f}, FPR={fpr[trsh_idx]:.3f}"
-)
-plt.xlabel("False Positive Rate", fontsize=14)
-plt.ylabel("True Positive Rate", fontsize=14)
-plt.title("ROC Curve: Reconstruction Error vs Manual Labels", fontsize=16, fontweight="bold")
-plt.grid(alpha=0.3)
-plt.legend(loc="lower right")
-plt.show()
-
-print(f"Reconstruction Error ROC AUC: {roc_auc_recon:.4f}")
-print(f"Selected threshold: {threshold_recon:.4f}")
-print(f"At this threshold, TPR={tpr[trsh_idx]:.3f} and FPR={fpr[trsh_idx]:.3f}")
-
-# Save Reconstruction Error parameters
-model_params = {
-    "threshold": threshold_recon,
+# Save Binary SVM model
+bin_svm_model_name = model_name.replace("VAE/", "SVM/TwoClass/").replace("vae_model", "binary_svm_model").replace(".pth", ".pkl")
+Path(bin_svm_model_name).parent.mkdir(parents=True, exist_ok=True)
+checkpoint = {
+    'model': bin_svm,
+    'scaler': scaler,
+    'threshold': threshold_bin,
+    'roc_auc': roc_auc_bin,
+    'average_precision': aps_bin
 }
+with open(bin_svm_model_name, "wb") as f:
+    pkl.dump(checkpoint, f)
+print(f"\n✓ Saved Binary SVM model to: {bin_svm_model_name}")
+print(f"  ROC AUC: {roc_auc_bin:.4f}")
+print(f"  Average Precision: {aps_bin:.4f}")
+print(f"  Threshold: {threshold_bin:.4f}")
 
-val_params_name = model_name.replace(".pth", "_recon_params.pkl")
-with open(val_params_name, "wb") as f:
-    pkl.dump(model_params, f)
-print(f"\nReconstruction Error parameters saved to: {val_params_name}")
-
-# Confusion matrix for Reconstruction Error
-predicted_labels_recon = df_latent["recon_error"].values > threshold_recon
-conf_matrix_recon = confusion_matrix(manual_labels, predicted_labels_recon, labels=[False, True], normalize='true')
-disp = ConfusionMatrixDisplay(conf_matrix_recon, display_labels=["empty", "obs"])
-disp.plot(cmap="Blues", values_format=".2f")
-plt.title("Confusion Matrix: Reconstruction Error")
-plt.show()
+print("\n" + "="*70)
+print("✓ SVM Training Complete!")
+print("="*70)
