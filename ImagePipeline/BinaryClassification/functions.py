@@ -336,6 +336,7 @@ class OneClassScorer(nn.Module):
     def predict_batch(self, mu, recon_err, rows, cols, center, threshold):
         with torch.no_grad():
             scores = self.anomaly_score(mu, recon_err, rows, cols, center)
+            scores = torch.sigmoid(scores)  # Convert to [0,1] range for interpretability
             preds = (scores >= threshold).long()
 
         return preds, scores
@@ -421,11 +422,9 @@ class TwoClassScorer(nn.Module):
         x = torch.relu(x)
         x = self.dropout3(x)
         
-        x = self.fc_out(x)
-        # Sigmoid to output probability in [0, 1]
-        prob = torch.sigmoid(x).squeeze(-1)
-        
-        return prob
+        # Final linear layer produces one logit per tile
+        logits = self.fc_out(x).squeeze(-1)
+        return logits
 
     def predict_batch(self, mu, recon_err, rows, cols, threshold=0.5):
         """

@@ -66,8 +66,8 @@ monitoring_effort = "Kristineberg_251128"  # for titles and saved model names, e
 grid_size = 16  # number of tiles along one side (e.g. 6 means 6x6=36 tiles per image)
 
 # model hyperparameters
-image_size = 128
-latent_dims = 32
+image_size = 256
+latent_dims = 128
 hidden_channels = 32
 
 train_tiles_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train_VAE", f"tiles{grid_size}")
@@ -82,7 +82,7 @@ images_train = sorted(Path(train_og_images_path).rglob("*.png"))
 print(f"Total training images with tiles found: {len(images_train)}")
 print(f"total training tiles found: {len(list(Path(train_tiles_path).rglob('*.png')))}")
 
-model_name = f"../models/VAE/{monitoring_effort}_vae_model{grid_size}_l{latent_dims}.pth"
+model_name = f"../models/VAE/{monitoring_effort}_vae_model{grid_size}_l{latent_dims}_img{image_size}.pth"
 if DEBUG:
     model_name = model_name.replace(".pth", "_debug.pth")
     epochs = EPOCHS_DEBUG

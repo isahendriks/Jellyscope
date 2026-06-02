@@ -24,6 +24,7 @@ import pandas as pd
 import pickle as pkl
 from pathlib import Path
 import torchvision.transforms as v2
+import copy
 
 from typing import cast
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
@@ -110,12 +111,18 @@ tiles_paths_obs = sorted(Path(tiles_path_obs).rglob("*.png"))
 tiles_path_no_obs = os.path.join(tiles_path, "no_obs")
 tiles_paths_no_obs = sorted(Path(tiles_path_no_obs).rglob("*.png"))
 
+# Check that we have both observation and empty tiles
+# Find unique orginial images in the dataset by extracting the common prefix from tile filenames (remove _row_col.png suffix)
+tiles_path_obs_stems = [str(path.stem)[:24] for path in tiles_paths_obs]  # Remove _row_col.png suffix
+tiles_path_no_obs_stems = [str(path.stem)[:24] for path in tiles_paths_no_obs]  # Remove _row_col.png suffix
+tiles_paths_stems = tiles_path_obs_stems + tiles_path_no_obs_stems
+unique_og_imgs = set(tiles_paths_stems)
+
+print(f"Loaded {len(unique_og_imgs)} original images")
 print(f"Found {len(tiles_paths_obs)} observation tiles and {len(tiles_paths_no_obs)} empty tiles for training.")
 
 tiles_paths = tiles_paths_obs + tiles_paths_no_obs
 df_train_tiles = load_tiles_from_paths_fast(tiles_paths, include_labels=True, to_device = device)  # type: ignore # Load tile paths and labels into a DataFrame
-
-print(df_train_tiles.head())
 
 # save the original image as identifier
 df_train_tiles["og_img"] = df_train_tiles["path"].apply(lambda x: str(Path(x).stem)[:23])  # Group by original tile (remove _row_col.png suffix)
@@ -151,54 +158,128 @@ test_dataset_imgs = torch.utils.data.Subset(dataset, test_idx)
 # Create DataLoaders
 dataloader_imgs_val = DataLoader(val_dataset_imgs, batch_size=batch_size, shuffle=False, num_workers=0)
 dataloader_imgs_test = DataLoader(test_dataset_imgs, batch_size=batch_size, shuffle=False, num_workers=0)
-dataloader_imgs_train = DataLoader(train_dataset_imgs, batch_size=batch_size, shuffle=False, num_workers=0)
+dataloader_imgs_train = DataLoader(train_dataset_imgs, batch_size=batch_size, shuffle=True, num_workers=0)
 
-# Print dataset statistics
-print(f"\nDataset splits:")
+print(f"\nDataset splits before augmentation:")
 print(f"  Train: {len(train_dataset_imgs)} samples (obs={labels_tensor[train_idx].sum().item():.0f}, empty={len(train_dataset_imgs) - labels_tensor[train_idx].sum().item():.0f})")
 print(f"  Val:   {len(val_dataset_imgs)} samples (obs={labels_tensor[val_idx].sum().item():.0f}, empty={len(val_dataset_imgs) - labels_tensor[val_idx].sum().item():.0f})")
 print(f"  Test:  {len(test_dataset_imgs)} samples (obs={labels_tensor[test_idx].sum().item():.0f}, empty={len(test_dataset_imgs) - labels_tensor[test_idx].sum().item():.0f})")
 
+AUGMENTATION = True
 
-# Augment the trainingdata 
-# for batch in dataloader_imgs_train:
-#     images, batch_rows, batch_cols, batch_labels = batch
-    
-#     # select only observations for augmentation
-#     obs_mask = batch_labels == 1
-#     images = images[obs_mask]
-#     batch_rows = batch_rows[obs_mask]
-#     batch_cols = batch_cols[obs_mask]
-    
-#     ### Augment by deformations 
-#     images_eldeform = v2.ElasticTransform(alpha=1.0, sigma=0.25)(images)
+if AUGMENTATION:
+    print("\nData augmentation is enabled. Augmenting only observation samples in the training set...")
 
-#     batch_rows_eldeform = batch_rows
-#     batch_cols_eldeform = batch_cols  # Update column indices for deformed images
-#     batch_labels_eldeform = batch_labels
-    
-#     # Add deformed samples to the training dataset
-#     augmented_images = torch.cat([images, images_eldeform], dim=0)
-#     augmented_rows = torch.cat([batch_rows, batch_rows_eldeform], dim=0)
-#     augmented_cols = torch.cat([batch_cols, batch_cols_eldeform], dim=0)
-#     augmented_labels = torch.cat([batch_labels, batch_labels_eldeform], dim=0)
-    
-#     ### Augment by adding Gaussian noise
-#     images_guassian = v2.GaussianBlur(kernel_size=3, sigma=(0.1, 0.5))(images)
-#     batch_rows_gaussian = batch_rows
-#     batch_cols_gaussian = batch_cols  # Update column indices for Gaussian noise images
-#     batch_labels_gaussian = batch_labels
-    
-#     augmented_images = torch.cat([augmented_images, images_guassian], dim=0)
-#     augmented_rows = torch.cat([augmented_rows, batch_rows_gaussian], dim=0)
-#     augmented_cols = torch.cat([augmented_cols, batch_cols_gaussian], dim=0)
-#     augmented_labels = torch.cat([augmented_labels, batch_labels_gaussian], dim=0)
+    # Augment the trainingdata 
+    augmented_images_all = []
+    augmented_rows_all = []
+    augmented_cols_all = []
+    augmented_labels_all = []
 
-#     # Create a new TensorDataset with the augmented data
-#     train_dataset_augmented = TensorDataset(augmented_images, augmented_rows, augmented_cols, augmented_labels)
-    
-#     # Create a new DataLoader for the augmented training dataset
-#     dataloader_imgs_train_augmented = DataLoader(train_dataset_augmented, batch_size=batch_size, shuffle=True, num_workers=0)
+    for idx, batch in enumerate(dataloader_imgs_train):
+        print(f"Processing batch {idx+1}/{len(dataloader_imgs_train)} for augmentation...", end="\r")
+        images, batch_rows, batch_cols, batch_labels = batch
+        
+        # select only observations for augmentation
+        obs_mask = batch_labels == 1
+        images = images[obs_mask]
+        batch_rows = batch_rows[obs_mask]
+        batch_cols = batch_cols[obs_mask]
+        batch_labels = batch_labels[obs_mask]
+        
+        if images.shape[0] == 0:
+            print(f"No observation samples in batch {idx+1}, skipping augmentation.")
+            continue
+        # else:
+            # print(f"Augmenting {images.shape[0]} observation samples in batch {idx+1}...", end="\n")
+        
+        ### Augment by deformations 
+        images_eldeform = v2.ElasticTransform(alpha=1.0, sigma=0.25)(images)
+
+        batch_rows_eldeform = batch_rows
+        batch_cols_eldeform = batch_cols  # Update column indices for deformed images
+        batch_labels_eldeform = 1 * torch.ones_like(batch_labels)  # Observations remain labeled as 1 after deformation
+        
+        # Add deformed samples to the training dataset
+        augmented_images = torch.cat([images, images_eldeform], dim=0)
+        augmented_rows = torch.cat([batch_rows, batch_rows_eldeform], dim=0)
+        augmented_cols = torch.cat([batch_cols, batch_cols_eldeform], dim=0)
+        augmented_labels = torch.cat([batch_labels, batch_labels_eldeform], dim=0)
+        
+        ### Augment by adding Gaussian noise
+        images_guassian = v2.GaussianBlur(kernel_size=3, sigma=(0.1, 0.5))(images)
+        batch_rows_gaussian = batch_rows
+        batch_cols_gaussian = batch_cols  # Update column indices for Gaussian noise images
+        batch_labels_gaussian = 1 * torch.ones_like(batch_labels)  # Observations remain labeled as 1 after adding noise
+        
+        augmented_images = torch.cat([augmented_images, images_guassian], dim=0)
+        augmented_rows = torch.cat([augmented_rows, batch_rows_gaussian], dim=0)
+        augmented_cols = torch.cat([augmented_cols, batch_cols_gaussian], dim=0)
+        augmented_labels = torch.cat([augmented_labels, batch_labels_gaussian], dim=0)
+        
+        ### Augment by rotations
+        images_rot90 = torch.rot90(images, k=1, dims=[2,3])  # Rotate 90 degrees
+        batch_rows_rot90 = batch_rows
+        batch_cols_rot90 = batch_cols  # Update column indices for rotated images
+        batch_labels_rot90 = 1 * torch.ones_like(batch_labels)  # Observations remain labeled as 1 after rotation
+        augmented_images = torch.cat([augmented_images, images_rot90], dim=0)
+        augmented_rows = torch.cat([augmented_rows, batch_rows_rot90], dim=0)
+        augmented_cols = torch.cat([augmented_cols, batch_cols_rot90], dim=0)
+        augmented_labels = torch.cat([augmented_labels, batch_labels_rot90], dim=0)
+        
+        images_rot180 = torch.rot90(images, k=2, dims=[2,3])  # Rotate 180 degrees
+        batch_rows_rot180 = batch_rows
+        batch_cols_rot180 = batch_cols  # Update column indices for rotated images
+        batch_labels_rot180 = 1 * torch.ones_like(batch_labels)  # Observations remain labeled as 1 after rotation
+        augmented_images = torch.cat([augmented_images, images_rot180], dim=0)
+        augmented_rows = torch.cat([augmented_rows, batch_rows_rot180], dim=0)
+        augmented_cols = torch.cat([augmented_cols, batch_cols_rot180], dim=0)
+        augmented_labels = torch.cat([augmented_labels, batch_labels_rot180], dim=0)
+        
+        images_rot270 = torch.rot90(images, k=3, dims=[2,3])  # Rotate 270 degrees
+        batch_rows_rot270 = batch_rows
+        batch_cols_rot270 = batch_cols  # Update column indices for rotated images
+        batch_labels_rot270 = 1 * torch.ones_like(batch_labels)  # Observations remain labeled as 1 after rotation
+        augmented_images = torch.cat([augmented_images, images_rot270], dim=0)
+        augmented_rows = torch.cat([augmented_rows, batch_rows_rot270], dim=0)
+        augmented_cols = torch.cat([augmented_cols, batch_cols_rot270], dim=0)
+        augmented_labels = torch.cat([augmented_labels, batch_labels_rot270], dim=0)
+
+        # Create a new TensorDataset with the augmented data
+        train_dataset_augmented = TensorDataset(augmented_images, augmented_rows, augmented_cols, augmented_labels)
+
+        augmented_images_all.append(augmented_images)
+        augmented_rows_all.append(augmented_rows)
+        augmented_cols_all.append(augmented_cols)
+        augmented_labels_all.append(augmented_labels)
+
+    if augmented_images_all:
+        train_dataset_augmented = TensorDataset(
+            torch.cat(augmented_images_all, dim=0),
+            torch.cat(augmented_rows_all, dim=0),
+            torch.cat(augmented_cols_all, dim=0),
+            torch.cat(augmented_labels_all, dim=0),
+        )
+    else:
+        train_dataset_augmented = TensorDataset(
+            torch.empty((0, images_tensor.shape[1], images_tensor.shape[2], images_tensor.shape[3])),
+            torch.empty((0,), dtype=torch.long),
+            torch.empty((0,), dtype=torch.long),
+            torch.empty((0,), dtype=torch.float32),
+        )
+        
+    # Add augmented data to the original training dataset
+    train_dataset_imgs = torch.utils.data.ConcatDataset([train_dataset_imgs, train_dataset_augmented])
+    dataloader_imgs_train = DataLoader(train_dataset_imgs, batch_size=batch_size, shuffle=True, num_workers=0)
+
+    train_obs_count = int(labels_tensor[train_idx].sum().item()) + int(torch.cat(augmented_labels_all).sum().item()) if augmented_labels_all else int(labels_tensor[train_idx].sum().item())
+    train_empty_count = len(train_dataset_imgs) - train_obs_count
+
+    # Print dataset statistics
+    print(f"\nDataset splits after augmentation:")
+    print(f"  Train: {len(train_dataset_imgs)} samples (obs={train_obs_count:.0f}, empty={train_empty_count:.0f})")
+    print(f"  Val:   {len(val_dataset_imgs)} samples (obs={labels_tensor[val_idx].sum().item():.0f}, empty={len(val_dataset_imgs) - labels_tensor[val_idx].sum().item():.0f})")
+    print(f"  Test:  {len(test_dataset_imgs)} samples (obs={labels_tensor[test_idx].sum().item():.0f}, empty={len(test_dataset_imgs) - labels_tensor[test_idx].sum().item():.0f})")
 
 
 #%% Encode image to obtain latentt features and embed position information
@@ -241,14 +322,14 @@ with torch.no_grad():
         latent_features = torch.cat(latent_list, dim=0).numpy()
         recon_err_features = torch.cat(recon_err_list, dim=0).numpy()
         labels_array = np.array(labels, dtype=np.float32)
-        rows_array = np.array(rows_list, dtype=np.int64)
-        cols_array = np.array(cols_list, dtype=np.int64)
+        rows_array = np.array(rows_list, dtype=np.float32)
+        cols_array = np.array(cols_list, dtype=np.float32)
         
         dataset = TensorDataset(
             torch.from_numpy(latent_features).float(),
             torch.from_numpy(recon_err_features).float(),
-            torch.from_numpy(rows_array).long(),
-            torch.from_numpy(cols_array).long(),
+            torch.from_numpy(rows_array).float(),
+            torch.from_numpy(cols_array).float(),
             torch.from_numpy(labels_array).float()
         )
         
@@ -446,14 +527,17 @@ plt.show()
 scorer_bin = TwoClassScorer(latent_dim=latent_dims, hidden_dim=256, dropout=0.3, grid_size=grid_size)
 scorer_bin.to(device)
 
-# Loss and optimizer
-criterion = nn.BCELoss()  # Binary cross entropy for probability targets
-optimizer = optim.Adam(scorer_bin.parameters(), lr=learning_rate)
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
 train_losses = []
 val_losses = []
 val_accuracies = []
+val_aps = []
+
+### Initialize checkpoints
+best_val_ap = -np.inf
+best_model_state = None
+best_epoch = None
+best_threshold = None
 
 # Balance training dataset by subsampling the empty class to match the number of observation samples
 num_obs = train_dataset_lat.tensors[4].sum().item()
@@ -473,16 +557,27 @@ if num_obs > 0 and len(empty_indices) > num_obs and BALANCE:
     balanced_labels = train_dataset_lat.tensors[4][combined_indices]
     n_obs = balanced_labels.sum().item()
     n_empty = len(combined_indices) - n_obs
-    
+
     print(f"\nBalanced training dataset: {len(train_dataset_lat_subset)} samples (obs={n_obs:.0f}, empty={n_empty:.0f})")
     train_loader = DataLoader(train_dataset_lat_subset, batch_size=batch_size, shuffle=True, num_workers=0)
+
 else:
     n_obs = train_dataset_lat.tensors[4].sum().item()
     n_empty = len(train_dataset_lat) - n_obs
     print(f"\nUnbalanced training dataset: {len(train_dataset_lat)} samples (obs={n_obs:.0f}, empty={n_empty:.0f})")
+
     train_loader = DataLoader(train_dataset_lat, batch_size=batch_size, shuffle=True, num_workers=0)
 
-    
+# Loss and optimizer
+pos_weight = torch.tensor(n_empty/n_obs if num_obs > 0 else 1.0)
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
+optimizer = optim.Adam(scorer_bin.parameters(), lr=learning_rate)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode="max",
+    factor=0.5,
+    patience=5
+)
 
 val_loader = DataLoader(val_dataset_lat, batch_size=batch_size, shuffle=False, num_workers=0)
 
@@ -504,8 +599,9 @@ for epoch in range(epochs):
         recon_err_expanded = X_recon.unsqueeze(1) if X_recon.dim() == 1 else X_recon.unsqueeze(1)
         
         # Get predictions
-        probs = scorer_bin(X_latent, X_recon, rows, cols)
-        loss = criterion(probs, y)
+        logits = scorer_bin(X_latent, X_recon, rows, cols)
+        
+        loss = criterion(logits, y)
         
         loss.backward()
         optimizer.step()
@@ -520,6 +616,10 @@ for epoch in range(epochs):
     val_loss = 0.0
     correct = 0
     total = 0
+
+    val_scores = []
+    val_labels = []
+
     with torch.no_grad():
         for X_latent, X_recon, rows, cols, y in val_loader:
             X_latent = X_latent.to(device, non_blocking=True)
@@ -527,30 +627,226 @@ for epoch in range(epochs):
             rows = rows.to(device, non_blocking=True)
             cols = cols.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-            
-            probs = scorer_bin(X_latent, X_recon, rows, cols)
-            loss = criterion(probs, y)
+
+            logits = scorer_bin(X_latent, X_recon, rows, cols)
+            loss = criterion(logits, y)
             val_loss += loss.item()
-            
-            # Compute accuracy at threshold=0.5
-            preds = (probs >= 0.5).float()
+
+            probs = torch.sigmoid(logits)
+
+            val_scores.append(probs.cpu().numpy())
+            val_labels.append(y.cpu().numpy())
+
+            preds = (probs > 0.5).float()
             correct += (preds == y).sum().item()
             total += y.size(0)
-    
+
     val_loss /= len(val_loader)
     val_losses.append(val_loss)
+
     accuracy = correct / total
     val_accuracies.append(accuracy)
+
+    val_scores = np.concatenate(val_scores)
+    val_labels = np.concatenate(val_labels)
+
+    val_ap = average_precision_score(val_labels, val_scores)
+    val_aps.append(val_ap)
     
-    scheduler.step(val_loss)
+    global_epoch = len(val_aps) - 1
+
+    if val_ap > best_val_ap:
+        best_val_ap = val_ap
+        best_epoch = global_epoch
+        best_model_state = copy.deepcopy(scorer_bin.state_dict())
+
+        print(f"New best model: epoch {best_epoch+1}, val AP={best_val_ap:.4f}, val acc={accuracy:.4f}")
+    
+    scheduler.step(val_ap)
     
     if (epoch + 1) % 5 == 0:
-        print(f"Epoch {epoch+1}/{epochs}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, Acc={accuracy:.4f}")
+        print(f"Epoch {epoch+1}/{epochs}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, Acc={accuracy:.4f}, Val AP={val_ap:.4f}")
 
-print(f"\nTraining complete!")
+print(f"\nInitial training complete! Starting Hard negative mining...")
+### HARD NEGATIVE MINING
+# Number of positives in training set
+labels_train = train_dataset_lat.tensors[4]
+positive_indices = torch.where(labels_train == 1)[0]
+empty_indices = torch.where(labels_train == 0)[0]
 
+n_pos = len(positive_indices)
+
+# Choose how many hard/easy negatives to include
+n_hard_neg = min(n_pos, len(empty_indices))
+n_easy_neg = min(n_pos, len(empty_indices))
+
+scorer_bin.eval()
+
+empty_probs = []
+empty_dataset_indices = []
+
+mine_loader = DataLoader(train_dataset_lat, batch_size=batch_size, shuffle=False)
+
+start_idx = 0
+
+with torch.no_grad():
+    for X_latent, X_recon, rows, cols, y in mine_loader:
+        X_latent = X_latent.to(device, non_blocking=True)
+        X_recon = X_recon.to(device, non_blocking=True)
+        rows = rows.to(device, non_blocking=True)
+        cols = cols.to(device, non_blocking=True)
+
+        logits = scorer_bin(X_latent, X_recon, rows, cols)
+        probs = torch.sigmoid(logits).cpu()
+
+        batch_size_now = y.size(0)
+        batch_indices = torch.arange(start_idx, start_idx + batch_size_now)
+        start_idx += batch_size_now
+
+        empty_mask = y == 0
+
+        empty_probs.append(probs[empty_mask])
+        empty_dataset_indices.append(batch_indices[empty_mask])
+
+empty_probs = torch.cat(empty_probs)
+empty_dataset_indices = torch.cat(empty_dataset_indices)
+
+# Select empty tiles with highest predicted observation probability
+topk = torch.topk(empty_probs, k=n_hard_neg)
+hard_negative_indices = empty_dataset_indices[topk.indices]
+
+# Also include random easy negatives so the model does not forget normal empty tiles
+remaining_empty_indices = empty_indices[~torch.isin(empty_indices, hard_negative_indices)]
+easy_negative_indices = remaining_empty_indices[torch.randperm(len(remaining_empty_indices))[:n_easy_neg]]
+
+# Final mined dataset: positives + hard negatives + random easy negatives
+mined_indices = torch.cat([positive_indices,
+                            hard_negative_indices,
+                            easy_negative_indices])
+
+mined_dataset = torch.utils.data.Subset(train_dataset_lat, mined_indices.cpu().tolist())
+
+mined_loader = DataLoader(mined_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=0)
+
+print(f"Hard-negative mining dataset:")
+print(f"  Positives:       {len(positive_indices)}")
+print(f"  Hard negatives:  {len(hard_negative_indices)}")
+print(f"  Easy negatives:  {len(easy_negative_indices)}")
+print(f"  Total:           {len(mined_dataset)}")
+print(f"  Mean hard negative prob: {empty_probs[topk.indices].mean():.4f}")
+print(f"  Max hard negative prob:  {empty_probs[topk.indices].max():.4f}")
+
+### Retrain model on mined dataset
+print(f" Retraining binary model on mined dataset...")
+scorer_bin.train()
+
+mined_labels = labels_train[mined_indices]
+n_obs = mined_labels.sum().item()
+n_empty = len(mined_labels) - n_obs
+pos_weight = torch.tensor([n_empty / n_obs], dtype=torch.float32, device=device)
+
+print(f"  Mined dataset class balance: obs={n_obs:.0f}, empty={n_empty:.0f}, pos_weight={pos_weight.item():.4f}")
+
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
+optimizer = optim.Adam(scorer_bin.parameters(), lr=learning_rate * 0.1)  # Lower learning rate for fine-tuning
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode="max",
+    factor=0.5,
+    patience=5
+)
+
+for epoch in range(epochs):  # Fewer epochs for fine-tuning
+    scorer_bin.train()
+    train_loss = 0.0
+    for X_latent, X_recon, rows, cols, y in mined_loader:
+        X_latent = X_latent.to(device, non_blocking=True)
+        X_recon = X_recon.to(device, non_blocking=True)
+        rows = rows.to(device, non_blocking=True)
+        cols = cols.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        
+        optimizer.zero_grad()
+        
+        logits = scorer_bin(X_latent, X_recon, rows, cols)
+        
+        loss = criterion(logits, y)
+        
+        loss.backward()
+        optimizer.step()
+        
+        train_loss += loss.item()
+
+    
+    train_loss /= len(mined_loader)
+    train_losses.append(train_loss)
+    
+    ### Testing on original validation set to check for overfitting
+    # Testing
+    scorer_bin.eval()
+    val_loss = 0.0
+    correct = 0
+    total = 0
+
+    val_scores = []
+    val_labels = []
+
+    with torch.no_grad():
+        for X_latent, X_recon, rows, cols, y in val_loader:
+            X_latent = X_latent.to(device, non_blocking=True)
+            X_recon = X_recon.to(device, non_blocking=True)
+            rows = rows.to(device, non_blocking=True)
+            cols = cols.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            logits = scorer_bin(X_latent, X_recon, rows, cols)
+            loss = criterion(logits, y)
+            val_loss += loss.item()
+
+            probs = torch.sigmoid(logits)
+
+            val_scores.append(probs.cpu().numpy())
+            val_labels.append(y.cpu().numpy())
+
+            preds = (probs > 0.5).float()
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+
+    val_loss /= len(val_loader)
+    val_losses.append(val_loss)
+
+    accuracy = correct / total
+    val_accuracies.append(accuracy)
+
+    val_scores = np.concatenate(val_scores)
+    val_labels = np.concatenate(val_labels)
+
+    val_ap = average_precision_score(val_labels, val_scores)
+    val_aps.append(val_ap)
+
+    global_epoch = len(val_aps) - 1
+
+    if val_ap > best_val_ap:
+        best_val_ap = val_ap
+        best_epoch = global_epoch
+        best_model_state = copy.deepcopy(scorer_bin.state_dict())
+
+        print(f"New best model: epoch {best_epoch+1}, val AP={best_val_ap:.4f}, val acc={accuracy:.4f}")
+    
+    scheduler.step(val_ap)
+        
+    if (epoch + 1) % 5 == 0:
+        print(f"Epoch {epoch+1}/{epochs}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, Val Accuracy={accuracy:.4f}, val AP={val_ap:.4f}")
+    
 print(f"\n Binary Model Statistics (on empty test set):")
-print(f"Final Test Accuracy: {val_accuracies[-1]:.4f}")
+
+scorer_bin.load_state_dict(best_model_state)
+
+print(f"Restored best model from epoch {best_epoch+1}")
+print(f"Best validation AP: {best_val_ap:.4f}")
 
 # Plot training curve
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
@@ -564,6 +860,9 @@ ax1.legend()
 ax1.grid(alpha=0.3)
 
 ax2.plot(val_accuracies, label='Val Accuracy')
+ax2.plot(val_aps, label='Val AP')
+# Plot where the best model was selected
+ax2.scatter(best_epoch, val_accuracies[best_epoch], color='red', label='Best Model', zorder=5)
 ax2.set_xlabel('Epoch')
 ax2.set_ylabel('Accuracy')
 ax2.set_title('Validation Accuracy')
@@ -610,15 +909,17 @@ with torch.no_grad():
         if mode == "one_class":
             z = scorer(X_latent, X_recon, rows, cols)
             scores = ((z - center) ** 2).sum(dim=1)
-        else:
+        elif mode == "binary":
             scores = scorer(X_latent, X_recon, rows, cols)
+            scores = torch.sigmoid(scores)
+        else:
+            raise ValueError(f"Invalid mode: {mode}. Must be 'one_class' or 'binary")
 
         all_scores.append(scores.cpu().numpy())
         all_labels.append(y.numpy())
 
 all_scores = np.concatenate(all_scores)
 all_labels = np.concatenate(all_labels)
-
 
 # Plot precision-recall curve
 precision, recall, thresholds = precision_recall_curve(all_labels, all_scores)
@@ -681,7 +982,6 @@ plt.title('ROC Curve')
 plt.legend()
 plt.grid(alpha=0.3)
 plt.show()
-
 
 preds = (all_scores >= best_threshold).astype(int)
 cm = confusion_matrix(all_labels, preds)

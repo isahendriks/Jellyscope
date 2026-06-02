@@ -1,5 +1,7 @@
 #%% Cell 1: Import Packages
 import os
+import json
+import random
 import cv2
 import numpy as np
 from pathlib import Path
@@ -12,6 +14,11 @@ import pandas as pd
 print("\n" + "="*60)
 print("Interactive Tile Labeler - Simple Grid-Based")
 print("="*60)
+
+
+def extract_species_name(image_path):
+    """Extract the species name from an image filename."""
+    return Path(image_path).stem.split('_')[-1]
 
 #%% Cell 2: Define User Parameters
 
@@ -26,11 +33,14 @@ sort_species = False
 ROOT_C = r"C:\Users\Admin\Documents\Jellyscope\Training data\Binary_classifier"
 ROOT_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data\Binary_classifier"
 
-input_folder = r"{}\train_DNN\OG_images".format(monitoring_effort)
-output_folder = r"{}\train_DNN\tiles{}_offsets{}".format(monitoring_effort, grid_size, len(OFFSET_NORMALIZED))
+input_folder = r"{}\test\OG_images".format(monitoring_effort)
+output_folder = r"{}\test\tiles{}_offsets{}".format(monitoring_effort, grid_size, len(OFFSET_NORMALIZED))
 
 input_path = Path(ROOT_C).joinpath(Path(input_folder))
 output_path = Path(ROOT_C).joinpath(Path(output_folder))
+manual_outline_dir = output_path / Path('manual_outlines')
+manual_outline_mask_dir = manual_outline_dir / Path('masks')
+manual_outline_contour_dir = manual_outline_dir / Path('contours')
 
 all_image_files = sorted(list(Path(input_path).rglob('*.png')))
 
@@ -39,7 +49,7 @@ if sort_species:
     species_names = np.unique(species_names)  # Get unique species names
 
     species_names_to_exclude =  ['dentritus', 'dentritus_glo', 'filament', 'macro_filament', 'filament_glo'] # Set this to a subset of species if you want to filter
-    species_names_to_include = ['mnemeopsis'] #[str(name) for name in species_names if name not in species_names_to_exclude] 
+    species_names_to_include = [str(name) for name in species_names if name not in species_names_to_exclude] 
 
     # exclude images that do not match the included species names
     all_image_files_filtered = []
@@ -64,11 +74,45 @@ for patch in obs_folder.glob('*.png'):
 for patch in no_obs_folder.glob('*.png'):
     processed_images.add(patch.stem.rsplit('_r', 1)[0])
 
+crop_metadata_path = output_path / "crop_metadata.csv"
+crop_metadata_df = None
+if crop_metadata_path.exists():
+    try:
+        crop_metadata_df = pd.read_csv(crop_metadata_path)
+        if 'image' in crop_metadata_df.columns:
+            processed_images.update(crop_metadata_df['image'].dropna().astype(str).tolist())
+        elif 'filename' in crop_metadata_df.columns:
+            processed_images.update(crop_metadata_df['filename'].dropna().astype(str).tolist())
+        print(f"  Loaded {len(crop_metadata_df)} labeled crop records from {crop_metadata_path}")
+    except Exception as e:
+        print(f"⚠ Could not read {crop_metadata_path}: {e}")
+
 ## Filter out images that are already processed
 all_image_files_unprocessed = []
 for img in all_image_files_filtered:
     if img.stem not in processed_images:
         all_image_files_unprocessed.append(img)
+
+species_to_total = defaultdict(int)
+for img in all_image_files_filtered:
+    species_to_total[extract_species_name(img)] += 1
+
+species_to_labeled = defaultdict(int)
+if crop_metadata_df is not None and 'image' in crop_metadata_df.columns:
+    for image_name in crop_metadata_df['image'].dropna().astype(str).tolist():
+        species_to_labeled[extract_species_name(Path(image_name))] += 1
+
+species_progress = {}
+for species, total_count in species_to_total.items():
+    labeled_count = species_to_labeled.get(species, 0)
+    species_progress[species] = {
+        'labeled': labeled_count,
+        'remaining': max(total_count - labeled_count, 0),
+        'total': total_count,
+    }
+
+random.Random(42).shuffle(all_image_files_unprocessed)
+randomized_image_files = all_image_files_unprocessed
 
 print(f"Configuration:")
 print(f"  Input folder:  {input_path}")
@@ -80,17 +124,24 @@ print(f"  Total images:  {len(all_image_files)}")
 print(f"  Images after filtering by species: {len(all_image_files_filtered)}")
 print(f"  Already processed images: {len(processed_images)}")
 print(f"  Remaining images to process: {len(all_image_files_unprocessed)}")
+print(f"  Randomized images to process: {len(randomized_image_files)}")
+print("  Species progress:")
+for species in sorted(species_progress):
+    stats = species_progress[species]
+    print(f"    - {species}: labeled={stats['labeled']}, remaining={stats['remaining']}, total={stats['total']}")
 print("\n" + "="*60)
 print("Parameters configured successfully!")
 print("="*60)
 
 # chose image files to process (all or only unprocessed)
-image_files_to_process = all_image_files_unprocessed
+image_files_to_process = randomized_image_files
 
 #%% Cell 3: Create output folders
 output_path.mkdir(parents=True, exist_ok=True)
 (output_path / Path("obs")).mkdir(exist_ok=True)
 (output_path / Path("no_obs")).mkdir(exist_ok=True)
+manual_outline_mask_dir.mkdir(parents=True, exist_ok=True)
+manual_outline_contour_dir.mkdir(parents=True, exist_ok=True)
 
 #%% Cell 4: Simple Grid-Based Tile Labeler Class
 
@@ -131,15 +182,27 @@ class GridTileLabeler:
         # Tracking selected high-resolution grid cells (hr_row, hr_col)
         self.hr_selected = set()
         self.undo_stack = []  # Stack of previous selections for undo (stores hr_selected snapshots)
+        self.saved_message = None
         
         # Reuse figure or create new one
         if fig is None or ax is None:
-            self.fig, self.ax = plt.subplots(1, 1, figsize=(14, 14))
+            self.fig = plt.figure(figsize=(18, 10))
+            self.ax = self.fig.add_axes([0.03, 0.05, 0.74, 0.9])
         else:
             self.fig, self.ax = fig, ax
-        
-        # Add margin at top to prevent title overlap
-        self.fig.subplots_adjust(top=0.93)
+            self.ax.set_position([0.03, 0.05, 0.74, 0.9])
+
+        # Side panel for species name and instructions
+        existing_info_ax = getattr(self.fig, '_jelly_info_ax', None)
+        if existing_info_ax is not None:
+            try:
+                existing_info_ax.remove()
+            except Exception:
+                pass
+
+        self.info_ax = self.fig.add_axes([0.80, 0.05, 0.18, 0.90])
+        self.fig._jelly_info_ax = self.info_ax
+        self.info_ax.set_axis_off()
         
         self.tile_rects = {}  # {(offset_idx, row, col): rect_patch}
         self.image_confirmed = False  # Flag to track when user presses 'c'
@@ -156,6 +219,61 @@ class GridTileLabeler:
         self.dragging = False
         self.drag_start = None
         self.drag_rect = None
+
+    def _build_manual_outline_mask(self):
+        """Build a full-resolution binary mask from selected HR cells."""
+        mask = np.zeros((self.img_h, self.img_w), dtype=np.uint8)
+
+        for hr_row, hr_col in self.hr_selected:
+            x0 = int(round(hr_col * self.hr_cell_w))
+            y0 = int(round(hr_row * self.hr_cell_h))
+            x1 = int(round((hr_col + 1) * self.hr_cell_w))
+            y1 = int(round((hr_row + 1) * self.hr_cell_h))
+
+            x0 = min(max(x0, 0), self.img_w)
+            y0 = min(max(y0, 0), self.img_h)
+            x1 = min(max(x1, 0), self.img_w)
+            y1 = min(max(y1, 0), self.img_h)
+
+            if x1 > x0 and y1 > y0:
+                mask[y0:y1, x0:x1] = 255
+
+        return mask
+
+    def _save_manual_outline_assets(self):
+        """Save the manual outline mask and contour metadata for the current crop."""
+        mask = self._build_manual_outline_mask()
+        base_name = self.image_path.stem
+
+        mask_path = manual_outline_mask_dir / f"{base_name}_mask.png"
+        contour_path = manual_outline_contour_dir / f"{base_name}_contours.json"
+
+        cv2.imwrite(str(mask_path), mask)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contour_payload = []
+        for contour in contours:
+            contour_xy = contour.squeeze().astype(int)
+            if contour_xy.ndim == 1:
+                contour_xy = contour_xy.reshape(-1, 2)
+            contour_payload.append(contour_xy.tolist())
+
+        with open(contour_path, 'w', encoding='utf-8') as f:
+            json.dump(contour_payload, f)
+
+        ys, xs = np.where(mask > 0)
+        if len(xs) > 0 and len(ys) > 0:
+            bbox = {
+                'x0': int(xs.min()),
+                'y0': int(ys.min()),
+                'x1': int(xs.max()) + 1,
+                'y1': int(ys.max()) + 1,
+            }
+        else:
+            bbox = {'x0': 0, 'y0': 0, 'x1': 0, 'y1': 0}
+
+        selected_area_px = int((mask > 0).sum())
+        return mask_path, contour_path, bbox, selected_area_px, len(contour_payload)
     
     def _extract_all_tiles(self):
         """Extract all sampled tiles for a full kxk subdivision per base tile.
@@ -209,29 +327,17 @@ class GridTileLabeler:
         self.ax.imshow(self.img_rgb)
         self.tile_rects = {}
 
-        # Draw HR grid with a distinct color for each offset pair
+        # Draw HR grid with a neutral grey outline for every offset cell
         k = self.k
         hr_h = self.hr_cell_h
         hr_w = self.hr_cell_w
 
-        # Create a colormap for the offset pairs (oy_idx, ox_idx)
-        num_offset_pairs = k * k
-        try:
-            cmap = cm.get_cmap('tab20', num_offset_pairs)
-        except Exception:
-            cmap = cm.get_cmap('hsv', num_offset_pairs)
-        colors = [cmap(i) for i in range(num_offset_pairs)]
-
-        # Draw each HR cell border colored by its offset pair index
-        # oy_idx = hr_row % k, ox_idx = hr_col % k
+        # Draw each HR cell border in the same grey style
         for r in range(self.hr_rows):
             for c in range(self.hr_cols):
-                oy_idx = r % k
-                ox_idx = c % k
-                color = colors[(oy_idx * k + ox_idx) % len(colors)]
                 x = c * hr_w
                 y = r * hr_h
-                rect = patches.Rectangle((x, y), hr_w, hr_h, linewidth=0.3, edgecolor=color, facecolor='none', alpha=0.6, zorder=1)
+                rect = patches.Rectangle((x, y), hr_w, hr_h, linewidth=0.3, edgecolor='grey', facecolor='none', alpha=0.5, zorder=1)
                 self.ax.add_patch(rect)
 
         # Shade selected HR cells
@@ -244,20 +350,48 @@ class GridTileLabeler:
         self.ax.set_xlim(0, self.img_w)
         self.ax.set_ylim(self.img_h, 0)
         self.ax.set_aspect('equal')
-        
-        species_name = self.image_path.stem.split('_')[-1]
-        sampled_tiles = self.hr_rows * self.hr_cols
-        
-        # Build title with better formatting
-        title = f"\n{species_name}\n"
-        title += f"Image {self.img_idx + 1} / {self.total_images}\n"
-        title += f"Selected OBS: {len(self.hr_selected)} | Unselected: {sampled_tiles - len(self.hr_selected)}\n"
-        title += f"Grid: {self.grid_size * self.k} x {self.grid_size * self.k} ({self.grid_size}x{self.grid_size} base tiles, {len(self.offsets_normalized)} offsets)\n\n"
-        title += "LEFT-CLICK: mark/unmark | 'r': reset | 'u': undo | 'c': save & next | 'e': exit"
-        
-        self.ax.set_title(title, fontsize=9, fontweight='bold', pad=20)
+        self.ax.set_xticks([])
+        self.ax.set_yticks([])
+
+        self._update_info_panel()
         self.fig.canvas.draw_idle()
     
+    def _update_info_panel(self):
+        """Render crop details and instructions in the side panel."""
+        self.info_ax.clear()
+        self.info_ax.set_axis_off()
+
+        species_name = extract_species_name(self.image_path)
+        sampled_tiles = self.hr_rows * self.hr_cols
+        status_line = f"{self.saved_message}\n\n" if self.saved_message else ""
+        info_text = (
+            f"{status_line}"
+            f"Species\n{species_name}\n\n"
+            f"Image\n{self.img_idx + 1} / {self.total_images}\n\n"
+            f"Selected OBS\n{len(self.hr_selected)}\n\n"
+            f"Unselected\n{sampled_tiles - len(self.hr_selected)}\n\n"
+            f"Grid\n{self.grid_size * self.k} x {self.grid_size * self.k}\n"
+            f"({self.grid_size}x{self.grid_size} base tiles, {len(self.offsets_normalized)} offsets)\n\n"
+            "Controls\n"
+            "Left-click: mark/unmark\n"
+            "Drag: select region\n"
+            "r: reset\n"
+            "u: undo\n"
+            "c: save & next\n"
+            "e: exit"
+        )
+
+        self.info_ax.text(
+            0.02,
+            0.98,
+            info_text,
+            va='top',
+            ha='left',
+            fontsize=12,
+            fontweight='bold',
+            family='sans-serif',
+            linespacing=1.3,
+        )
     def get_tile_at_click(self, x, y):
         """Find which tile was clicked based on coordinates."""
         # Map click to high-resolution grid cell
@@ -397,9 +531,8 @@ class GridTileLabeler:
             print("\n✓ Confirming image...")
             self.save_image()
             self.image_confirmed = True
-            # Update title to show saved message with species name
-            species_name = self.image_path.stem.split('_')[-1]
-            self.ax.set_title(f"✓ Saved - {species_name} - Next image coming...", fontsize=10, fontweight='bold', pad=20, color='green')
+            self.saved_message = f"Saved - {extract_species_name(self.image_path)}"
+            self._update_info_panel()
             self.fig.canvas.draw_idle()
         
         elif event.key == 'r':
@@ -495,8 +628,27 @@ class GridTileLabeler:
                         'hr_overlap_count': sum(1 for rr in range(hr_r0, hr_r1 + 1) for cc in range(hr_c0, hr_c1 + 1) if (rr, cc) in self.hr_selected),
                     })
 
+        mask_path, contour_path, bbox, selected_area_px, contour_count = self._save_manual_outline_assets()
+
+        crop_metadata_records.append({
+            'image': self.image_path.stem,
+            'image_path': str(self.image_path),
+            'label': 'obs' if selected_area_px > 0 else 'no_obs',
+            'selected_hr_cells': len(self.hr_selected),
+            'selected_area_px': selected_area_px,
+            'selected_area_fraction': selected_area_px / float(self.img_h * self.img_w),
+            'mask_path': str(mask_path),
+            'contour_path': str(contour_path),
+            'contour_count': contour_count,
+            'bbox_x0': bbox['x0'],
+            'bbox_y0': bbox['y0'],
+            'bbox_x1': bbox['x1'],
+            'bbox_y1': bbox['y1'],
+        })
+
         queued_after = len(crops_to_save)
         print(f"✓ Extracted tiles for {len(offsets)} offsets: {obs_count} obs, {no_obs_count} no_obs")
+        print(f"  - Saved manual outline: {mask_path.name}")
         print(f"  - Total crops queued: {queued_after - queued_before}")
 
         # Update progress file
@@ -515,6 +667,7 @@ print("="*60)
 
 # Global list to store crops for batch saving at the end
 crops_to_save = []
+crop_metadata_records = []
 
 # Load progress from file
 progress_file = output_path / "progress.txt"
@@ -527,22 +680,11 @@ if progress_file.exists():
     except:
         start_index = 0
 
-# Ask user for starting index
 print(f"\nYou have {len(image_files_to_process)} images to process.")
-user_input = input(f"Enter starting index (default: {start_index} to continue): ").strip()
-
-if user_input:
-    try:
-        start_index = int(user_input)
-        if start_index < 0 or start_index >= len(image_files_to_process):
-            print(f"⚠ Invalid index. Using default {start_index}")
-    except:
-        print(f"⚠ Invalid input. Using default {start_index}")
+if progress_file.exists():
+    print(f"→ Continuing from saved progress at image {start_index}")
 else:
-    if progress_file.exists():
-        print(f"→ Continuing from image {start_index}")
-    else:
-        print(f"→ Starting fresh from image {start_index}")
+    print("→ Starting from the first randomized image")
 
 # Create figure once and reuse for all images
 fig, ax = plt.subplots(1, 1, figsize=(14, 14))
@@ -648,6 +790,12 @@ if crops_to_save:
             print(f"    ... and {len(duplicates) - 5} more")
 else:
     print("⚠ No obs crops were labeled")
+
+if crop_metadata_records:
+    crop_metadata_df = pd.DataFrame(crop_metadata_records)
+    crop_metadata_path = output_path / "crop_metadata.csv"
+    crop_metadata_df.to_csv(crop_metadata_path, index=False)
+    print(f"✓ Created crop-level metadata CSV: {crop_metadata_path}")
 
 print("\n" + "="*60)
 print("Interactive Tile Labeler - COMPLETE")
