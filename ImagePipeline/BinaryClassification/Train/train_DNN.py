@@ -16,25 +16,25 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from datetime import datetime
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import matplotlib.pyplot as plt
-import pandas as pd
-import pickle as pkl
+import matplotlib.colors as colors
 from pathlib import Path
 import torchvision.transforms as v2
 import copy
 
 from typing import cast
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
-from sklearn.metrics import roc_curve, auc, confusion_matrix, ConfusionMatrixDisplay, precision_recall_curve, average_precision_score, f1_score
+from sklearn.metrics import roc_curve, auc, confusion_matrix, ConfusionMatrixDisplay, precision_recall_curve, average_precision_score
 import sys
+
+# import PCA
+from sklearn.decomposition import PCA
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-
-from functions import VariationalAutoencoder, OneClassScorer, TwoClassScorer, image_pipeline_df, load_tiles_from_paths_fast, preprocess_tile
+from functions import Autoencoder, VariationalAutoencoder, OneClassScorer, TwoClassScorer, image_pipeline_df, load_tiles_from_paths_fast, preprocess_tile, MahalanobisScorer
 
 print("="*70)
 print("Training Neural Network Scorer - Binary Mode (Both Classes)")
@@ -70,12 +70,14 @@ print(f"Using device:      {device}")
 
 # Configuration
 ROOT_DIR_C = r"C:\Users\Admin\Documents\Jellyscope\Training data\Binary_classifier"   
-monitoring_effort = "Kristineberg_251128"
+monitoring_effort = "Kristineberg_250915"
 grid_size = 16
 tile_size = int(4512/grid_size)
 image_size_vae = 128
-latent_dim = 32
-model_name = f"../models/VAE/{monitoring_effort}_vae_model{grid_size}_l{latent_dim}.pth"
+latent_dim = 64
+offsets_normalized = [0, 0.2, 0.4, 0.6, 0.8]
+encoder = "AE"  # Options: "vae" or "ae"
+model_name = f"../models/{encoder}/{monitoring_effort}_{encoder}_model{grid_size}_l{latent_dim}_img{image_size_vae}.pth"
 
 # Training parameters
 batch_size = 512
@@ -95,16 +97,24 @@ image_size = checkpoint.get("image_size")
 hidden_channels = checkpoint.get("hidden_channels")
 grid_size = checkpoint.get("grid_size")
 
-vae_model = VariationalAutoencoder(latent_dims=latent_dims, image_size=image_size, 
-                                   hidden_channels=hidden_channels, grid_size=grid_size)
-vae_model.load_state_dict(checkpoint["model_state_dict"])
-vae_model.to(device)
-vae_model.eval()
+if encoder == "VAE":
+    encoder_model = VariationalAutoencoder(latent_dims=latent_dims, image_size=image_size, 
+                                    hidden_channels=hidden_channels, grid_size=grid_size)
+    encoder_model.load_state_dict(checkpoint["model_state_dict"])
+    encoder_model.to(device)
+    encoder_model.eval()
+elif encoder == "AE":
+    encoder_model = Autoencoder(latent_dims=latent_dims, image_size=image_size, hidden_channels=hidden_channels, grid_size=grid_size)
+    encoder_model.load_state_dict(checkpoint["model_state_dict"])
+    encoder_model.to(device)
+    encoder_model.eval()
+else:
+    raise ValueError(f"Invalid encoder type: {encoder}. Must be 'vae' or 'ae'.")
 
-print(f"Loaded VAE model with latent_dim={latent_dims}, grid_size={grid_size}")
+print(f"Loaded {encoder} model with latent_dim={latent_dims}, grid_size={grid_size}")
 
 #%% Load training data
-tiles_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train_DNN", f"tiles{grid_size}_offsets5")
+tiles_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train_DNN", f"tiles{grid_size}_offsets{len(offsets_normalized)}_labelme")
 tiles_path_obs = os.path.join(tiles_path, "obs")
 tiles_paths_obs = sorted(Path(tiles_path_obs).rglob("*.png"))
 
@@ -308,10 +318,18 @@ with torch.no_grad():
             batch_rows = batch_rows.to(device, non_blocking=True)
             batch_cols = batch_cols.to(device, non_blocking=True)
             
-            mu, _ = vae_model.encode(images, row=batch_rows, col=batch_cols)
-            x_hat = vae_model.decode(mu)
-            recon_err = ((images - x_hat) ** 2).flatten(1).mean(dim=1)
+            if encoder == "VAE":
+                mu, _ = encoder_model.encode(images, row=batch_rows, col=batch_cols)
+
+            elif encoder == "AE":
+                mu = encoder_model.encode(images, row=batch_rows, col=batch_cols)
+                
+            else:
+                raise ValueError(f"Invalid encoder type: {encoder}. Must be 'vae' or 'ae'.")
             
+            x_hat = encoder_model.decode(mu)
+            recon_err = ((images - x_hat) ** 2).flatten(1).mean(dim=1)
+                
             latent_list.append(mu.cpu())
             recon_err_list.append(recon_err.cpu())
             labels.extend(batch_labels.cpu().numpy().tolist())
@@ -339,23 +357,8 @@ train_dataset_lat = datasets_latent["train"]
 val_dataset_lat = datasets_latent["val"]
 test_dataset_lat = datasets_latent["test"]
 
-#%% Check for data leakage by comparing group IDs in train/val/test splits
 
-train_groups = set(og_imgs[train_idx])
-val_groups = set(og_imgs[val_idx])
-test_groups = set(og_imgs[test_idx])
-leaked_groups = train_groups.intersection(test_groups)
-
-if len(leaked_groups) > 0:
-    print(f"WARNING: Data leakage detected! {len(leaked_groups)} groups are in both train and test sets.")
-else:
-    print("No data leakage detected. Train and test groups are disjoint.")
-
-
-#%% Train in one class mode
-scorer_oc = OneClassScorer(latent_dim=latent_dims, hidden_dim=64, emb_dim= 4, grid_size=grid_size)
-scorer_oc.to(device)
-
+### Define oneclass sets for training the one-class model (only empty samples)
 # Only empty samples (label=0) for one-class training
 oneclass_mask_train = train_dataset_lat.tensors[4] == 0
 train_dataset_oneclass = TensorDataset(
@@ -375,6 +378,23 @@ val_dataset_oneclass = TensorDataset(
     test_dataset_lat.tensors[3][oneclass_mask_test],
     torch.ones(int(oneclass_mask_test.sum().item()), dtype=torch.float32),
 )
+
+#%% Check for data leakage by comparing group IDs in train/val/test splits
+
+train_groups = set(og_imgs[train_idx])
+val_groups = set(og_imgs[val_idx])
+test_groups = set(og_imgs[test_idx])
+leaked_groups = train_groups.intersection(test_groups)
+
+if len(leaked_groups) > 0:
+    print(f"WARNING: Data leakage detected! {len(leaked_groups)} groups are in both train and test sets.")
+else:
+    print("No data leakage detected. Train and test groups are disjoint.")
+
+
+#%% Train in one class mode
+scorer_oc = OneClassScorer(latent_dim=latent_dims, hidden_dim=64, emb_dim= 4, grid_size=grid_size)
+scorer_oc.to(device)
 
 train_loader_oneclass = DataLoader(train_dataset_oneclass, batch_size=2048, shuffle=True)
 val_loader_oneclass = DataLoader(val_dataset_oneclass, batch_size=2048, shuffle=False)
@@ -505,7 +525,6 @@ print(f"  99% threshold      = {threshold_oneclass:.4f}")
 print("  Scores above threshold = likely observation/anomaly")
 
 # Recommended threshold for anomaly detection
-threshold_oneclass = mean_empty_score - std_empty_score  # Conservative threshold
 print(f"\nRecommended threshold for anomaly detection: {threshold_oneclass:.4f}")
 print(f"  (Observations < threshold = likely observation, > threshold = likely empty)")
 
@@ -523,7 +542,7 @@ plt.savefig('scorer_training.png', dpi=150)
 print("Saved training curves to scorer_training.png")
 plt.show()
 
-#%% Initialize and train scorer network in BINARY mode
+#%% DNN Scorer - Binary Mode (with both empty and observation data)
 scorer_bin = TwoClassScorer(latent_dim=latent_dims, hidden_dim=256, dropout=0.3, grid_size=grid_size)
 scorer_bin.to(device)
 
@@ -600,7 +619,6 @@ for epoch in range(epochs):
         
         # Get predictions
         logits = scorer_bin(X_latent, X_recon, rows, cols)
-        
         loss = criterion(logits, y)
         
         loss.backward()
@@ -659,13 +677,11 @@ for epoch in range(epochs):
         best_val_ap = val_ap
         best_epoch = global_epoch
         best_model_state = copy.deepcopy(scorer_bin.state_dict())
-
-        print(f"New best model: epoch {best_epoch+1}, val AP={best_val_ap:.4f}, val acc={accuracy:.4f}")
     
     scheduler.step(val_ap)
     
     if (epoch + 1) % 5 == 0:
-        print(f"Epoch {epoch+1}/{epochs}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, Acc={accuracy:.4f}, Val AP={val_ap:.4f}")
+        print(f"Epoch {epoch+1}/{epochs}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, Acc={accuracy:.4f}, Val AP={val_ap:.4f}, best model:  val AP={best_val_ap:.4f}, val acc={accuracy:.4f}")
 
 print(f"\nInitial training complete! Starting Hard negative mining...")
 ### HARD NEGATIVE MINING
@@ -866,6 +882,7 @@ ax2.scatter(best_epoch, val_accuracies[best_epoch], color='red', label='Best Mod
 ax2.set_xlabel('Epoch')
 ax2.set_ylabel('Accuracy')
 ax2.set_title('Validation Accuracy')
+ax2.set_ylim(0, 1)
 ax2.legend()
 ax2.grid(alpha=0.3)
 
@@ -874,8 +891,24 @@ plt.savefig('scorer_training.png', dpi=150)
 print("Saved training curves to scorer_training.png")
 plt.show()
 
-#%% EVALUATION: Find optimal threshold and plot ROC curve and confusion matrix
+#%% Mahalanobis distance scorer with torch implementation for fast distance calculation in latent space
 
+# calculate covariance matrice of empty samples in latent space for Mahalanobis distance
+# scaler = StandardScaler()
+
+train_maha_latent = train_dataset_oneclass.tensors[0]  # Get latent features of empty samples
+X_latent = train_maha_latent
+
+cov = np.cov(X_latent, rowvar=False)
+cov_inv = np.linalg.inv(cov)
+
+cov = torch.tensor(cov, dtype=torch.float32).to(device)
+cov_inv = torch.tensor(cov_inv, dtype=torch.float32).to(device)
+mean_vec = torch.mean(X_latent, dim=0).to(device)
+
+scorer_maha = MahalanobisScorer(cov_inv=cov_inv, mean_vec=mean_vec)
+
+#%% EVALUATION: Find optimal threshold and plot ROC curve and confusion matrix
 test_loader = DataLoader(test_dataset_lat, batch_size=batch_size, shuffle=False, num_workers=0)
 
 n_obs = test_dataset_lat.tensors[4].sum().item()
@@ -887,18 +920,21 @@ mode = "binary"  # Change to "one_class" if evaluating one-class model
 
 if mode == "one_class":
     scorer = scorer_oc
-    
+    scorer.eval()
 elif mode == "binary":
     scorer = scorer_bin
+    scorer.eval()
+elif mode == "mahalanobis":
+    scorer = scorer_maha
 else:
-    raise ValueError(f"Invalid mode: {mode}. Must be 'one_class' or 'binary'.")
+    raise ValueError(f"Invalid mode: {mode}. Must be 'one_class', 'binary', or 'mahalanobis'.")
 
+scorer.to(device)
 # Run all test data through the loader
-scorer.eval()
-
 with torch.no_grad():
     all_scores = []
     all_labels = []
+    all_recon = []
     for X_latent, X_recon, rows, cols, y in test_loader:
         X_latent = X_latent.to(device, non_blocking=True)
         X_recon = X_recon.to(device, non_blocking=True)
@@ -910,16 +946,22 @@ with torch.no_grad():
             z = scorer(X_latent, X_recon, rows, cols)
             scores = ((z - center) ** 2).sum(dim=1)
         elif mode == "binary":
-            scores = scorer(X_latent, X_recon, rows, cols)
-            scores = torch.sigmoid(scores)
+            probs = scorer.predict_batch(X_latent, X_recon, rows, cols)
+            scores = probs
+        elif mode == "mahalanobis":
+            probs = scorer.predict_batch(X_latent, X_recon, rows, cols)
+            scores = probs
         else:
-            raise ValueError(f"Invalid mode: {mode}. Must be 'one_class' or 'binary")
+            raise ValueError(f"Invalid mode: {mode}. Must be 'one_class' or 'binary'")
 
         all_scores.append(scores.cpu().numpy())
         all_labels.append(y.numpy())
+        all_recon.append(X_recon.cpu().numpy())
 
-all_scores = np.concatenate(all_scores)
+# all_scores = np.concatenate(all_scores)
 all_labels = np.concatenate(all_labels)
+all_recon = np.concatenate(all_recon)
+all_scores = np.concatenate(all_scores)  # Combine model score and reconstruction error for evaluation
 
 # Plot precision-recall curve
 precision, recall, thresholds = precision_recall_curve(all_labels, all_scores)
@@ -946,6 +988,9 @@ best_threshold_f0_5 = thresholds[best_idx_f0_5]
 best_threshold_f1 = thresholds[best_idx_f1]
 best_threshold_f2 = thresholds[best_idx_f2]
 best_threshold_f3 = thresholds[best_idx_f3]
+youdens_j = recall - (1 - precision)
+best_idx_youden = np.argmax(youdens_j)
+best_threshold_youden = thresholds[best_idx_youden]
 
 print(f"Optimal thresholds:")
 print(f"  0.25 score: {best_threshold_f0_25:.4f} (0.25={f0_25_scores[best_idx_f0_25]:.4f})")
@@ -956,6 +1001,7 @@ print(f"  F3 score: {best_threshold_f3:.4f} (F3={f3_scores[best_idx_f3]:.4f})")
 
 # Use F3 since you prefer recall (catching obs) over precision
 best_threshold = best_threshold_f3
+print(f"\nRecommended threshold based on Youden's J statistic: {best_threshold:.4f}")
 
 plt.figure(figsize=(6, 6))
 plt.plot(recall, precision, label=f'Precision-Recall curve (AP = {avg_precision:.4f})')
@@ -991,31 +1037,111 @@ disp.plot(cmap='Blues')
 plt.title('Confusion Matrix')
 plt.show()
 
+# Plot score distribution for empty vs observation samples on PCA of latent space, labels in different shapes, and color by score
+# Make colorbar change colors at the threshold for better visualization
+color_norm = colors.TwoSlopeNorm(vmin=all_scores.min(), vcenter=best_threshold, vmax=all_scores.max())
+#%%
+pca = PCA(n_components=2)
+latent_2d = pca.fit_transform(test_dataset_lat.tensors[0].cpu().numpy())
+latent_2d_obs = latent_2d[all_labels == 1]
+latent_2d_empty = latent_2d[all_labels == 0]
+
+max_pca_x = np.max(abs(latent_2d[:, 0]))
+max_pca_y = np.max(abs(latent_2d[:, 1]))
+
+max_dim = max(max_pca_x, max_pca_y)
+
+plt.figure(figsize=(3.5, 3.5))
+# scatter_obs = plt.scatter(latent_2d_obs[:, 0], latent_2d_obs[:, 1], c=all_scores[all_labels == 1], norm = color_norm, marker='o', cmap='coolwarm', alpha=0.7, s=10, label='Observation')
+# scatter_empty = plt.scatter(latent_2d_empty[:, 0], latent_2d_empty[:, 1], c=all_scores[all_labels == 0], norm = color_norm, marker='s', cmap='coolwarm', alpha=0.7, s=10, label='Empty')
+
+scatter_empty = plt.scatter(latent_2d_empty[:, 0], latent_2d_empty[:, 1], c='blue', marker='o',  alpha=0.3, s=2, label='Empty')
+scatter_obs = plt.scatter(latent_2d_obs[:, 0], latent_2d_obs[:, 1], c='red', marker='o', alpha=0.3, s=2, label='Observation')
+# plt.legend(loc=' right', fontsize=10)
+plt.xlabel('PCA 1')
+plt.ylabel('PCA 2')
+plt.legend(
+    loc='lower center',
+    bbox_to_anchor=(0.5, 1.02),  # centered above axes
+    ncol=2,
+    fontsize=10,
+)
+plt.xlim(-max_dim, max_dim)
+plt.ylim(-max_dim, max_dim)
+plt.xticks([-10, -5, 0, 5, 10])
+plt.yticks([-10, -5, 0, 5, 10])
+plt.grid()
+# plt.colorbar(scatter_obs, label='Anomaly Score', ticks=[0, best_threshold, 1], format='%.3f')
+
 #%% Save scorer model for future reference
 
 if mode == "one_class" and scorer_oc is not None:
-    scorer_model_name = model_name.replace("VAE/", "NN/OneClass/").replace("vae_model", "scorer_oneclass_model")
-    Path(scorer_model_name).parent.mkdir(parents=True, exist_ok=True)
-
+    scorer_model_name = model_name.replace(f"{encoder}/", "NN/OneClass/").replace(f"{encoder}_model", "scorer_oneclass_model")
+    checkpoint = {
+                'model_state_dict': scorer_oc.state_dict(),
+                'threshold': best_threshold,
+                'latent_dim': latent_dims,
+                'grid_size': grid_size,
+                'average_precision': avg_precision
+                }
+    
 elif mode == "binary" and scorer_bin is not None:
-    scorer_model_name = model_name.replace("VAE/", "NN/TwoClass/").replace("vae_model", "scorer_binary_model")
-    Path(scorer_model_name).parent.mkdir(parents=True, exist_ok=True)
 
+    scorer_model_name = model_name.replace(f"{encoder}/", "NN/TwoClass/").replace(f"{encoder}_model", "scorer_binary_model")
+    checkpoint = {
+                'model_state_dict': scorer_bin.state_dict(),
+                'threshold': best_threshold,
+                'latent_dim': latent_dims,
+                'grid_size': grid_size,
+                'average_precision': avg_precision
+                }
+        
+elif mode == "mahalanobis":
+    scorer_model_name = model_name.replace(f"{encoder}/", "NN/Mahalanobis/").replace(f"{encoder}_model", "scorer_mahalanobis_model")
+    
+    checkpoint = {
+                'mean_vec': mean_vec.cpu(),
+                'cov_inv': cov_inv.cpu(),
+                'threshold': best_threshold,
+                'latent_dim': latent_dims,
+                'grid_size': grid_size,
+                'average_precision': avg_precision
+                }
 else:
     raise ValueError(f"Invalid mode: {mode}. Cannot save model.")
-checkpoint = {
-    'model_state_dict': scorer_bin.state_dict(),
-    'threshold': best_threshold,
-    'latent_dim': latent_dims,
-    'grid_size': grid_size,
-    'test_accuracy': test_accuracies[-1],
-    'average_precision': avg_precision
-}
+
+Path(scorer_model_name).parent.mkdir(parents=True, exist_ok=True)
 
 torch.save(checkpoint, scorer_model_name)
 print(f"\n✓ Saved {mode} scorer model to: {scorer_model_name}")
 print(f"  Mode: {mode}")
 print(f"  Threshold: {best_threshold:.4f}")
-print(f"  Test Accuracy: {test_accuracies[-1]:.4f}")
 print(f"  Average Precision: {avg_precision:.4f}")
-# %%
+# %% Load scorer model checkpoint for inference
+# Example of loading the saved model for inference later
+
+checkpoint = torch.load(scorer_model_name, map_location=device)
+
+if mode == "one_class":
+    scorer_loaded = OneClassScorer(latent_dim=checkpoint['latent_dim'], hidden_dim=64, emb_dim=4, grid_size=checkpoint['grid_size'])
+    scorer_loaded.load_state_dict(checkpoint['model_state_dict'])
+    scorer_loaded.to(device)
+    scorer_loaded.eval()
+    print(f"✓ Loaded one-class scorer model from {scorer_model_name}")
+    print(f"  Threshold: {checkpoint['threshold']:.4f}")
+    print(f"  Average Precision: {checkpoint['average_precision']:.4f}")
+elif mode == "binary":
+    scorer_loaded = TwoClassScorer(latent_dim=checkpoint['latent_dim'], hidden_dim=256, dropout=0.3, grid_size=checkpoint['grid_size'])
+    scorer_loaded.load_state_dict(checkpoint['model_state_dict'], weight_only=F)
+    scorer_loaded.to(device)
+    scorer_loaded.eval()
+    print(f"✓ Loaded binary scorer model from {scorer_model_name}")
+    print(f"  Threshold: {checkpoint['threshold']:.4f}")
+    print(f"  Average Precision: {checkpoint['average_precision']:.4f}")
+elif mode == "mahalanobis":
+    scorer_loaded = MahalanobisScorer(cov_inv=checkpoint['cov_inv'].to(device), mean_vec=checkpoint['mean_vec'].to(device))
+    print(f"✓ Loaded Mahalanobis scorer model from {scorer_model_name}")
+    print(f"  Threshold: {checkpoint['threshold']:.4f}")
+    print(f"  Average Precision: {checkpoint['average_precision']:.4f}")
+else:
+    raise ValueError(f"Invalid mode: {mode}. Cannot load model.")   

@@ -770,7 +770,7 @@ if crops_to_save:
     
     # Create and save dataframe
     df = pd.DataFrame(df_data)
-    csv_path = output_path / "crops_metadata.csv"
+    csv_path = output_path / "tiles_metadata.csv"
     df.to_csv(csv_path, index=False)
     
     # Count obs and no_obs
@@ -793,7 +793,7 @@ else:
 
 if crop_metadata_records:
     crop_metadata_df = pd.DataFrame(crop_metadata_records)
-    crop_metadata_path = output_path / "crop_metadata.csv"
+    crop_metadata_path = output_path / "crops_metadata.csv"
     crop_metadata_df.to_csv(crop_metadata_path, index=False)
     print(f"✓ Created crop-level metadata CSV: {crop_metadata_path}")
 

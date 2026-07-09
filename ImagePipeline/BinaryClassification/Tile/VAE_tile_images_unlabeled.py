@@ -27,11 +27,11 @@ AUGMENTATION = False
 # Set to [] or [0.0] to disable offset cropping (single crop per tile)
 OFFSET_NORMALIZED = [0.0, 0.2, 0.4, 0.6, 0.8]
 
-monitoring_effort = "Kristineberg_251128" #"Kristineberg_260424" 
+monitoring_effort = "Kristineberg_250915" #"Kristineberg_260424" 
 
 # Folder paths
 input_folder = f"{monitoring_effort}\\train_VAE\\OG_images"# Folder containing images to split
-output_folder = f"{monitoring_effort}\\train_VAE\\tiles{grid_size}"# Folder to save the tiles (will be created if it doesn't exist)
+output_folder = f"{monitoring_effort}\\train_VAE\\tiles{grid_size}_offset{len(OFFSET_NORMALIZED)}"# Folder to save the tiles (will be created if it doesn't exist)
 
 input_path = Path(ROOT_DIR_C).joinpath(Path(input_folder))
 total_images = len(list(Path(input_path).rglob('*.png')))

@@ -12,55 +12,78 @@ import pandas as pd
 
 # Encoder 
 class Encoder(nn.Module):
+    """Regular encoder with continuous positional features"""
     def __init__(self, latent_dims=2, image_size=128, hidden_channels=32, grid_size=16):
         super().__init__()
         self.image_size = image_size
+        self.grid_size = grid_size
 
         self.conv = nn.Sequential(
-            nn.Conv2d(1, hidden_channels, kernel_size=3, stride=2, padding=1),  # /2
+            nn.Conv2d(1, hidden_channels, kernel_size=3, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels, hidden_channels * 2, kernel_size=3, stride=2, padding=1),  # /4
+            nn.Conv2d(hidden_channels, hidden_channels * 2, kernel_size=3, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels * 2, hidden_channels * 4, kernel_size=3, stride=2, padding=1),  # /8
+            nn.Conv2d(hidden_channels * 2, hidden_channels * 4, kernel_size=3, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels * 4, hidden_channels * 8, kernel_size=3, stride=2, padding=1),  # /16
+            nn.Conv2d(hidden_channels * 4, hidden_channels * 8, kernel_size=3, stride=2, padding=1),
             nn.ReLU(inplace=True),
         )
-        
-        # Embed the position of each tile in the grid and add to the features before the final FC layer
-        embedding_dim = hidden_channels * 2
-        self.row_embedding = nn.Embedding(grid_size, embedding_dim)
-        self.col_embedding = nn.Embedding(grid_size, embedding_dim)
+
+        embedding_total_dim = hidden_channels * 8
+        self.pos_embedding = PositionalEmbedding(
+            input_dim=10,
+            output_dim=embedding_total_dim
+        )
 
         with torch.no_grad():
             dummy = torch.zeros(1, 1, self.image_size, self.image_size)
             feat = self.conv(dummy)
-        self.feat_shape = feat.shape[1:]  # (C, H, W)
-        self.feat_dim = feat.numel()      # flattened size
 
-        embedding_total_dim = embedding_dim * 2  # row + col embeddings
-        combined_dim = self.feat_dim + embedding_total_dim
-        
-        self.fc = nn.Linear(combined_dim, latent_dims)
+        self.feat_shape = feat.shape[1:]
+        self.feat_dim = feat.numel()
 
-    def forward(self, x, row = None, col = None):
+        self.pos_fc1 = nn.Linear(embedding_total_dim, hidden_channels * 8)
+        self.pos_bn1 = nn.BatchNorm1d(hidden_channels * 8)
+
+        combined_dim = self.feat_dim + hidden_channels * 8
+
+        self.fusion_fc1 = nn.Linear(combined_dim, hidden_channels * 8)
+        self.fusion_bn1 = nn.BatchNorm1d(hidden_channels * 8)
+        self.fusion_dropout1 = nn.Dropout(0.2)
+
+        self.fusion_fc2 = nn.Linear(hidden_channels * 8 + embedding_total_dim, hidden_channels * 8)
+        self.fusion_bn2 = nn.BatchNorm1d(hidden_channels * 8)
+        self.fusion_dropout2 = nn.Dropout(0.2)
+
+        self.fc_z = nn.Linear(hidden_channels * 8, latent_dims)
+
+    def forward(self, x, row=None, col=None):
         h = self.conv(x)
         h = torch.flatten(h, start_dim=1)
-        
-        # Get positional embeddings
+
         if row is not None and col is not None:
-            row = row.to(x.device).long()
-            col = col.to(x.device).long()
-            
-            row_emb = self.row_embedding(row)  # shape: (B, embedding_dim)
-            col_emb = self.col_embedding(col)  # shape: (B, embedding_dim)
-            
-            # Concatenate visual features with positional embeddings
-            h = torch.cat([h, row_emb, col_emb], dim=1)  # shape: (B, feat_dim + 2*embedding_dim)
+            pos_features = compute_position_features(row, col, self.grid_size, x.device)
+            pos_emb = self.pos_embedding(pos_features)
 
-        z = self.fc(h)
+            pos_processed = self.pos_fc1(pos_emb)
+            pos_processed = self.pos_bn1(pos_processed)
+            pos_processed = F.relu(pos_processed)
+
+            h = torch.cat([h, pos_processed], dim=1)
+            h = self.fusion_fc1(h)
+            h = self.fusion_bn1(h)
+            h = F.relu(h)
+            h = self.fusion_dropout1(h)
+
+            h = torch.cat([h, pos_emb], dim=1)
+            h = self.fusion_fc2(h)
+            h = self.fusion_bn2(h)
+            h = F.relu(h)
+            h = self.fusion_dropout2(h)
+
+        z = self.fc_z(h)
         return z
-
+    
 ### Variational Encoder for segmentation, with multi-level positional embeddings 
 class VariationalEncoder(nn.Module):
     """Variational Encoder with continuous positional features"""
@@ -223,9 +246,15 @@ class Decoder(nn.Module):
 
 ### Autoencoder that combines the Encoder and Decoder
 class Autoencoder(nn.Module):
-    def __init__(self, latent_dims, image_size=128, in_channels=1, hidden_channels=32):
+    def __init__(self, latent_dims, image_size=128, hidden_channels=32, grid_size=16):
         super().__init__()
-        self.encoder = Encoder(latent_dims, image_size, hidden_channels)
+        self.encoder = Encoder(
+            latent_dims=latent_dims,
+            image_size=image_size,
+            hidden_channels=hidden_channels,
+            grid_size=grid_size
+        )
+
         self.decoder = Decoder(
             latent_dims,
             feat_shape=self.encoder.feat_shape,
@@ -242,7 +271,7 @@ class Autoencoder(nn.Module):
     def forward(self, x, row=None, col=None):
         z = self.encoder(x, row=row, col=col)
         return self.decoder(z)
-
+    
 ### Variational Autoencoder that combines the VariationalEncoder and Decoder
 class VariationalAutoencoder(nn.Module):
     def __init__(self, latent_dims, image_size=128, hidden_channels=32, grid_size=16):
@@ -333,20 +362,17 @@ class OneClassScorer(nn.Module):
         score = ((z - center) ** 2).sum(dim=1)
         return score
 
-    def predict_batch(self, mu, recon_err, rows, cols, center, threshold):
+    def predict_batch(self, mu, recon_err, rows, cols, center):
         with torch.no_grad():
             scores = self.anomaly_score(mu, recon_err, rows, cols, center)
-            scores = torch.sigmoid(scores)  # Convert to [0,1] range for interpretability
-            preds = (scores >= threshold).long()
+            probs = torch.sigmoid(scores)  # Convert to [0,1] range for interpretability
 
-        return preds, scores
+
+        return probs
 
 class TwoClassScorer(nn.Module):
     """
     Dense neural network for classifying tiles as observation or empty.
-    Supports two modes:
-    - 'binary': Binary classification (observation vs empty)
-    - 'one_class': One-class learning (detect anomalies when only empty data available)
     
     Uses shared positional encoding to ensure consistency with VAE.
     Designed for GPU-accelerated inference and training.
@@ -381,10 +407,7 @@ class TwoClassScorer(nn.Module):
         
         # Output probability [0, 1]
         self.fc_out = nn.Linear(hidden_dim // 4, 1)
-        
-        
-
-        
+                
     def forward(self, mu, recon_err, rows, cols):
         """
         Forward pass.
@@ -426,16 +449,16 @@ class TwoClassScorer(nn.Module):
         logits = self.fc_out(x).squeeze(-1)
         return logits
 
-    def predict_batch(self, mu, recon_err, rows, cols, threshold=0.5):
+    def predict_batch(self, mu, recon_err, rows, cols):
         """
         Batch prediction with thresholding.
         """
-        
+        self.eval()
         with torch.no_grad():
-            probs = self.forward(mu, recon_err, rows, cols)            
-            preds = (probs >= threshold).long()
-            
-        return preds, probs
+            logits = self.forward(mu, recon_err, rows, cols)      
+            probs = torch.sigmoid(logits)  # Convert logits to probabilities in [0,1]      
+
+        return probs
 
 ### Shared Positional Encoding Components ###
 def compute_position_features(rows, cols, grid_size, device):
@@ -936,6 +959,236 @@ def split_image_into_tiles(image, grid_size):
     return tiles_info
 
 
+class MahalanobisScorer(nn.Module):
+    def __init__(self, latent_dim=32, grid_size=16, mean_vec=None, cov_inv=None):
+        super().__init__()
+
+        self.latent_dim = latent_dim
+        self.grid_size = grid_size
+
+        self.register_buffer("mean_vec", mean_vec)
+        self.register_buffer("cov_inv", cov_inv)
+
+        self.register_buffer(
+            "chi2_half_df",
+            torch.tensor(latent_dim / 2, dtype=mean_vec.dtype, device=mean_vec.device)
+        )
+
+        pos_emb_dim = max(16, 10 * 2)
+        self.pos_embedding = PositionalEmbedding(input_dim=10, output_dim=pos_emb_dim)
+
+    def mahalanobis_distance(self, x):
+
+        diff = x - self.mean_vec
+
+        dist_sq = torch.sum((diff @ self.cov_inv) * diff, dim=1)
+        dist_sq = torch.clamp(dist_sq, min=0)
+
+        return torch.sqrt(dist_sq)
+
+    def predict_batch(self, mu, recon_err, rows=None, cols=None):
+        with torch.no_grad():
+            dist = self.mahalanobis_distance(mu)
+
+            dist_scores = torch.special.gammainc(
+                self.chi2_half_df.to(device=dist.device, dtype=dist.dtype),
+                dist ** 2 / 2
+            )
+
+            recon_scores = torch.special.gammainc(
+                self.chi2_half_df.to(device=recon_err.device, dtype=recon_err.dtype),
+                recon_err ** 2 / 2
+            )
+
+            alpha = 0.5
+            probs = alpha * dist_scores + (1 - alpha) * recon_scores
+
+            return probs
+import json
+from pathlib import Path
+import cv2
+import numpy as np
+
+
+def get_manual_crops_from_labelme_json(
+    json_path,
+    image_shape,
+    image_path,
+    image_name,
+    PXL_TO_MM2,
+    crop_padding_pixels=0,
+    make_square=True,
+    allowed_labels=None,   # set to None to keep all shapes
+):
+    json_path = Path(json_path)
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    h, w = image_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    # Rasterize LabelMe shapes into a binary mask
+    for shape in data.get("shapes", []):
+        label = shape.get("label", None)
+        if allowed_labels is not None and label not in allowed_labels:
+            continue
+
+        pts = np.array(shape.get("points", []), dtype=np.float32)
+        if pts.size == 0:
+            continue
+
+        shape_type = shape.get("shape_type", "polygon")
+
+        if shape_type == "rectangle" and len(pts) == 2:
+            (x0, y0), (x1, y1) = pts
+            x0, x1 = sorted([int(round(x0)), int(round(x1))])
+            y0, y1 = sorted([int(round(y0)), int(round(y1))])
+            cv2.rectangle(mask, (x0, y0), (x1, y1), 1, thickness=-1)
+
+        elif shape_type in {"polygon", "freehand", "linestrip"}:
+            cv2.fillPoly(mask, [np.round(pts).astype(np.int32)], 1)
+
+        else:
+            # Skip unsupported shape types for now
+            continue
+
+    # Split into connected components so each separated region becomes one crop
+    n_labels, cc_mask, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+
+    manual_crop_metadata = []
+    crop_id = 0
+
+    for cc_id in range(1, n_labels):  # 0 is background
+        x, y, bw, bh, area = stats[cc_id]
+        if area == 0:
+            continue
+
+        y0 = max(0, y - crop_padding_pixels)
+        x0 = max(0, x - crop_padding_pixels)
+        y1 = min(h, y + bh + crop_padding_pixels)
+        x1 = min(w, x + bw + crop_padding_pixels)
+
+        if make_square:
+            crop_h = y1 - y0
+            crop_w = x1 - x0
+            crop_size = max(crop_h, crop_w)
+
+            y_center = (y0 + y1) // 2
+            x_center = (x0 + x1) // 2
+
+            y0 = max(0, y_center - crop_size // 2)
+            x0 = max(0, x_center - crop_size // 2)
+            y1 = min(h, y0 + crop_size)
+            x1 = min(w, x0 + crop_size)
+
+            # Re-clip in case the crop hit an image boundary
+            y0 = max(0, y1 - crop_size)
+            x0 = max(0, x1 - crop_size)
+
+        region_area_px = int((cc_mask == cc_id).sum())
+
+        manual_crop_metadata.append({
+            "OG_image_path": Path(image_path),
+            "image_name": image_name,
+            "crop_id": crop_id,
+            "crop_y0": int(y0),
+            "crop_x0": int(x0),
+            "crop_y1": int(y1),
+            "crop_x1": int(x1),
+            "crop_height": int(y1 - y0),
+            "crop_width": int(x1 - x0),
+            "region_size_pixels": region_area_px,
+            "region_size_mm2": float(region_area_px * PXL_TO_MM2),
+            "source": "manual",
+            "label_manual": True,
+            "label_predicted": None,
+            "matched_by_pred": False,
+            "mask_path": str(json_path),
+        })
+        crop_id += 1
+
+    return manual_crop_metadata
+
+def crops_overlap(pred_crop, manual_crop,
+                  min_manual_covered_pred_larger,
+                  min_manual_covered_pred_smaller):
+    py0, px0, py1, px1 = pred_crop["crop_y0"], pred_crop["crop_x0"], pred_crop["crop_y1"], pred_crop["crop_x1"]
+    my0, mx0, my1, mx1 = manual_crop["crop_y0"], manual_crop["crop_x0"], manual_crop["crop_y1"], manual_crop["crop_x1"]
+
+    inter_y0 = max(py0, my0)
+    inter_x0 = max(px0, mx0)
+    inter_y1 = min(py1, my1)
+    inter_x1 = min(px1, mx1)
+
+    if inter_y1 <= inter_y0 or inter_x1 <= inter_x0:
+        return False
+
+    inter_area = (inter_y1 - inter_y0) * (inter_x1 - inter_x0)
+    pred_area = (py1 - py0) * (px1 - px0)
+    manual_area = (my1 - my0) * (mx1 - mx0)
+
+    if pred_area <= 0 or manual_area <= 0:
+        return False
+
+    manual_covered = inter_area / manual_area
+    pred_covered = inter_area / pred_area
+    thr = min_manual_covered_pred_larger if pred_area > manual_area else min_manual_covered_pred_smaller
+
+    return (manual_covered >= thr) or (pred_covered >= thr)
+
+
+# class MahalanobisScorer():
+#     """
+#     Class for scoring usisng mahalnobis distance in latent space, combined with reconstruction error.
+    
+#     Architecture same as OneClassScorer, so that it can be used interchangeably with different scoring functions.
+    
+#     """
+#     def __init__(self, latent_dim=32, grid_size=16, mean_vec=None, cov_inv=None):
+#         super().__init__()
+#         self.latent_dim = latent_dim
+#         self.grid_size = grid_size
+#         self.mean_vec = mean_vec
+#         self.cov_inv = cov_inv
+
+#         # Shared positional embedding module — matches VAE's pos_embedding
+#         pos_emb_dim = max(16, 10 * 2)  # output dim of PositionalEmbedding with input_dim=10
+#         self.pos_embedding = PositionalEmbedding(input_dim=10, output_dim=pos_emb_dim)
+      
+#     def mahalanobis_distance(self, x):
+#         # Mahalanobis distance: sqrt((x - mean)^T * cov_inv * (x - mean))
+#         # Make compatible for batch processing and single vector input
+        
+#         mean = self.mean_vec.to(x.device) 
+#         cov_inv = self.cov_inv.to(x.device)
+        
+#         diff = x - mean
+#         dist = torch.sqrt(torch.sum(diff @ cov_inv * diff, dim=1))
+#         return dist
+
+#     def predict_batch(self, mu, recon_err, rows, cols):
+#         """
+#         Batch prediction with thresholding.
+#         """
+        
+#         with torch.no_grad():
+#             # Compute Mahalanobis distance
+#             dist = self.mahalanobis_distance(mu)
+            
+#             k = self.latent_dim
+            
+#             # Combine with reconstruction error (you can also try other combinations)
+            
+#             # Convert to probability using sigmoid (or use raw scores for anomaly detection
+#             dist_scores = torch.special.gammainc(torch.tensor(k / 2, device=dist.device), dist ** 2 / 2)  # Convert to [0,1] range for interpretability
+#             recon_scores = torch.special.gammainc(torch.tensor(k / 2, device=dist.device), recon_err ** 2 / 2)  # Convert to [0,1] range for interpretability
+            
+#             alpha = 0.5  # 0.5 = equal weighting
+
+#             probs = alpha * dist_scores + (1 - alpha) * recon_scores
+                        
+#             return probs
 # def train_image_pipeline(batch_paths, image_size=128):
 #     images = []
 #     rows = []
@@ -1053,6 +1306,186 @@ def split_image_into_tiles(image, grid_size):
 #     def __getitem__(self, idx):
 #         image_path = self.image_paths[idx]
 #         return self.preprocess_fn(image_path)
+
+### Batch run inference functions
+def batch_run_inference(tiles_tensor, rows_tensor, cols_tensor, model, scorer, encoder, device, batch_size):
+    """Run scorer inference on a batch of tiles from multiple images."""
+
+    
+    return scores_array, mu_array, recon_array
+
+def split_results_by_image(scores_array, rows_list, cols_list, tile_grid_size, offsets, image_tile_counts):
+    """Split batched inference results back to per-image probability maps."""
+    results_per_image = []
+    start_idx = 0
+    
+    for img_num, num_tiles in enumerate(image_tile_counts):
+        if num_tiles == 0:
+            results_per_image.append(None)
+            continue
+        
+        end_idx = start_idx + num_tiles
+        image_scores = scores_array[start_idx:end_idx]
+        image_rows = rows_list[start_idx:end_idx]
+        image_cols = cols_list[start_idx:end_idx]
+        
+        prob_map_small, coverage_map_small = aggregate_scores_to_map(
+            image_rows,
+            image_cols,
+            image_scores,
+            tile_grid_size=tile_grid_size,
+            offsets_count=len(offsets),
+        )
+        
+        results_per_image.append({
+            "prob_map_small": prob_map_small,
+            "coverage_map_small": coverage_map_small,
+        })
+        start_idx = end_idx
+    
+    return results_per_image
+
+def aggregate_scores_to_map(rows_list, cols_list, scores, tile_grid_size: int, offsets_count: int):
+    grid_size_small = tile_grid_size * offsets_count
+    prob_map_small = np.zeros((grid_size_small, grid_size_small), dtype=np.float32)
+    coverage_map_small = np.zeros((grid_size_small, grid_size_small), dtype=np.float32)
+
+    for tile_row, tile_col, pred_score in zip(rows_list, cols_list, scores):
+        small_row = int(round(float(tile_row) * offsets_count))
+        small_col = int(round(float(tile_col) * offsets_count))
+        small_row = max(0, min(small_row, grid_size_small - 1))
+        small_col = max(0, min(small_col, grid_size_small - 1))
+
+        prob_map_small[small_row : small_row + offsets_count, small_col : small_col + offsets_count] += float(pred_score)
+        coverage_map_small[small_row : small_row + offsets_count, small_col : small_col + offsets_count] += 1.0
+
+    prob_map_small = np.divide(
+        prob_map_small,
+        coverage_map_small,
+        out=prob_map_small,
+        where=coverage_map_small > 0,
+    )
+    return prob_map_small, coverage_map_small
+
+
+def image_to_probability_map(
+    image: np.ndarray,
+    model,
+    scorer,
+    device: torch.device,
+    tile_size: int,
+    tile_grid_size: int,
+    image_size: int,
+    batch_size: int,
+    offsets,
+    offsets_norm,
+):
+    
+    tiles_list = []
+    rows_list = []
+    cols_list = []
+
+    for offset, offset_norm in zip(offsets, offsets_norm):
+        print(f"offset = {offset} pixels, ({offset_norm:.2f} of tile size)")
+        tiles = extract_tiles_with_offset(image, tile_size, tile_grid_size, offset_pxl_x=offset, offset_pxl_y=offset, offset_norm_x=offset_norm, offset_norm_y = offset_norm )
+        for tile, row, col in tiles:
+            tile_tensor = preprocess_tile(tile, image_size=image_size)
+            if tile_tensor is None:
+                continue
+            tiles_list.append(tile_tensor)
+            rows_list.append(row)
+            cols_list.append(col)
+
+    if not tiles_list:
+        return None
+
+    tiles_tensor = torch.stack(tiles_list, dim=0)
+    rows_tensor = torch.tensor(rows_list, dtype=torch.float32)
+    cols_tensor = torch.tensor(cols_list, dtype=torch.float32)
+
+    scores_list = []
+    preds_list = []
+    mu_list = []
+    recon_list = []
+
+    with torch.inference_mode():
+        for start_idx in range(0, len(tiles_tensor), batch_size):
+            end_idx = min(start_idx + batch_size, len(tiles_tensor))
+            tiles_batch = tiles_tensor[start_idx:end_idx].to(device, non_blocking=True)
+            rows_batch = rows_tensor[start_idx:end_idx].to(device, non_blocking=True)
+            cols_batch = cols_tensor[start_idx:end_idx].to(device, non_blocking=True)
+
+            mu, _ = model.encode(tiles_batch, row=rows_batch, col=cols_batch)
+            x_hat = model(tiles_batch, row=rows_batch, col=cols_batch)
+            recon_err = ((tiles_batch - x_hat) ** 2).flatten(1).mean(dim=1)
+            scores = scorer(mu, recon_err, rows_batch, cols_batch)
+
+            mu_list.append(mu.detach().cpu().numpy())
+            recon_list.append(recon_err.detach().cpu().numpy())
+            scores_list.append(scores.detach().cpu().numpy())
+
+
+    scores_array = np.concatenate(scores_list, axis=0)
+    mu_array = np.concatenate(mu_list, axis=0)
+    recon_array = np.concatenate(recon_list, axis=0)
+
+    prob_map_small, coverage_map_small = aggregate_scores_to_map(
+        rows_list,
+        cols_list,
+        scores_array,
+        tile_grid_size=tile_grid_size,
+        offsets_count=len(offsets),
+    )
+
+    return {
+        "prob_map_small": prob_map_small,
+        "coverage_map_small": coverage_map_small,
+        "rows_list": np.asarray(rows_list, dtype=np.float32),
+        "cols_list": np.asarray(cols_list, dtype=np.float32),
+        "scores_array": scores_array,
+        "mu_array": mu_array,
+        "recon_array": recon_array,
+    }
+
+def batch_extract_tiles_from_images(images_list, tile_size, tile_grid_size, offsets, offsets_norm, image_size):
+    """Extract tiles from multiple images and return concatenated batch with image tracking."""
+    all_tiles = []
+    all_rows = []
+    all_cols = []
+    image_tile_counts = []  # Track how many tiles per image
+    
+    for image_gray in images_list:
+        tiles_list = []
+        rows_list = []
+        cols_list = []
+
+        for offset, offset_norm in zip(offsets, offsets_norm):
+            tiles = extract_tiles_with_offset(image_gray, tile_size, tile_grid_size, offset_pxl_x=offset, offset_pxl_y=offset, offset_norm_x=offset_norm, offset_norm_y=offset_norm)
+            for tile, row, col in tiles:
+                tile_tensor = preprocess_tile(tile, image_size=image_size)
+                if tile_tensor is None:
+                    continue
+                tiles_list.append(tile_tensor)
+                # row/col already include the fractional offset and are 0-based.
+                rows_list.append(row)
+                cols_list.append(col)
+        
+        if tiles_list:
+            all_tiles.extend(tiles_list)
+            all_rows.extend(rows_list)
+            all_cols.extend(cols_list)
+            image_tile_counts.append(len(tiles_list))
+        else:
+            image_tile_counts.append(0)
+    
+    if not all_tiles:
+        return None, None, None, None, None
+    
+    tiles_tensor = torch.stack(all_tiles, dim=0)
+    rows_tensor = torch.tensor(all_rows, dtype=torch.float32)
+    cols_tensor = torch.tensor(all_cols, dtype=torch.float32)
+    
+    return tiles_tensor, rows_tensor, cols_tensor, image_tile_counts, (all_rows, all_cols)
 
 def load_tiles_from_paths_fast(batch_paths, image_size=128, include_labels=False, batch_size=256, num_workers=16, to_device=None, return_generator=False):
     """

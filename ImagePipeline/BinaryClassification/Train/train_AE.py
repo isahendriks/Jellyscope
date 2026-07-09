@@ -7,6 +7,8 @@ import sys
 from time import time
 
 import cv2
+from matplotlib.pylab import copy 
+from copy import deepcopy
 import numpy as np
 
 import torch
@@ -18,7 +20,7 @@ from tqdm.auto import tqdm
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from functions import Autoencoder, VariationalAutoencoder, image_pipeline_df, load_tiles_from_paths_fast, preprocess_tile
+from functions import Autoencoder, image_pipeline_df, load_tiles_from_paths_fast, preprocess_tile
 
 torch.manual_seed(0)
 plt.rcParams["figure.dpi"] = 200
@@ -62,15 +64,16 @@ DEBUG = False
 N_DEBUG = 5000
 EPOCHS_DEBUG = 10
 
-monitoring_effort = "Kristineberg_251128"  # for titles and saved model names, e.g. "kristineberg_251128" 
+monitoring_effort = "Kristineberg_250915"  # for titles and saved model names, e.g. "kristineberg_251128" 
 grid_size = 16  # number of tiles along one side (e.g. 6 means 6x6=36 tiles per image)
+offsets_normalized = [0.0, 0.2, 0.4, 0.6, 0.8]  # List of normalized offsets [0.0, 0.2, 0.4, 0.6, 0.8] creates crops at 0%, 20%, 40%, 60%, 80% offset; set to [] or [0.0] to disable offset cropping (single crop per tile)
 
 # model hyperparameters
 image_size = 128
 latent_dims = 64
 hidden_channels = 32
 
-train_tiles_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train_VAE", f"tiles{grid_size}")
+train_tiles_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train_VAE", f"tiles{grid_size}_offset{len(offsets_normalized)}")
 train_og_images_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train_VAE", "OG_images")
 
 print(f"train_tiles_path: {train_tiles_path}")
@@ -82,7 +85,7 @@ images_train = sorted(Path(train_og_images_path).rglob("*.png"))
 print(f"Total training images with tiles found: {len(images_train)}")
 print(f"total training tiles found: {len(list(Path(train_tiles_path).rglob('*.png')))}")
 
-model_name = f"../models/VAE/{monitoring_effort}_VAE_model{grid_size}_l{latent_dims}_img{image_size}.pth"
+model_name = f"../models/AE/{monitoring_effort}_AE_model{grid_size}_l{latent_dims}_img{image_size}.pth"
 if DEBUG:
     model_name = model_name.replace(".pth", "_debug.pth")
     epochs = EPOCHS_DEBUG
@@ -96,7 +99,7 @@ batch_size = 128
 learning_rate = 1e-4 * (batch_size / 64)  # scale learning rate with batch size
 epochs = 50
 warmup_epochs = 25  # Number of epochs to linearly increase learning rate (helps stabilize early training)
-beta_max = 0.01   # try 0.001, 0.01, 0.05, 0.1
+patience = 5  # Number of epochs to wait for improvement before early stopping
 
 if DEBUG:
     print(f"DEBUG MODE: Using only {N_DEBUG} tiles and training for {EPOCHS_DEBUG} epochs \n if saving enabled model name will be: {model_output_path.name}")
@@ -144,12 +147,25 @@ print(f"Applying image pipeline to training tiles and creating dataset...")
 images_tensor, rows_tensor, cols_tensor = image_pipeline_df(df_train_tiles, input_image_size_vae=image_size)  # type: ignore # Create dataset with preprocessing pipeline applied to each tile
 
 print(f"Dataset created: images tensor shape: {images_tensor.shape}, rows tensor shape: {rows_tensor.shape}, cols tensor shape: {cols_tensor.shape}")
-train_dataset = TensorDataset(images_tensor, rows_tensor, cols_tensor)  # Convert to TensorDataset for DataLoader
+# Split into train and val sets 
+val_split = 0.1
+n_val = int(len(images_tensor) * val_split)
+
+dataset = TensorDataset(images_tensor, rows_tensor, cols_tensor)  # Convert to TensorDataset for DataLoader
+train_dataset, val_dataset = torch.utils.data.random_split(dataset, [len(dataset) - n_val, n_val])
 
 train_loader = DataLoader(
     train_dataset,                     # dataset object
     batch_size=batch_size,
     shuffle=True,
+    num_workers=0,                   # set >0 later if you want
+    pin_memory=torch.cuda.is_available()
+)
+
+val_loader = DataLoader(
+    val_dataset,                     # dataset object
+    batch_size=batch_size,
+    shuffle=False,
     num_workers=0,                   # set >0 later if you want
     pin_memory=torch.cuda.is_available()
 )
@@ -265,11 +281,11 @@ plt.tight_layout(rect=(0, 0.03, 1, 0.95))  # Adjust layout to make room for titl
 plt.show()
 
 #%%###########################################################################
-#### VARIATIONAL AUTOENCODER (VAE) ARCHITECTURE, TRAINING, AND EVALUATION ####
+#### AUTOENCODER (AE) ARCHITECTURE, TRAINING, AND EVALUATION ####
 ##############################################################################
 
 ### Initialize model
-model = VariationalAutoencoder(
+model = Autoencoder(
         latent_dims = latent_dims,
         image_size = image_size,
         hidden_channels = hidden_channels,
@@ -284,9 +300,10 @@ print("Model architecture:")
 print(model)
 
 #%% Train model
-epoch_losses, recon_losses, kl_losses = [], [], []
-step_losses, step_recon_losses, step_kl_losses = [], [], []
-kl_per_dim_history = []
+epoch_losses, step_losses = [], []
+epoch_val_losses, step_val_losses = [], []
+best_val_loss = float("inf")
+patience_counter = 0
 
 model.train()
 
@@ -306,8 +323,6 @@ for epoch in range(epochs):
         g["lr"] = lr
 
     running_loss = 0.0
-    running_recon = 0.0
-    running_kl = 0.0
 
     for x, rows, cols in train_loader:
         x = x.to(device, non_blocking=True)
@@ -319,40 +334,50 @@ for epoch in range(epochs):
 
         # calculate reconstruction error
         x_hat = model(x, row=rows, col=cols)
-        
-        recon_per_tile = ((x - x_hat) ** 2).mean(dim=(1, 2, 3))
-        recon = recon_per_tile.mean()
-
-        kl_per_tile = model.encoder.kl / x.shape[0]
-
-        beta = beta_max * min(1.0, (epoch + 1) / warmup_epochs)
-
-        loss = recon + beta * kl_per_tile
+        loss = ((x - x_hat) ** 2).mean()
 
         # backpropagate and optimize
         loss.backward()
         opt.step()
         
         running_loss += loss.item()
-        running_recon += recon.item()
-        running_kl += kl_per_tile.item()
 
         # Log per-step losses (for plotting later)
         step_losses.append(loss.item())
-        step_recon_losses.append(recon.item())
-        step_kl_losses.append(kl_per_tile.item())
 
     # Per-epoch averages
     epoch_losses.append(running_loss / n_batches)
-    recon_losses.append(running_recon / n_batches)
-    kl_losses.append(running_kl / n_batches)
-    kl_per_dim_history.append(model.encoder.kl_per_dim.detach().cpu().numpy())
     
+    # Test set evaluation (using training set as proxy for now since we don't have a separate val set)
+    model.eval()
+    with torch.no_grad():
+        val_loss = 0.0
+        for x, rows, cols in val_loader:
+            x = x.to(device, non_blocking=True)
+            rows = rows.to(device, non_blocking=True)
+            cols = cols.to(device, non_blocking=True)
+
+            x_hat = model(x, row=rows, col=cols)
+            val_loss += ((x - x_hat) ** 2).mean().item()
+    
+    epoch_val_losses.append(val_loss / len(val_loader))
     avg_epoch_time = (time() - start_time) / (epoch + 1)
     expected_time_remaining = avg_epoch_time * (epochs - epoch - 1)
-    expected_finish_time = time() + expected_time_remaining
     
-    print(f"  loss={epoch_losses[-1]:.3f} (recon={recon_losses[-1]:.3f}, kl={kl_losses[-1]:.3f}, beta={beta:.2f}), average epoch time: {avg_epoch_time:.1f}s, expected finish time: {time():.1f}s + {expected_time_remaining/60:.1f}m = {expected_finish_time:.1f}s")
+    print(f"  loss={epoch_losses[-1]:.3f}, val_loss={epoch_val_losses[-1]:.3f}, average epoch time: {avg_epoch_time:.1f}s, expected time remaining: {int(expected_time_remaining // 60)}m {int(expected_time_remaining % 60)}s ")
+    
+    # Add patience early stopping
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        # best_model_state = copy.deepcopy(model.state_dict())
+        patience_counter = 0
+    else:
+        patience_counter += 1
+        print(f"  No improvement in validation loss for {patience_counter} epoch(s)")
+
+    if patience_counter >= patience:
+        print(f"Early stopping at epoch {epoch+1}")
+        break
     
 total_elapsed = time() - start_time
 
@@ -361,45 +386,26 @@ print(f"Training finished in {int(total_elapsed // 60)}m {int(total_elapsed % 60
 
 #%% Plot training curves
 # Plot loss curves
+
+steps_per_epoch = len(train_loader)
+epoch_indices = np.arange(1, len(epoch_losses) + 1)
+step_indices = np.linspace(0, len(epoch_losses), steps_per_epoch*len(epoch_losses))  # Thinned out step indices for visibility
+
 plt.figure(figsize=(8, 5))
-plt.plot(epoch_losses, label="Total loss")
-plt.plot(recon_losses, label="Reconstruction loss")
-plt.plot(kl_losses, label="KL loss")
-plt.yscale("log")
+
+# plot training loss 
+plt.plot(step_indices, step_losses, label="Per-step loss", alpha=0.5, linestyle='None', marker='o', markersize=3)
+plt.plot(epoch_indices, epoch_losses, label="Total loss")
+
+# plot validation loss 
+plt.plot(epoch_indices, epoch_val_losses, label="Validation loss", linestyle='--')
+
 plt.xlabel("Epoch")
 plt.ylabel("Loss")
 plt.title("Training loss curves")
 plt.grid(alpha=0.3)
 plt.legend()
 plt.show()
-
-# Plot per-step loss curves
-eps = 1e-12
-plt.figure(figsize=(10, 5))
-plt.plot(step_losses, label="Total loss", alpha=0.9)
-plt.plot(step_recon_losses, label="Reconstruction loss", alpha=0.8)
-plt.plot(step_kl_losses, label="KL loss", alpha=0.8)
-plt.yscale("log")
-plt.xlabel("Training step")
-plt.ylabel("Loss")
-plt.title("Training loss curves per step")
-plt.grid(alpha=0.3)
-plt.legend()
-plt.show()
-
-# Plot KL per latent dimension over epochs (only for VAE)
-if kl_per_dim_history and isinstance(model, VariationalAutoencoder):
-    kl_per_dim_history = np.array(kl_per_dim_history)  # shape: (epochs, latent_dims)
-
-    plt.figure(figsize=(8,5))
-    for i in range(kl_per_dim_history.shape[1]):
-        plt.plot(kl_per_dim_history[:, i], label=f"dim {i}")
-    plt.xlabel("Epoch")
-    plt.ylabel("KL per dim")
-    plt.title("KL divergence per latent dimension")
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.show()
 
 #%% save model checkpoint
 
@@ -413,23 +419,17 @@ checkpoint = {
     "epochs": epochs,
     "learning_rate": learning_rate,
     "epoch_losses": epoch_losses,
-    "recon_losses": recon_losses,
-    "kl_losses": kl_losses,
     "step_losses": step_losses,
-    "step_recon_losses": step_recon_losses,
-    "step_kl_losses": step_kl_losses,
-    "kl_per_dim_history": kl_per_dim_history
 }
 
 torch.save(checkpoint, model_output_path)
 print(f"Saved checkpoint to: {model_output_path}")
 
 #%% Load model checkpoint (if restarted kernel)
-
 if model_output_path.exists():
     print(f"Loading checkpoint from: {model_output_path}")
     checkpoint = torch.load(model_output_path, map_location=device, weights_only=False)
-    model = VariationalAutoencoder(
+    model = Autoencoder(
         latent_dims=checkpoint["latent_dim"],
         image_size=checkpoint["image_size"],
         hidden_channels=checkpoint["hidden_channels"],
@@ -461,7 +461,7 @@ all_mu = []
 
 with torch.no_grad():
     for x, rows, cols in train_loader_random_subset:
-        mu, logvar = model.encode(
+        mu = model.encode(
             x.to(device),
             row=rows.to(device),
             col=cols.to(device)
@@ -483,12 +483,18 @@ from sklearn.decomposition import PCA
 pca = PCA(n_components=2)
 z_pca = pca.fit_transform(all_mu)
 
-plt.figure(figsize=(8, 6))
-plt.scatter(z_pca[:, 0], z_pca[:, 1], alpha=0.5, s=10)
-plt.xlabel("PCA component 1")
-plt.ylabel("PCA component 2")
-plt.title("PCA of latent space distribution")
-plt.grid(alpha=0.3)
+plt.figure(figsize=(2, 2))
+plt.scatter(z_pca[:, 0], z_pca[:, 1], alpha=0.5, s=5)
+plt.xlabel("PCA 1")
+plt.ylabel("PCA 2")
+# plt.title("PCA of latent space distribution")
+plt.xlim(-5, 5)
+# plt.axis('equal')
+plt.ylim(-5, 5)
+plt.xticks([-4, -2, 0, 2, 4])
+plt.yticks([-4, -2, 0, 2, 4])
+
+plt.grid(alpha=0.7)
 
 print(f'all_mu.shape: {all_mu.shape}')
 
@@ -551,7 +557,7 @@ with torch.no_grad():
     empty_tile_batch = empty_tile.repeat(test_grid_size * test_grid_size, 1, 1, 1)  # shape: (test_grid_size^2, 1, H, W)
     
     # Single forward pass through encoder
-    mu, logvar = model.encode(empty_tile_batch, row=rows_all, col=cols_all)
+    mu = model.encode(empty_tile_batch, row=rows_all, col=cols_all)
     
     # Single forward pass through decoder
     tile_reconstructed_batch = model.decode(mu)  # shape: (test_grid_size^2, 1, H, W)
@@ -596,7 +602,6 @@ plt.suptitle("Reconstructed tiles from empty input across row/col positions", fo
 plt.tight_layout()
 plt.show()
 
-#%% Reconstruct the background image while split up in tiles
 
 
 #%% Model summary

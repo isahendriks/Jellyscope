@@ -13,13 +13,12 @@ import time
 from matplotlib.patches import Rectangle
 import gc
 
-from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score, confusion_matrix, ConfusionMatrixDisplay
-
 # matplotlib.use("TkAgg")  # Interactive backend so debug plots can open windows.
 import matplotlib.pyplot as plt
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
-from functions import find_local_maxima, flood_fill_region, get_manual_crops_from_labelme_json, Autoencoder, VariationalAutoencoder, OneClassScorer, TwoClassScorer, batch_run_inference, split_results_by_image, batch_extract_tiles_from_images, MahalanobisScorer, crops_overlap
+from BinaryClassification.functions import find_local_maxima, flood_fill_region, Autoencoder, VariationalAutoencoder, OneClassScorer, TwoClassScorer, split_results_by_image, batch_extract_tiles_from_images, MahalanobisScorer
+from BinaryClassification.models import *
 
 #%% Activate GPU
 print("="*40)
@@ -48,13 +47,12 @@ print("="*40)
 print(f"Using device:      {device}")
 
 #%% Define paths and parameters
-ROOT_DIR_C = r"C:\Users\Admin\Documents\Jellyscope\Training data\Binary_classifier"   
-ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Monitoring data"
-monitoring_effort = "Kristineberg_250915"  # for titles and saved model names, e.g. "kristineberg_251128"
-# images_folder = os.path.join(ROOT_DIR_R, monitoring_effort)
-# images_folder = os.path.join(ROOT_DIR_R, monitoring_effort)
-images_folder = os.path.join(ROOT_DIR_C, monitoring_effort, "test", "OG_images")
-output_folder = Path(os.path.join(ROOT_DIR_C, monitoring_effort, "test", "test_segmentation"))
+
+monitoring_effort = "Kristineberg_251001"  # options: "Original_new", "Original_old", "New_new", "New_old"
+ROOT_DIR_C = f"C:\\Users\\Admin\\Documents\\Jellyscope\\Training data\\class_classifier\\monitoring_data\\{monitoring_effort}"   
+
+images_folder = os.path.join(ROOT_DIR_C, "OG_images")
+output_folder = Path(os.path.join(ROOT_DIR_C, "OG_images_crops"))
 output_folder.mkdir(parents=True, exist_ok=True)
 
 tile_grid_size = 16
@@ -63,7 +61,11 @@ image_size = 128
 encoder = "AE"  # options: "VAE", "AE"
 scorer_mode = "binary"  # options: "one_class", "binary", "mahalanobis"
 offsets_norm = [0, 0.2, 0.4, 0.6, 0.8]  # relative offsets for tile grid (e.g. 0.2 means shift grid by 20% of tile size)
-best_threshold = 0.17
+best_threshold = 0.7305
+model_monitoring_effort = "Kristineberg_250915"  # monitoring effort used for training the VAE and scorer models (must match the folder name in BinaryClassification/models/)
+
+MAX_IMAGES_PER_SPECIES = 150
+MAX_CROPS_PER_IMAGE = 2
 
 IMAGE_SIZE_PX = 4512  # All images are square 4512x4512
 IMAGE_W = 91 # width of the image in mm
@@ -71,8 +73,8 @@ PXL_TO_MM = IMAGE_W / IMAGE_SIZE_PX  # conversion factor from pixels to mm
 PXL_TO_MM2 = PXL_TO_MM ** 2  # conversion factor from pixels^2 to mm^2
 tile_size = IMAGE_SIZE_PX // tile_grid_size
 
-MANUAL_ANNOTATIONS_AVAILABLE = True
-PLOT_DEBUG = True
+MANUAL_ANNOTATIONS_AVAILABLE = False
+PLOT_DEBUG = False
 SAVE_DEBUG_PLOTS = False
 SAVE_CROPS = True
 
@@ -82,26 +84,23 @@ crop_padding_pixels = 0
 
 offsets = [int(norm * tile_size) for norm in offsets_norm]
 
-# Load all images    
-# images_path = sorted(str(p) for p in Path(images_folder).glob("*.png"))
-
-# Load images in crop_metadata.csv to ensure we only test on images that have manual crops (and avoid accidentally loading any non-image files in the folder)
-if MANUAL_ANNOTATIONS_AVAILABLE:
-    manual_crops_csv = os.path.join(images_folder[:-10], f"tiles{tile_grid_size}_offsets{len(offsets_norm)}_labelme", "crops_metadata.csv")
-    manual_crops_metadata = pd.read_csv(manual_crops_csv)
-    images_in_metadata = manual_crops_metadata["image_path"].unique()
-    images_path = [p for p in images_in_metadata]
-else:
-    print("loading all images...")
-    images_path = sorted(str(p) for p in Path(images_folder).glob("*.png"))
-    print("loading all images... Done!", end='\r')
-
-N_TEST_IMAGES = None
-if N_TEST_IMAGES is not None and len(images_path) > N_TEST_IMAGES:
-    images_path = images_path[:N_TEST_IMAGES]
+# load images from subfolders (e.g. species subfolders) to ensure we get all images even if they are organized into subfolders    
+print("loading all images...", end='\r')
+images_path_all = sorted(str(p) for p in Path(images_folder).glob("**/*.png"))
+images_path = []
+species = [Path(p).parent.name for p in images_path_all]
+for sp in set(species):
+    count = species.count(sp)
+    if count > MAX_IMAGES_PER_SPECIES:
+        print(f"Limiting to {MAX_IMAGES_PER_SPECIES} images for species '{sp}' (original count: {count})")
+        sp_indices = [i for i, s in enumerate(species) if s == sp][:MAX_IMAGES_PER_SPECIES]
+        images_path.extend([images_path_all[i] for i in sp_indices])
+    else:
+        images_path.extend([p for p in images_path_all if Path(p).parent.name == sp])
+print("loading all images... Done!", end='\r')
 
 ### Load VAE model
-model_name = f"../models/{encoder}/{monitoring_effort}_{encoder}_model{tile_grid_size}_l{latent_dim}_img{image_size}.pth"
+model_name = f"../BinaryClassification/models/{encoder}/{model_monitoring_effort}_{encoder}_model{tile_grid_size}_l{latent_dim}_img{image_size}.pth"
 checkpoint_encoder = torch.load(model_name, map_location=device, weights_only=False)
 
 latent_dims = checkpoint_encoder.get("latent_dim")
@@ -182,7 +181,7 @@ min_manual_covered_pred_larger = 0.70   # predicted crop is larger: must cover 7
 min_manual_covered_pred_smaller = 0.90  # predicted crop is smaller: must cover 90% of manual crop (we want to be stricter about small predicted crops since they could easily fit inside a manual crop without really covering the important parts of it, whereas if the predicted crop is larger we are more lenient since it at least covers the entire manual crop even if it also includes a lot of extra area)
     
 ### Set batch sizes for processing (adjust based on GPU memory and image size)
-batch_size_images = 1  # Process 32 images per batch
+batch_size_images = 32  # Process 32 images per batch
 
 batch_size = 8912  # Process 8192 tiles per batch (adjust based on GPU memory)
 vae_image_size = 128
@@ -293,7 +292,7 @@ for image_idx, image_path_str in enumerate(images_path, start=1):
         # Process each image's results
         for batch_img_idx, (image_gray, image_path) in enumerate(zip(images_batch, image_paths_batch)):
             image_name = image_path.stem
-
+            species = image_path.parent.name
             predicted_crop_metadata = []
             manual_crop_metadata = []
             accepted = []
@@ -307,8 +306,7 @@ for image_idx, image_path_str in enumerate(images_path, start=1):
                     
             prob_map_small = result["prob_map_small"] # type: ignore  
             
-            # Find local maxima in the small-grid probability map to identify candidate regions
-            maxima_small = find_local_maxima(prob_map_small, peak_threshold/1.5)
+            maxima_small = find_local_maxima(prob_map_small, peak_threshold)
 
             # Convert each small-grid flood-filled region into a pixel crop bbox
             candidates = []
@@ -374,6 +372,7 @@ for image_idx, image_path_str in enumerate(images_path, start=1):
 
             # Pick the strongest peaks first
             candidates = sorted(candidates, key=lambda c: c["peak_val"], reverse=True)
+            candidates = candidates[:MAX_CROPS_PER_IMAGE]  # keep more candidates than max crops to allow for filtering by overlap and mean intensity
 
             accepted = []
             for cand in candidates:
@@ -443,67 +442,11 @@ for image_idx, image_path_str in enumerate(images_path, start=1):
                                     })
 
                 crop_counter += 1
-                
-            # --- Load manual crops for this image ---
-            manual_crop_metadata = []
-
-            if MANUAL_ANNOTATIONS_AVAILABLE:
-
-                mask_path = image_path.parent.parent / "manual_masks" / Path(image_name + ".json")
-                manual_crop_metadata = get_manual_crops_from_labelme_json(
-                    json_path=mask_path,
-                    image_shape=image_gray.shape,
-                    image_path=image_path,
-                    image_name=image_name,
-                    PXL_TO_MM2=PXL_TO_MM2
-                )
-
-                    
-                for i, crop in enumerate(manual_crop_metadata):
-                    crop["crop_id"] = len(predicted_crop_metadata) + i
-                    crop["source"] = crop.get("source", "manual")
-                    crop["matched_by_pred"] = False
-                    crop["label_manual"] = True
-                    crop["label_predicted"] = None
-
-                # initialize predicted crops
-                for crop in predicted_crop_metadata:
-                    crop["matched_by_pred"] = False
-                    crop["label_manual"] = False
-                    crop["label_predicted"] = None
-
-                # Match predicted and manual crops 
-                if MANUAL_ANNOTATIONS_AVAILABLE and predicted_crop_metadata and manual_crop_metadata:
-                    for pred_crop in predicted_crop_metadata:
-                        for manual_crop in manual_crop_metadata:
-                            if crops_overlap(pred_crop, manual_crop,min_manual_covered_pred_larger,min_manual_covered_pred_smaller):
-                                pred_crop["matched_by_pred"] = True
-                                pred_crop["label_manual"] = True
-                                manual_crop["matched_by_pred"] = True
-
-                #  Combine metadata 
-                image_crop_metadata = predicted_crop_metadata + manual_crop_metadata
-
-                # Final labels 
-                if MANUAL_ANNOTATIONS_AVAILABLE:
-                    for crop in image_crop_metadata:
-                        if crop["source"] == "predicted":
-                            crop["label_predicted"] = crop["peak_intensity"] >= peak_threshold
-                            if crop["label_manual"] and crop["label_predicted"]:
-                                crop["label"] = "TP"
-                            elif crop["label_manual"] and not crop["label_predicted"]:
-                                crop["label"] = "FN"
-                            elif not crop["label_manual"] and crop["label_predicted"]:
-                                crop["label"] = "FP"
-                            else:
-                                crop["label"] = "TN"
-
-                        elif crop["source"] == "manual":
-                            crop["label_predicted"] = None
-                            crop["label"] = "TP" if crop["matched_by_pred"] else "FN"                    
             
             
-            # Make subplot with all extracted crops
+            image_crop_metadata.extend(predicted_crop_metadata)
+                        
+                        # Make subplot with all extracted crops
             if len(image_crop_metadata) > 0 and (PLOT_DEBUG or SAVE_DEBUG_PLOTS):
                 ### Plot subplot with heatmaps and flood filled regions with red contour and final crop with green box for debugging
                 fig, ax = plt.subplots(1,2, figsize=(16, 8))
@@ -534,7 +477,13 @@ for image_idx, image_path_str in enumerate(images_path, start=1):
                             col = "green"
                             linestyle = "dashed"
                             alpha = 1
-                                        
+                    
+                    if source == "manual" and MANUAL_ANNOTATIONS_AVAILABLE:
+                        if label_predicted == True:
+                            col = "green"
+                            linestyle = "solid"
+                            alpha = 0.5
+                    
                     rect = Rectangle((crop_x0, crop_y0), crop_x1 - crop_x0, crop_y1 - crop_y0,
                                         edgecolor=col, facecolor="none", linewidth=2, alpha = alpha, linestyle=linestyle, label=crop['label'])
                     
@@ -567,43 +516,18 @@ for image_idx, image_path_str in enumerate(images_path, start=1):
                     
                 plt.close('all')
                 gc.collect()
-                        
-                # plot the true predictions
-                TPs = [crop for crop in image_crop_metadata if crop['label_manual'] == True and crop['label_predicted'] == True and crop['source'] == "predicted"]
-                FPs = [crop for crop in image_crop_metadata if crop['label_manual'] == False and crop['label_predicted'] == True and crop['source'] == "predicted"]
-                
-                Ps = TPs + FPs
-                if MANUAL_ANNOTATIONS_AVAILABLE and (len(Ps) > 0):
-                    fig, axes = plt.subplots(1, len(Ps), figsize = (len(Ps)* 8, 8))
-                    if len(Ps) == 1:
-                        axes = [axes]
-                    for idx, crop in enumerate(Ps):
-                        crop_y0, crop_x0, crop_y1, crop_x1 = crop["crop_y0"], crop["crop_x0"], crop["crop_y1"], crop["crop_x1"]
-                        crop_image = image_gray[crop_y0:crop_y1, crop_x0:crop_x1]
-                        axes[idx].imshow(crop_image, cmap="gray", vmin=0, vmax=255)
-                        axes[idx].set_title(f"Crop {idx+1}, peak={crop['peak_intensity']:.2f}, region_mean={crop['region_mean_intensity']:.2f}, label = {crop['label']}")
-                        axes[idx].axis("off")
-                    plt.suptitle(f"Extracted Crops from {image_name[13:23]} with species: {image_name[24:]}", fontsize=16)
-                    plt.show()
-
+            
             # save the new crops for this image
             batch_crop_metadata.extend(image_crop_metadata)
             
             if SAVE_CROPS:
-                # Create four folders, TN, TP, FN, FP, and save crops in corresponding folders based on their labels (for easier review of results)
-                if MANUAL_ANNOTATIONS_AVAILABLE:
-                    for folder in ["TN", "TP", "FN", "FP"]:
-                        folder_path = os.path.join(output_folder_crops, folder)
-                        os.makedirs(folder_path, exist_ok=True)                
-                else:
-                    folder_path = os.path.join(output_folder_crops, "predicted")
-                    os.makedirs(folder_path, exist_ok=True)
+
+                folder_path = os.path.join(output_folder_crops, species)
+                os.makedirs(folder_path, exist_ok=True)
                     
                 for crop in image_crop_metadata:
-                    if MANUAL_ANNOTATIONS_AVAILABLE:
-                        crop_name = f"{crop['label']}\\{crop['image_name']}_crop_{crop['crop_id']:03d}_area_{crop['region_size_mm2']}.png"
-                    else: 
-                        crop_name = f"predicted\\{crop['image_name']}_crop_{crop['crop_id']:03d}_area_{crop['region_size_mm2']}.png"
+
+                    crop_name = os.path.join(species, f"{crop['image_name']}_crop_{crop['crop_id']:03d}_area_{crop['region_size_mm2']}.png")
                     
                     crop_path = os.path.join(output_folder_crops, crop_name)
                     crop['crop_path'] = crop_path  # add crop path to metadata for later reference
@@ -611,7 +535,9 @@ for image_idx, image_path_str in enumerate(images_path, start=1):
                     crop_y0, crop_x0, crop_y1, crop_x1 = crop["crop_y0"], crop["crop_x0"], crop["crop_y1"], crop["crop_x1"]
                     crop_image = image_gray[crop_y0:crop_y1, crop_x0:crop_x1]
                     
-                    cv2.imwrite(crop_path, crop_image)
+                    ok = cv2.imwrite(crop_path, crop_image)
+                    if not ok:
+                        print(f"Error saving crop: {crop_path}")
                        
         # Save batch metadata to CSV (appending if file already exists)
         if len(batch_crop_metadata) > 0:
@@ -663,148 +589,21 @@ if total_images_processed > 0:
     
 print(f"\n✓ Complete! Total crops extracted: {crop_counter}")
 
-# %% Plot ROC curve for the extracted crops if labels are available (requires 'label' column in crop_metadata.csv)
-
-# Load metadata from CSV
-predicted_crops_csv = os.path.join(output_folder_crops, "crop_metadata.csv")
-df_predictions = pd.read_csv(predicted_crops_csv)
-segmentation_performance_summary = []
-
-# Calculate the ROC curve and precision recall
-threshold_metric = "peak_intensity"  # you can change this to "region_mean_intensity" or another metric if you want to see how it performs as a predictor
-
-fpr, tpr, roc_thresholds = roc_curve(df_predictions["label_manual"], df_predictions[threshold_metric])
-roc_auc = auc(fpr, tpr)
-
-precision, recall, pr_thresholds = precision_recall_curve(df_predictions["label_manual"], df_predictions[threshold_metric])
-average_precision = average_precision_score(df_predictions["label_manual"], df_predictions[threshold_metric])
-
-threshold_f05 = pr_thresholds[np.argmax((1 + 0.5**2) * (precision * recall) / (0.5**2 * precision + recall + 1e-8))]  # F0.5-score optimal threshold
-threshold_f1 = pr_thresholds[np.argmax(2 * (precision * recall) / (precision + recall + 1e-8))]  # F1-score optimal threshold
-threshold_f2 = pr_thresholds[np.argmax((1 + 2**2) * (precision * recall) / (2**2 * precision + recall + 1e-8))]  # F2-score optimal threshold
-threshold_f3 = pr_thresholds[np.argmax((1 + 3**2) * (precision * recall) / (3**2 * precision + recall + 1e-8))]  # F3-score optimal threshold
-
-youden_index = tpr - fpr
-threshold_youden = roc_thresholds[np.argmax(youden_index)]  # Youden's J statistic optimal threshold
-
-threshold = threshold_f2  # you can choose which threshold to use based on the precision-recall tradeoff you want (e.g. F1 for balanced, F0.5 for more precision, F2 for more recall)
-df_predictions["label_predicted"] = (df_predictions[threshold_metric] >= threshold).astype(int)
-cm = confusion_matrix(df_predictions["label_manual"], df_predictions["label_predicted"], labels=[1,0])
-
-roc_thrsh_idx = np.argmin(np.abs(roc_thresholds - threshold))
-pr_thrsh_idx = np.argmin(np.abs(pr_thresholds - threshold))
-
-print(f"Average Precision: {average_precision:.4f}")
-print(f"AUC: {roc_auc:.4f}")
-   
-# Plot the ROC curve
-plt.figure(figsize=(8, 8))
-plt.plot(fpr, tpr, color="blue", label=f"ROC curve (AUC = {roc_auc:.4f})")
-plt.scatter(fpr[roc_thrsh_idx], tpr[roc_thrsh_idx], color="red", label=f"Chosen threshold = {threshold:.4f}", zorder=5)
-plt.plot([0, 1], [0, 1], color="red", linestyle="--")
-plt.xlim([0.0, 1.0])
-plt.ylim([0.0, 1.05])
-plt.grid()
-plt.xlabel("False Positive Rate", fontweight="bold", fontsize = 14)
-plt.ylabel("True Positive Rate", fontweight="bold", fontsize = 14)
-plt.title(f"ROC Curve for Predicted Crops vs Manual Crops", fontweight="bold", fontsize=18)
-plt.legend(loc="lower right", fontsize=14)
-plt.xticks(fontsize=12)
-plt.yticks(fontsize=12)
-plt.show()
-    
-# Plot precision-recall curve
-plt.figure(figsize=(8, 8))
-plt.plot(recall, precision, color="blue", label=f"Precision-Recall curve (AP = {average_precision:.4f})")
-plt.scatter(recall[pr_thrsh_idx], precision[pr_thrsh_idx], color="red", label=f"Chosen threshold = {threshold:.4f}", zorder=5)
-plt.xlim([0.0, 1.0])
-plt.ylim([0.0, 1.05])
-plt.grid()
-plt.xlabel("Recall")
-plt.ylabel("Precision")
-plt.title(f"Precision-Recall Curve for Predicted Crops vs Manual Crops")
-plt.legend(loc="lower left")
-
-# Plot confusion matrix of correct vs incorrect predictions
-disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Obs", "Empty"])
-disp.plot(cmap="Blues", values_format="d")
-# increase size of numbers in confusion matrix
-for text in plt.gca().texts:
-    text.set_fontsize(14)
-plt.gca().images[-1].colorbar.remove()
-plt.title(f"Confusion Matrix for Predicted Crops vs Manual Crops")
-
-plt.xticks(fontsize=12, rotation=0)
-plt.yticks(fontsize=12, rotation=90)
-plt.xlabel("Predicted Label", fontweight="bold", fontsize=14)
-plt.ylabel("True Label", fontweight="bold", fontsize=14)
-plt.title("")
-plt.show()    
-
-#%% Plot False positives
-FPs = df_predictions[(df_predictions["label_manual"] == 0) & (df_predictions["label_predicted"] == 1)]
-FNs = df_predictions[(df_predictions["label_manual"] == 1) & (df_predictions["label_predicted"] == 0)]
-TPs = df_predictions[(df_predictions["label_manual"] == 1) & (df_predictions["label_predicted"] == 1)]
-TNs = df_predictions[(df_predictions["label_manual"] == 0) & (df_predictions["label_predicted"] == 0)]
-
-max_to_show = 10
-max_per_row = 5
-
-if len(FNs) > 0:
-    FNs = FNs.head(max_to_show)
-    rows = (len(FNs) - 1) // max_per_row + 1
-    cols = min(len(FNs), max_per_row)
-    fig, axes = plt.subplots(rows, cols, figsize = (cols * 4, rows * 4))
-    axes = axes.flatten() if len(FNs) > 1 else [axes]
-    for ax, crop in zip(axes, FNs.itertuples()):
-        crop_image = cv2.imread(crop.crop_path, cv2.IMREAD_GRAYSCALE)
-        ax.imshow(crop_image, cmap="gray", vmin=0, vmax=255)
-        ax.set_title(f"PI: {crop.peak_intensity:.2f}, RMI: {crop.region_mean_intensity:.2f}")
-        ax.axis("off")
-    plt.suptitle(f"False Negative Crops (Predicted negative but labeled positive) with {threshold_metric} < {threshold:.4f}", fontsize=16)
-    plt.show()
-
-if len(TPs) > 0:
-    TPs = TPs.head(max_to_show)
-    rows = (len(TPs) - 1) // max_per_row + 1
-    cols = min(len(TPs), max_per_row)
-    fig, axes = plt.subplots(rows, cols, figsize = (cols * 4, rows * 4))
-    axes = axes.flatten() if len(TPs) > 1 else [axes]
-    for ax, crop in zip(axes, TPs.itertuples()):
-        crop_image = cv2.imread(crop.crop_path, cv2.IMREAD_GRAYSCALE)
-        ax.imshow(crop_image, cmap="gray", vmin=0, vmax=255)
-        ax.set_title(f"PI: {crop.peak_intensity:.2f}, RMI: {crop.region_mean_intensity:.2f}")
-        ax.axis("off")
-    plt.suptitle(f"True Positive Crops (Predicted positive and labeled positive) with {threshold_metric} >= {threshold:.4f}", fontsize=16)
-    plt.show()
-
-if len(FPs) > 0:
-    FPs = FPs.head(max_to_show)
-    rows = (len(FPs) - 1) // max_per_row + 1
-    cols = min(len(FPs), max_per_row)
-    fig, axes = plt.subplots(rows, cols, figsize = (cols * 4, rows * 4))
-    axes = axes.flatten() if len(FPs) > 1 else [axes]
-    for ax, crop in zip(axes, FPs.itertuples()):
-        crop_image = cv2.imread(crop.crop_path, cv2.IMREAD_GRAYSCALE)
-        ax.imshow(crop_image, cmap="gray", vmin=0, vmax=255)
-        ax.set_title(f"PI: {crop.peak_intensity:.2f}, RMI: {crop.region_mean_intensity:.2f}")
-        ax.axis("off")
-    plt.suptitle(f"False Positive Crops (Predicted positive but labeled negative) with {threshold_metric} >= {threshold:.4f}", fontsize=16)
-    plt.show()
-
-if len(TNs) > 0:
-    TNs = TNs.head(max_to_show)
-    rows = (len(TNs) - 1) // max_per_row + 1
-    cols = min(len(TNs), max_per_row)
-    fig, axes = plt.subplots(rows, cols, figsize = (cols * 4, rows * 4))
-    axes = axes.flatten() if len(TNs) > 1 else [axes]
-    for ax, crop in zip(axes, TNs.itertuples()):
-        crop_image = cv2.imread(crop.crop_path, cv2.IMREAD_GRAYSCALE)
-        ax.imshow(crop_image, cmap="gray", vmin=0, vmax=255)
-        ax.set_title(f"PI: {crop.peak_intensity:.2f}, RMI: {crop.region_mean_intensity:.2f}")
-        ax.axis("off")
-    plt.suptitle(f"True Negative Crops (Predicted negative and labeled negative) with {threshold_metric} < {threshold:.4f}", fontsize=16)
-    plt.show()
 
 
-# %%
+# %% plot N example images with their species  name
+
+N = 5
+n_species = len(set(p.parent.name for p in Path(images_folder).glob("**/*.png")))
+fig, axes = plt.subplots(N, n_species, figsize=(n_species * 4, N*4))
+
+for col_idx, species in enumerate(sorted(set(p.parent.name for p in Path(images_folder).glob("**/*.png")))):
+    species_images = sorted(p for p in Path(images_folder).glob(f"**/{species}/*.png"))
+    for row_idx in range(N):
+        if row_idx < len(species_images):
+            img = cv2.imread(str(species_images[row_idx]), cv2.IMREAD_GRAYSCALE)
+            axes[row_idx, col_idx].imshow(img, cmap="gray", vmin=0, vmax=255)
+            axes[row_idx, col_idx].set_title(f"{species}")
+            axes[row_idx, col_idx].axis("off")
+        else:
+            axes[row_idx, col_idx].axis("off")

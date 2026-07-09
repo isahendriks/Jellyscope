@@ -1,4 +1,5 @@
 #%% Import packages
+import os
 import re
 from pathlib import Path
 import shutil
@@ -11,14 +12,14 @@ print("=" * 60)
 
 
 #%% Define user parameters
-monitoring_effort = "Kristineberg_251128"# "Kristineberg_250915" #"Kristineberg_251128"
+monitoring_effort = "Kristineberg_251001"# "Kristineberg_250915" #"Kristineberg_251128"
 
 ROOT_C = r"C:\\Users\\Admin\\Documents\\Jellyscope"
 ROOT_R = r"R:\\LU24A1037-Jellyscope\\Jellyscope"
 
 folder_crops = f"{ROOT_R}\\Training data\\Class_classifier\\Monitoring_training_data\\Original_new"
-source_folder = f"{ROOT_R}\\Monitoring data\\{monitoring_effort}"  # Folder containing the original images to match against (e.g., OG_images folder for the same monitoring effort)
-output_folder = f"{ROOT_R}\\Training data\\Binary_classifier\\{monitoring_effort}\\test\\OG_images"
+source_folder = f"{ROOT_R}\\Monitoring data\\{monitoring_effort}\\gain20"  # Folder containing the original images to match against (e.g., OG_images folder for the same monitoring effort)
+output_folder = f"{ROOT_C}\\Training data\\class_classifier\\monitoring_data\\{monitoring_effort}\\OG_images"  # Folder to save the matched original images
 
 # subfolders_source = [f for f in Path(source_folder).iterdir() if f.is_dir()]  # List of subfolders in the source folder
 # subfolders_source_keep = ["gain10", "gain10_nobgsub"]  # List of subfolder names to keep (e.g., those containing the dates of interest)
@@ -71,11 +72,12 @@ print(f"\n Found a total of {len(df_matches)} images matching the date(s) across
 for idx, row in df_matches.iterrows():
     source_path = row["image_path"]
     species_name = row["species"]
-    image_name = row["image_name"]
+    image_name = row["image_name"]+'.png'  # Add the .png extension back to the image name
     
     # Create a new image name by appending the species name to the original image name
-    new_image_name = f"{image_name}_{species_name}.png"
-    destination_path = Path(output_folder).joinpath(Path(new_image_name))
+    destination_folder = Path(output_folder).joinpath(Path(species_name))
+    os.makedirs(destination_folder, exist_ok=True)  # Create the species subfolder if it doesn't exist
+    destination_path = Path(destination_folder).joinpath(Path(image_name))
     
     # Copy the original image to the output folder with the new name
     shutil.copy(source_path, destination_path)
