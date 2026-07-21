@@ -4,42 +4,36 @@ import numpy as np
 import cv2
 import os
 import time
-import skimage
-from collections import deque
+# import skimage
 import gc
 import psutil
 
 ### ==========================
 ### Recording parameters
 ### ==========================
-ACQUIRE_COUNT = 800 # for long recording, <10000, for short recording 
-FRAME_SKIP = 3 # Seconds/frame
+ACQUIRE_COUNT = 100 # for long recording, <10000, for short recording 
+FRAME_SKIP = 1 # Seconds/frame
 
-SAVE_PATH = "/media/jellyfish/PortableSSD/test_251111"
+SAVE_PATH = "jetson_firstrecordingattempt_0721"
+image_type = "png"
 #SAVE_PATH = "/media/jellyfish/PortableSSD/Training_data/Luidia_sarsia"
 
 IMG_NAME_PREFIX = "img_"
 GAIN_DB = 20.0 # hardware gain
 
-ENABLE_SAVE = True
+ENABLE_SAVE = False
+if ENABLE_SAVE:
+    # Check if the save path exists, if not create it
+    if not os.path.exists(SAVE_PATH):
+        os.makedirs(SAVE_PATH)
+    print(f"Saving images to {SAVE_PATH}")
 
-### Background subtraction settings - in progress, keep to False
-BG_SUB = False
-BACKGROUND_FRAMES = 50 # size of rolling median
-BACKGROUND_SUBSAMPLE = 20 # subsample to compute rolling median from 
-DOWNSAMPLE_FACTOR = 8 # downsample when storing median
-bg_file = "bg_buffer.npy"
-
+ENABLE_LIVE_STREAM = True
+STREAM_PORT = 8080 # view at http://<jetson-ip>:8080/ (or VS Code's forwarded port)
 ### Image processing settings
-MEDIAN_KERNEL_SIZE = 3 # Median calculation kernel, can be adjusted,for denoising
-POST_GAIN = 1 # only for faints
-GAMMA = 0.7 # enhance image, can be adjusted
-CLAHE_CLIP = 0.01 # clahe parameter, can be adjusted
-CLAHE_KERNEL = 512 # Clahe parameter, can be adjusted
 HDR_MAX = 4094 # should not be changed!!!!
 
 ### Live display settings, false for long term monitoring
-ENABLE_LIVE_STREAM = True
 
 # shouldn't have to change but you can
 disp_scale = 10 # Downscale for display [%]
@@ -87,45 +81,80 @@ nodemap.ExposureMode.from_string("TriggerWidth")
 nodemap.TriggerMode.from_string("On")
 nodemap.PixelFormat.from_string("Mono12p")
 
-dark_frame = cv2.imread("bkg.png", cv2.IMREAD_UNCHANGED)
-print("dtype:", dark_frame.dtype)
-dark_frame = dark_frame.astype(np.float32)
-
-if BG_SUB:
-    if os.path.exists(bg_file):
-        bg_buffer = np.load(bg_file)
-        bg_buffer = deque(bg_buffer, maxlen=BACKGROUND_FRAMES)
-    else:
-        bg_buffer = deque(maxlen=BACKGROUND_FRAMES)
-        print('made empty buffer')
-
 device.start_acquisition()
+
 print("Acquisition started.")
 
+stop_event = None
 if ENABLE_LIVE_STREAM:
-    cv2.namedWindow("Live Stream", cv2.WINDOW_NORMAL)
-    print("Live stream enabled. Press ESC to stop early.")
+    import threading
+    from flask import Flask, Response
+
+    latest_frame_lock = threading.Lock()
+    latest_frame_jpeg = None
+    stop_event = threading.Event()
+
+    flask_app = Flask(__name__)
+
+    @flask_app.route("/")
+    def _stream_index():
+        return (
+            '<html><body style="margin:0;background:#000;height:100vh;'
+            'display:flex;align-items:center;justify-content:center">'
+            '<img src="/stream" style="max-width:100vw;max-height:100vh;object-fit:contain">'
+            '<button onclick="this.innerText=\'Stopping...\';this.disabled=true;'
+            "fetch('/stop',{method:'POST'})\" "
+            'style="position:fixed;top:16px;left:16px;padding:12px 20px;font-size:16px;'
+            'background:#c0392b;color:#fff;border:none;border-radius:6px;cursor:pointer">'
+            "Stop Recording</button>"
+            "</body></html>"
+        )
+
+    @flask_app.route("/stream")
+    def _stream_feed():
+        def generate():
+            while True:
+                with latest_frame_lock:
+                    frame = latest_frame_jpeg
+                if frame is not None:
+                    yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+                time.sleep(0.05)
+        return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+    @flask_app.route("/stop", methods=["POST"])
+    def _stream_stop():
+        stop_event.set()
+        return "", 204
+
+    threading.Thread(
+        target=lambda: flask_app.run(host="0.0.0.0", port=STREAM_PORT, debug=False, use_reloader=False),
+        daemon=True,
+    ).start()
+    print(f"Live stream enabled at http://<jetson-ip>:{STREAM_PORT}/")
 
 time_counter = 0 # counts time (1s per trigger)
 frame_counter = 0 # counts actually recorded frames
 saved_counter = 0 # counts saved frames
 
 background_median_full = None
-waiting_time = (FRAME_SKIP + 1) * 1000
+waiting_time = (FRAME_SKIP + 2) * 1000
 
 process = psutil.Process()
 
 try:
-    while saved_counter < ACQUIRE_COUNT or ACQUIRE_COUNT == None:
+    while (saved_counter < ACQUIRE_COUNT or ACQUIRE_COUNT == None) and not (stop_event and stop_event.is_set()):
         image = device.get_next_image(waiting_time)
+
         if image is None:
             print("No image returned, trigger issue")
             continue
 
         time_counter += 1
+
         if time_counter % FRAME_SKIP != 0:
             image.dispose()
             continue
+
         if image.is_incomplete:
             print(f"Image {image.frame_id} incomplete.")
             image.dispose()
@@ -140,94 +169,38 @@ try:
         p = (ctypes.c_uint16 * size).from_address(int(image12.get_data()))
         
         img_array = np.ctypeslib.as_array(p).reshape((height, width)).astype(np.float32)
+        image12.dispose()
+        del p, image12
 
-        img_array = np.subtract(img_array, dark_frame, out=img_array)
+        # img_array = np.subtract(img_array, dark_frame, out=img_array)
         img_array = np.clip(img_array, 1.0, HDR_MAX)
 
-        # Spatial median denoising
-        img_denoised = cv2.medianBlur(img_array.astype(np.uint16), MEDIAN_KERNEL_SIZE).astype(np.float32)
-
-        # Background subtraction
-        if BG_SUB:
-            img_small = cv2.resize(img_denoised, (width//DOWNSAMPLE_FACTOR, height//DOWNSAMPLE_FACTOR), interpolation=cv2.INTER_LINEAR)
-            bg_buffer.append(img_small)
-
-            if len(bg_buffer) == BACKGROUND_FRAMES:
-                # Compute median on downsampled frames
-                idx = np.random.choice(len(bg_buffer), size=BACKGROUND_SUBSAMPLE, replace=False)
-                subset = [bg_buffer[i] for i in idx]
-                bg_small_median = np.median(np.stack(subset, axis=0), axis=0)
-
-                # Upsample to full resolution
-                background_median_full = cv2.resize(bg_small_median, (width, height), interpolation=cv2.INTER_LINEAR)
-
-                # delete for memory management
-                gc.collect()
-                del subset, bg_small_median
-            if background_median_full is not None:
-                img_bg_subtracted = img_denoised - background_median_full
-                img_bg_subtracted = np.clip(img_bg_subtracted, 0, HDR_MAX)
-            else:
-                img_bg_subtracted = img_denoised
-                print("Background calculating " + str(len(bg_buffer)) + "/" + str(BACKGROUND_FRAMES))
-        else:
-            img_bg_subtracted = img_denoised
-
-        # Gamma / post-gain
-        img_norm = img_bg_subtracted / HDR_MAX
-        img_gamma = np.clip(np.power(img_norm, GAMMA) * POST_GAIN, 0.0, 1.0)
-
-        # CLAHE
-        img_clahe = skimage.exposure.equalize_adapthist(
-            (img_gamma * HDR_MAX).astype(np.uint16),
-            clip_limit=CLAHE_CLIP,
-            nbins=4096,
-            kernel_size=CLAHE_KERNEL
-        )
-        img_clahe = np.clip(img_clahe, 0.0, 1.0)
-
-        # HDR -> LDR
-        img_to_save = (img_clahe * 255).astype(np.uint8)
-
-        # Save frame
-        if background_median_full is not None or BG_SUB is False:
-            timestamp = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time()*1000)%1000:03d}"
-            saved_counter+=1
-            
-            if ENABLE_SAVE:
-                filename = f"{IMG_NAME_PREFIX}{timestamp}.png"
-                output_path = os.path.join(SAVE_PATH, filename)
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                cv2.imwrite(output_path, img_to_save)
-                print(f"saved im {saved_counter}/{ACQUIRE_COUNT} to {filename}")
-            else:
-                print(f"recorded im {saved_counter}/{ACQUIRE_COUNT}")
+        img_to_save = img_array.astype(np.uint16)
 
         # Live display
         if ENABLE_LIVE_STREAM:
-            display_frame = cv2.resize(img_to_save, (0,0), fx=disp_scale/100, fy=disp_scale/100, interpolation=cv2.INTER_AREA)
-            if BG_SUB and background_median_full is None:
-                cv2.putText(display_frame, f"BG: {len(bg_buffer)}/{BACKGROUND_FRAMES}", (dispx,dispy1), font, font_scale, color, thickness)
-                cv2.putText(display_frame, f"Computing BG",(dispx, dispy2), font, font_scale, color, thickness)
-            elif BG_SUB and background_median_full is not None:
-                cv2.putText(display_frame, f"Frame: {frame_counter}/{ACQUIRE_COUNT}", (dispx,dispy1), font, font_scale, color, thickness)
-                cv2.putText(display_frame, f"BG Ready",(dispx, dispy2), font, font_scale, color, thickness)
-            else:
-                cv2.putText(display_frame, f"Frame: {frame_counter}/{ACQUIRE_COUNT}", (dispx,dispy1), font, font_scale, color, thickness)
-                cv2.putText(display_frame, "BG sub disabled",(dispx, dispy2), font, font_scale, color, thickness)
-
+            img_to_display = np.clip(img_array * (255.0 / HDR_MAX), 0, 255).astype(np.uint8)
+            display_frame = cv2.resize(img_to_display, (0,0), fx=disp_scale/100, fy=disp_scale/100, interpolation=cv2.INTER_AREA)
+            cv2.putText(display_frame, f"Frame: {frame_counter}/{ACQUIRE_COUNT}", (dispx,dispy1), font, font_scale, color, thickness)
             cv2.putText(display_frame, time.strftime("%H:%M:%S"), (dispx, dispy3), font, font_scale, color, thickness)
-            cv2.imshow("Live Stream", display_frame)
-            if cv2.waitKey(1) == 27:
-                image.dispose()
-                break
+            ok, encoded = cv2.imencode(".jpg", display_frame)
+            if ok:
+                with latest_frame_lock:
+                    latest_frame_jpeg = encoded.tobytes()
+
+
+        if ENABLE_SAVE:
+            filename = os.path.join(SAVE_PATH, f"{IMG_NAME_PREFIX}{saved_counter:05d}.{image_type}")
+            cv2.imwrite(filename, img_to_save)
+            saved_counter += 1
 
         # Memory check & cleanup
         if frame_counter % 100 == 0:
             gc.collect()
 
         image.dispose()
-        del image, img_array, img_denoised, img_bg_subtracted, img_norm, img_gamma, img_clahe, img_to_save
+        print(f"[Frame {frame_counter}] Saved: {saved_counter}/{ACQUIRE_COUNT} | Time: {time.strftime('%H:%M:%S')} | Memory usage: {process.memory_info().rss / 1e6:.1f} MB", end = '\r', flush=True)
+        del image, img_array
 
 finally:
     device.stop_acquisition()
@@ -236,11 +209,5 @@ finally:
 
     mem_mb = process.memory_info().rss / 1e6
     print(f"[Stopped at Frame {frame_counter}] With Memory usage: {mem_mb:.1f} MB")
- 
-    
-    if BG_SUB:
-        np.save(bg_file, bg_buffer)
-        
-    if ENABLE_LIVE_STREAM:
-        cv2.destroyAllWindows()
+
     print("Acquisition stopped, resources released.")

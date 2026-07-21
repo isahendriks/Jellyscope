@@ -96,6 +96,7 @@ echo "==> Step 6: install torch (prerelease cu132) -- the line that actually wor
 # --pre is REQUIRED (wheels are prerelease). --extra-index-url (not --index-url)
 # so numpy and friends still resolve from PyPI.
 python -m pip install --pre torch --extra-index-url "${CU_INDEX}"
+# pip install --pre torch --index-url "${CU_INDEX}" 
 
 echo "==> Step 7: verify torch on the GPU BEFORE adding torchvision"
 python - <<'PY'
@@ -114,7 +115,7 @@ PY
 
 echo "==> Step 8: torchvision (only after torch passes)"
 python -m pip install --pre torchvision --extra-index-url "${CU_INDEX}"
-# pip install --pre torch --index-url "${CU_INDEX}" -v
+
 
 echo "==> Step 9: common packages + Jupyter kernel"
 python -m pip install numpy pillow matplotlib jupyterlab ipykernel
