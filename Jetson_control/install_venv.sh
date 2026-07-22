@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 #
+# This is a modified version of the NVIDIA Jetson PyTorch install script foud on:
+# It is aimed at installing PyTorch on JetPack 7.2 for Jetson Orin NX 16GB (sm_87), CUDA 13.2, Python 3.12.
+# it was last used on 21/07/2026 
 # PyTorch on JetPack 7.2 for Jetson Orin NX 16GB (sm_87), CUDA 13.2, Python 3.12.
 # The working, undocumented path: prerelease cu132 aarch64 wheels.
 #

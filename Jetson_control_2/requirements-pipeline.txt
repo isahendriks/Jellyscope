@@ -1,0 +1,6 @@
+# Additional dependencies for the Jetson_control_2 pipeline, layered into the
+# existing Jetson_control/.venv-jellyscope venv (torch, torchvision, opencv-python,
+# itala, Flask, psutil are already installed there).
+kornia
+scipy   # required by ImagePipeline/BinaryClassification/functions.py (maximum_filter)
+pandas  # required by ImagePipeline/BinaryClassification/functions.py
