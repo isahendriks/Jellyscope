@@ -1,0 +1,4 @@
+{
+    "python.analysis.enableTroubleshootMissingImports": true,
+    "workbench.settings.openDefaultSettings": true
+}
