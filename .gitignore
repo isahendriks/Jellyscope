@@ -34,6 +34,9 @@ wandb/
 **/models/
 **/logs/
 
+# TensorRT export/calibration/build artifacts (Jetson_control_2 INT8 pipeline)
+Jetson_control_2/trt/
+
 # Data files (optional - if you don't want to track large datasets)
 *.png
 *.jpg
