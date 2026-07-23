@@ -30,6 +30,14 @@ if ENABLE_SAVE:
 
 ENABLE_LIVE_STREAM = True
 STREAM_PORT = 8080 # view at http://<jetson-ip>:8080/ (or VS Code's forwarded port)
+
+# Strobe controller (Opto Engineering LTDVE1CH-40F) exposes temperature over
+# Modbus/TCP -- registers 206/207 per its instruction manual section 14.2.41-42.
+STROBE_IP = "192.168.0.32"
+STROBE_MODBUS_PORT = 502
+STROBE_MODBUS_UNIT = 32
+STROBE_TEMP_POLL_INTERVAL = 2.0 # seconds
+
 ### Image processing settings
 HDR_MAX = 4094 # should not be changed!!!!
 
@@ -37,17 +45,6 @@ HDR_MAX = 4094 # should not be changed!!!!
 
 # shouldn't have to change but you can
 disp_scale = 10 # Downscale for display [%]
-font = cv2.FONT_HERSHEY_SIMPLEX
-font_scale = 10
-thickness = 10
-font_scale = int(font_scale*(disp_scale/100))
-thickness = int(thickness*(disp_scale/100))
-color = (255, 255, 255)
-
-dispx = int(80*(disp_scale/100))
-dispy1 = int(300*(disp_scale/100))
-dispy2 = int(600*(disp_scale/100))
-dispy3 = int(900*(disp_scale/100))
 
 ### ==========================
 ### Initialize camera
@@ -88,11 +85,47 @@ print("Acquisition started.")
 stop_event = None
 if ENABLE_LIVE_STREAM:
     import threading
-    from flask import Flask, Response
+    from flask import Flask, Response, jsonify
+    from pymodbus.client import ModbusTcpClient
 
     latest_frame_lock = threading.Lock()
     latest_frame_jpeg = None
     stop_event = threading.Event()
+
+    status_lock = threading.Lock()
+    status = {
+        "frame": 0, "total": ACQUIRE_COUNT, "saved": 0,
+        "camera_c": None, "strobe_converter_c": None, "strobe_driver_c": None,
+    }
+    camera_temp_supported = True
+
+    def _to_signed16(value):
+        return value - 65536 if value > 32767 else value
+
+    def _poll_strobe_temperatures():
+        client = ModbusTcpClient(STROBE_IP, port=STROBE_MODBUS_PORT)
+        warned = False
+        while not stop_event.is_set():
+            try:
+                if not client.connected:
+                    client.connect()
+                rr = client.read_holding_registers(address=206, count=2, device_id=STROBE_MODBUS_UNIT)
+                if rr.isError():
+                    raise IOError(str(rr))
+                converter_raw, driver_raw = rr.registers
+                with status_lock:
+                    status["strobe_converter_c"] = _to_signed16(converter_raw) * 0.1
+                    status["strobe_driver_c"] = _to_signed16(driver_raw) * 0.1
+                warned = False
+            except Exception as exc:
+                client.close()
+                if not warned:
+                    print(f"Strobe controller temperature unavailable: {exc}")
+                    warned = True
+            stop_event.wait(STROBE_TEMP_POLL_INTERVAL)
+        client.close()
+
+    threading.Thread(target=_poll_strobe_temperatures, daemon=True).start()
 
     flask_app = Flask(__name__)
 
@@ -107,8 +140,31 @@ if ENABLE_LIVE_STREAM:
             'style="position:fixed;top:16px;left:16px;padding:12px 20px;font-size:16px;'
             'background:#c0392b;color:#fff;border:none;border-radius:6px;cursor:pointer">'
             "Stop Recording</button>"
+            '<pre id="status" style="position:fixed;top:76px;left:16px;margin:0;'
+            'padding:10px 14px;font-size:16px;line-height:1.4;color:#fff;'
+            'background:rgba(0,0,0,0.55);border-radius:6px;white-space:pre"></pre>'
+            "<script>"
+            "async function updateStatus(){"
+            "try{"
+            "const d=await (await fetch('/status')).json();"
+            "const fmt=(v)=>v===null?'N/A':v.toFixed(1)+'C';"
+            "document.getElementById('status').textContent="
+            "`Frame: ${d.frame}/${d.total}  Saved: ${d.saved}\\n`+"
+            "`Cam: ${fmt(d.camera_c)}  Strobe: ${fmt(d.strobe_driver_c)}`+"
+            "` (conv ${fmt(d.strobe_converter_c)})\\n${d.time}`;"
+            "}catch(e){}"
+            "}"
+            "updateStatus();setInterval(updateStatus,1000);"
+            "</script>"
             "</body></html>"
         )
+
+    @flask_app.route("/status")
+    def _stream_status():
+        with status_lock:
+            payload = dict(status)
+        payload["time"] = time.strftime("%H:%M:%S")
+        return jsonify(payload)
 
     @flask_app.route("/stream")
     def _stream_feed():
@@ -179,10 +235,20 @@ try:
 
         # Live display
         if ENABLE_LIVE_STREAM:
+            if camera_temp_supported:
+                try:
+                    with status_lock:
+                        status["camera_c"] = nodemap.DeviceTemperature.value
+                except Exception as exc:
+                    camera_temp_supported = False
+                    print(f"Camera temperature unavailable: {exc}")
+
+            with status_lock:
+                status["frame"] = frame_counter
+                status["saved"] = saved_counter
+
             img_to_display = np.clip(img_array * (255.0 / HDR_MAX), 0, 255).astype(np.uint8)
             display_frame = cv2.resize(img_to_display, (0,0), fx=disp_scale/100, fy=disp_scale/100, interpolation=cv2.INTER_AREA)
-            cv2.putText(display_frame, f"Frame: {frame_counter}/{ACQUIRE_COUNT}", (dispx,dispy1), font, font_scale, color, thickness)
-            cv2.putText(display_frame, time.strftime("%H:%M:%S"), (dispx, dispy3), font, font_scale, color, thickness)
             ok, encoded = cv2.imencode(".jpg", display_frame)
             if ok:
                 with latest_frame_lock:

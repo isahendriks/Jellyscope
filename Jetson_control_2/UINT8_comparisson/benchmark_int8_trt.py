@@ -23,8 +23,11 @@ TensorRT 10.x execute_async_v3 + set_tensor_address API.
 Usage: python benchmark_int8_trt.py
 """
 
+import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # Jetson_control_2/
 
 import numpy as np
 import tensorrt as trt
@@ -109,9 +112,14 @@ def benchmark_segment():
     seg_rows = torch.from_numpy(np.load(CAL_DIR / "seg_rows.npy")).to(device)
     seg_cols = torch.from_numpy(np.load(CAL_DIR / "seg_cols.npy")).to(device)
 
-    batch_size = min(8912, seg_tiles.shape[0])
+    # Must match build_trt_int8.py's SEG_BATCH exactly -- the TRT engines were
+    # built with a fixed (not dynamic) input shape, so they only accept this
+    # one batch size. 1280 is analyse.py's actual per-image tile count (5
+    # offsets x 16x16 grid), not the 8912 split-threshold (which never
+    # actually triggers in production since 1280 < 8912).
+    batch_size = min(1280, seg_tiles.shape[0])
     tiles, rows, cols = seg_tiles[:batch_size], seg_rows[:batch_size], seg_cols[:batch_size]
-    print(f"Using a batch of {tiles.shape[0]} real tiles (matches analyse.py's batch_size)")
+    print(f"Using a batch of {tiles.shape[0]} real tiles (analyse.py's actual per-image tile count)")
 
     print("\nLoading PyTorch segmentation models...")
     seg_model, scorer, scorer_threshold, seg_grid_size, seg_image_size = seg_models.load_segmentation_models(

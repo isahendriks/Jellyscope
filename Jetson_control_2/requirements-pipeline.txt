@@ -2,5 +2,12 @@
 # existing Jetson_control/.venv-jellyscope venv (torch, torchvision, opencv-python,
 # itala, Flask, psutil are already installed there).
 kornia
-scipy   # required by ImagePipeline/BinaryClassification/functions.py (maximum_filter)
-pandas  # required by ImagePipeline/BinaryClassification/functions.py
+scipy       # required by Pipeline_development/BinaryClassification/functions.py (maximum_filter)
+pandas      # required by Pipeline_development/BinaryClassification/functions.py
+scikit-learn  # ROC/PR/confusion-matrix metrics, monitoring/Test/test_segmentation_int8.py
+
+# For UINT8_comparisson/ (ONNX export + TensorRT INT8 comparison) -- onnx installed
+# separately by hand; tensorrt is the system apt package, made visible to this venv
+# via site-packages/system_tensorrt.pth (see Jetson_control/install_venv.sh Step 10).
+onnx
+onnxscript  # torch.onnx.export's default (TorchDynamo-based) exporter needs this in torch 2.13

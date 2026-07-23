@@ -44,7 +44,10 @@ Usage: python collect_calibration_data.py [folder_of_images] [--max-images N]
 """
 
 import argparse
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # Jetson_control_2/
 
 import cv2
 import numpy as np

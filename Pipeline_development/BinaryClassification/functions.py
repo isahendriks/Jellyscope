@@ -478,8 +478,21 @@ def compute_position_features(rows, cols, grid_size, device):
     Returns:
         pos_features: Tensor of shape (B, 10) with continuous positional features
     """
-    rows_t = rows.to(device).float() if isinstance(rows, torch.Tensor) else torch.tensor(rows, dtype=torch.float32, device=device)
-    cols_t = cols.to(device).float() if isinstance(cols, torch.Tensor) else torch.tensor(cols, dtype=torch.float32, device=device)
+    # Preserve the caller's floating dtype (e.g. float16 under .half()) instead of
+    # hardcoding float32 -- otherwise this always returns float32 regardless of the
+    # model's precision, which mismatches PositionalEmbedding's weights as soon as
+    # the model is cast to a different dtype (e.g. FP16 inference).
+    if isinstance(rows, torch.Tensor):
+        rows_t = rows.to(device)
+        rows_t = rows_t if rows_t.is_floating_point() else rows_t.float()
+    else:
+        rows_t = torch.tensor(rows, dtype=torch.float32, device=device)
+
+    if isinstance(cols, torch.Tensor):
+        cols_t = cols.to(device)
+        cols_t = cols_t if cols_t.is_floating_point() else cols_t.float()
+    else:
+        cols_t = torch.tensor(cols, dtype=torch.float32, device=device)
 
     denom = float(grid_size - 1)
     y = rows_t / denom

@@ -29,6 +29,11 @@ and adjust OPSET below if the parser in build_trt_int8.py rejects it).
 Usage: python export_onnx.py
 """
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # Jetson_control_2/
+
 import torch
 import torch.nn as nn
 
@@ -39,7 +44,9 @@ from models import vit_classifier
 ONNX_DIR = config.PIPELINE_DIR / "trt" / "onnx"
 ONNX_DIR.mkdir(parents=True, exist_ok=True)
 
-OPSET = 17
+OPSET = 18  # 17 failed to downgrade for vit_classifier's Resize op (torch.onnx version
+            # converter has no opset-17 adapter for it); 18 exports cleanly for all four
+            # models, and TensorRT 10.16 supports it fine.
 CLASSIFIER_IMAGE_SIZE = 256  # matches analyse.py
 N_EXAMPLE = 8  # only fixes dtypes for tracing; exported batch dim is dynamic
 

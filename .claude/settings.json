@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source /home/jellyfish/Github/Jellyscope/Jetson_control/.venv-jellyscope/bin/activate)",
+      "Bash(bash -n *)",
+      "Bash(pip show *)",
+      "Bash(journalctl -k *)",
+      "Bash(df -h *)"
+    ]
+  }
+}

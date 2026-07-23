@@ -48,6 +48,21 @@ wait_for_link() {
   return 1
 }
 
+# nvethernet (Jetson's onboard end0) rejects MTU changes while the device is
+# admin-up ("must be stopped to change its MTU" in dmesg). `ip link set down`
+# and NetworkManager's live reapply both return before the driver has actually
+# quiesced the device, so we poll the kernel's own IFF_UP flag rather than
+# assuming the transition is instant.
+wait_for_admin_down() {
+  local iface="$1" timeout="${2:-5}" flags
+  for ((i = 0; i < timeout * 10; i++)); do
+    flags="$(cat "/sys/class/net/${iface}/flags" 2>/dev/null)" || return 1
+    (( flags & 0x1 )) || return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 set_static_ip() {
   local iface="$1" addr="$2" mtu="${3:-}"
   local con current_mtu
@@ -66,6 +81,8 @@ set_static_ip() {
     if [ -n "${mtu}" ] && [ "${current_mtu}" != "${mtu}" ]; then
       # Some drivers (e.g. nvethernet on end0) refuse MTU changes while admin-up.
       sudo ip link set dev "${iface}" down
+      wait_for_admin_down "${iface}" \
+        || echo "    WARNING: ${iface} didn't go admin-down in time, MTU change may be rejected" >&2
       sudo ip link set dev "${iface}" mtu "${mtu}"
     fi
     sudo ip link set dev "${iface}" up
@@ -74,7 +91,14 @@ set_static_ip() {
     return
   fi
   sudo nmcli con mod "${con}" ipv4.method manual ipv4.addresses "${addr}" ipv4.gateway ""
-  [ -n "${mtu}" ] && sudo nmcli con mod "${con}" 802-3-ethernet.mtu "${mtu}"
+  if [ -n "${mtu}" ] && [ "${current_mtu}" != "${mtu}" ]; then
+    sudo nmcli con mod "${con}" 802-3-ethernet.mtu "${mtu}"
+    # nmcli can reapply MTU live on an already-active connection without a real
+    # down/up cycle; force the kernel-level down nvethernet actually requires.
+    sudo ip link set dev "${iface}" down
+    wait_for_admin_down "${iface}" \
+      || echo "    WARNING: ${iface} didn't go admin-down in time, MTU change may be rejected" >&2
+  fi
   sudo nmcli con up "${con}" >/dev/null
   wait_for_link "${iface}" || echo "    WARNING: ${iface} link didn't come back up in time" >&2
 }

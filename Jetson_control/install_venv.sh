@@ -14,6 +14,16 @@
 
 set -euo pipefail
 
+# NOTE: this creates ~/.venvs/venv-jellyscope. The venv actually used by the
+# Jetson_control_2 pipeline (record.py/analyse.py/etc) is a separate, older one
+# at Jetson_control/.venv-jellyscope, which predates this script and was never
+# recreated with --system-site-packages. Rather than recreate it here (which
+# would mean re-downloading torch/torchvision/kornia/itala/etc from scratch),
+# that venv was patched directly with a site-packages/*.pth file pointing at
+# /usr/lib/python3.12/dist-packages, so it can see system TensorRT too. If you
+# ever do rebuild Jetson_control/.venv-jellyscope from scratch, just point VENV
+# below at it instead and this script's --system-site-packages handles it
+# properly from the start.
 VENV="${HOME}/.venvs/venv-jellyscope"
 CU_INDEX="https://download.pytorch.org/whl/cu132"
 
@@ -123,6 +133,14 @@ python -m pip install --pre torchvision --extra-index-url "${CU_INDEX}"
 echo "==> Step 9: common packages + Jupyter kernel"
 python -m pip install numpy pillow matplotlib jupyterlab ipykernel
 python -m ipykernel install --user --name jetson-jp72 --display-name "Jetson JP7.2 Python 3.12"
+
+echo "==> Step 10: onnx + confirm TensorRT visibility (for the INT8/TensorRT export pipeline)"
+# onnx is a normal portable package -- plain pip install works here.
+python -m pip install onnx
+# TensorRT itself is NOT pip-installable on this platform -- it's the apt-installed
+# system package (tensorrt/libnvinfer, from JetPack), made visible to this venv via
+# --system-site-packages above. Just verify that actually worked rather than assume.
+python -c "import tensorrt as trt; print('tensorrt visible in venv:', trt.__version__)"
 
 echo
 echo "Done. Run 'python verify_stack.py' for the full stack check."
