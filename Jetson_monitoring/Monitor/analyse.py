@@ -234,7 +234,8 @@ if config.ENABLE_LIVE_STREAM:
             "`Full frames: ${d.que_fullframes_depth}  Crops: ${d.que_crops_depth}\\n \\n`+"
             "hdr('LEAK DETECTION')+"
             "`Leak: ${d.leak_detected===true?'!!! DETECTED !!!':d.leak_detected===false?'OK':'N/A'}  "
-            "Enclosure humidity: ${fmt(d.bme280_humidity_pct,'%')}\\n \\n`+"
+            "Enclosure humidity: ${fmt(d.bme280_humidity_pct,'%')}  "
+            "Dew point: ${fmt(d.dew_point_c,' C')}\\n \\n`+"
             "hdr('ENVIRONMENTAL')+"
             "`Bar3XT pressure: ${fmt(d.bar3xt_pressure_mbar,' mbar')}  "
             "depth: ${fmt(d.bar3xt_depth_m,' m')}\\n`+"
@@ -310,6 +311,7 @@ if config.ENABLE_LIVE_STREAM:
             "bme280_pressure_mbar": live.get("bme280_pressure_mbar"),
             "bme280_humidity_pct": live.get("bme280_humidity_pct"),
             "bme280_temp_c": live.get("bme280_temp_c"),
+            "dew_point_c": live.get("dew_point_c"),
             "ds18b20_temp_c": live.get("ds18b20_temp_c"),
             "leak_detected": live.get("leak_detected"),
             "camera_temp_c": live.get("camera_temp_c"),

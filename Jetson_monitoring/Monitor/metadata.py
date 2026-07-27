@@ -36,6 +36,7 @@ import queue_io
 import transfer
 import metro_m0
 import strobe
+import leak_alert
 
 METADATA_OUTBOX = config.PIPELINE_DIR / "metadata_outbox"
 ENVIRONMENTAL_OUTBOX = config.PIPELINE_DIR / "environmental_outbox"
@@ -109,6 +110,8 @@ def collect_sample(m0: dict | None, gpu_percent_mean: float | None, gpu_percent_
     mem = psutil.virtual_memory()
     record_status = heartbeat_status("record")
     strobe_converter_c, strobe_driver_c = strobe.read_temperatures()
+    bme280_temp_c = m0["b"] if m0 else None
+    bme280_humidity_pct = m0["h"] if m0 else None
     return {
         "timestamp_unix": time.time(),
         "cpu_percent": psutil.cpu_percent(interval=None),
@@ -138,8 +141,9 @@ def collect_sample(m0: dict | None, gpu_percent_mean: float | None, gpu_percent_
         # Converted from the BME280's native Pa to mbar (1 mbar = 100 Pa) so device
         # (enclosure air) and environmental (Bar3XT water) pressure share one unit.
         "bme280_pressure_mbar": (m0["p"] / 100.0) if m0 else None,
-        "bme280_humidity_pct": m0["h"] if m0 else None,
-        "bme280_temp_c": m0["b"] if m0 else None,
+        "bme280_humidity_pct": bme280_humidity_pct,
+        "bme280_temp_c": bme280_temp_c,
+        "dew_point_c": leak_alert.dew_point_c(bme280_temp_c, bme280_humidity_pct),
         "leak_detected": bool(m0["l"]) if m0 else None,
         "ds18b20_temp_c": m0["t"] if m0 else None,
     }
@@ -181,6 +185,7 @@ def aggregate(samples: list[dict]) -> dict:
         "bme280_pressure_mbar_mean": _mean([s["bme280_pressure_mbar"] for s in samples]),
         "bme280_humidity_pct_mean": _mean([s["bme280_humidity_pct"] for s in samples]),
         "bme280_temp_c_mean": _mean([s["bme280_temp_c"] for s in samples]),
+        "dew_point_c_mean": _mean([s["dew_point_c"] for s in samples]),
         "ds18b20_temp_c_mean": _mean([s["ds18b20_temp_c"] for s in samples]),
         # A leak is a "did this happen at all" signal, not something to average away.
         "leak_detected_any": any(leaks) if leaks else None,
@@ -234,6 +239,7 @@ def write_live_snapshot(device_sample: dict | None, env_sample: dict | None) -> 
             "bme280_pressure_mbar": device_sample["bme280_pressure_mbar"],
             "bme280_humidity_pct": device_sample["bme280_humidity_pct"],
             "bme280_temp_c": device_sample["bme280_temp_c"],
+            "dew_point_c": device_sample["dew_point_c"],
             "ds18b20_temp_c": device_sample["ds18b20_temp_c"],
             "leak_detected": device_sample["leak_detected"],
             "disk_free_gb_by_path": device_sample["disk_free_gb_by_path"],
@@ -305,6 +311,7 @@ while True:
         gpu_percent_max = max(gpu_percent_window) if gpu_percent_window else None
         new_device_sample = collect_sample(latest_m0_reading, gpu_percent_mean, gpu_percent_max)
         samples.append(new_device_sample)
+        leak_alert.check_for_leak(new_device_sample)
         gpu_percent_window = []
         last_device_sample_time = now
 

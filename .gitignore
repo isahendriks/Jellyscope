@@ -34,11 +34,14 @@ wandb/
 **/models/
 **/logs/
 
-# TensorRT export/calibration/build artifacts (Jetson_control_2 INT8 pipeline)
-Jetson_control_2/trt/
+# TensorRT export/calibration/build artifacts (monitoring/ INT8 pipeline)
+monitoring/trt/
 
 # Data files (optional - if you don't want to track large datasets)
 *.png
 *.jpg
 *.jpeg
 data/
+
+# Secrets (webhook URLs, API keys, etc.) -- see secrets_example.py for the template
+Jetson_monitoring/Monitor/secrets.py

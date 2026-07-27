@@ -64,7 +64,7 @@ MIN_FREE_BYTES = 2 * 1024**3  # record.py/analyse.py pause producing below this
 ### stream (see analyse.py's /status) so it's visible what rate is actually
 ### being recorded at.
 ### ==========================
-FRAME_SKIP = 2
+FRAME_SKIP = 1
 
 # Optional dark/background reference frame (control/monitoring/record.py's "bkg.png"),
 # subtracted during analyse.py's PREPROCESS step. If this path doesn't exist,
@@ -174,7 +174,12 @@ CUDA_CACHE_CLEANUP_EVERY_N_FRAMES = 100
 ### ==========================
 ENABLE_LIVE_STREAM = True
 LIVESTREAM_PORT = 8080  # view at http://<jetson-ip>:8080/
-LIVESTREAM_DISP_SCALE = 50  # % downscale, matches livestream.py's own convention
+# % downscale. Was 50 (2256x2256, ~670KB/JPEG) -- at the pipeline's current ~1fps
+# analysis rate, that much data per frame added real transmission/decode lag on top
+# of the already-slow update rate, making the live view feel even more sluggish than
+# the ~1fps alone would. 20 -> ~902x902, much faster to send/decode; still matches
+# livestream.py's own downscale-before-draw convention (see update_live_frame()).
+LIVESTREAM_DISP_SCALE = 10
 CROP_BOX_COLOR = (0, 255, 0)  # green, BGR (cv2 convention)
 
 ### ==========================
@@ -206,6 +211,20 @@ METADATA_UPLOAD_INTERVAL_S = 60
 ### ==========================
 ENVIRONMENTAL_SAMPLE_INTERVAL_S = 1
 ENVIRONMENTAL_UPLOAD_INTERVAL_S = 60
+
+### ==========================
+### Leak alerting (leak_alert.py) -- direct sensor tier is unambiguous, but
+### THE INDIRECT (dew point / pressure) THRESHOLDS BELOW ARE PLACEHOLDERS.
+### There's no baseline data from this deployment yet to calibrate against --
+### watch actual dew_point_c/bme280_pressure_mbar behavior over a few days of
+### normal operation before trusting these numbers. See leak_alert.py's
+### module docstring for the full reasoning.
+### ==========================
+LEAK_SENSOR_CONSECUTIVE_READS = 2  # ~20s at METADATA_SAMPLE_INTERVAL_S=10 -- rules out one glitchy read
+LEAK_WARNING_WINDOW_S = 900  # 15 min -- trend window for the indirect BME280 signals
+LEAK_DEW_POINT_RISE_THRESHOLD_C = 3.0  # PLACEHOLDER
+LEAK_PRESSURE_DEVIATION_THRESHOLD_MBAR = 5.0  # PLACEHOLDER
+LEAK_ALERT_COOLDOWN_S = 1800  # 30 min -- don't re-spam the same tier while a condition persists
 
 ### ==========================
 ### Arduino Metro M0 serial port (M0_metadata_BME280.cpp) -- sensors: Bar3XT
