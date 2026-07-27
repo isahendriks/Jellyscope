@@ -134,6 +134,20 @@ def read_live_metadata() -> dict:
         return {}
 
 
+def read_send_heartbeat() -> dict:
+    """Reads send.py's own heartbeat.json directly -- no exclusive-ownership concern
+    here (unlike the M0/strobe reads, which go through metadata.py), it's just a plain
+    JSON file, same pattern metadata.py's own heartbeat_status() already uses for
+    record/analyse/send. Used for the live-stream's Connection chapter."""
+    path = config.HEARTBEAT_DIR / "send.heartbeat.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 if config.ENABLE_LIVE_STREAM:
     from flask import Flask, Response, jsonify
 
@@ -162,18 +176,35 @@ if config.ENABLE_LIVE_STREAM:
     @flask_app.route("/")
     def _stream_index():
         return (
-            '<html><body style="margin:0;background:#000;height:100vh;'
-            'display:flex;align-items:flex-end;justify-content:flex-end">'
-            '<img src="/stream" style="max-width:100vw;max-height:100vh;object-fit:contain">'
+            '<html><body style="margin:0;background:#000;height:100vh;overflow:hidden">'
+            # width/height (not max-width/max-height) so a small source image -- e.g. at a low
+            # LIVESTREAM_DISP_SCALE, chosen for faster transmit/decode -- gets scaled UP to fill
+            # the viewport instead of rendering at its tiny native pixel size; object-fit:contain
+            # preserves aspect ratio (letterboxed, not stretched/cropped either way), and
+            # object-position pins the visible image to the bottom-right corner of that box
+            # instead of object-fit's default centering.
+            '<img id="videoFrame" style="width:100vw;height:100vh;object-fit:contain;'
+            'object-position:right bottom;display:block">'
             '<pre id="status" style="position:fixed;top:16px;left:16px;margin:0;'
-            'padding:10px 14px;font-size:11px;line-height:1.5;color:#0f0;'
-            'background:rgba(0,0,0,0.6);border-radius:6px;white-space:pre;'
-            'font-family:monospace"></pre>'
+            'padding:14px 18px;font-size:12px;line-height:1.6;color:#fff;'
+            'background:rgba(15,15,15,0.72);border-radius:10px;white-space:pre;'
+            'font-family:-apple-system,Menlo,Consolas,monospace;'
+            'box-shadow:0 4px 18px rgba(0,0,0,0.45)"></pre>'
             '<pre id="logtail" style="position:fixed;top:16px;left:16px;margin:0;'
-            'max-width:60vw;padding:6px 10px;font-size:8px;line-height:1.4;color:#0f0;'
-            'background:rgba(0,0,0,0.6);border-radius:6px;white-space:pre-wrap;'
-            'font-family:monospace;opacity:0.75"></pre>'
+            'max-width:60vw;padding:8px 12px;font-size:9px;line-height:1.5;color:#fff;'
+            'background:rgba(15,15,15,0.72);border-radius:10px;white-space:pre-wrap;'
+            'font-family:Menlo,Consolas,monospace;opacity:0.8;'
+            'box-shadow:0 4px 18px rgba(0,0,0,0.45)"></pre>'
             "<script>"
+            # Polls a single always-fresh frame instead of holding open a multipart MJPEG
+            # stream -- see /latest_frame.jpg's comment for why: a persistent stream can only
+            # fall further behind if the browser/network ever briefly lags the production
+            # rate, since it must display every buffered frame in order before reaching "now".
+            # A fresh request each tick always gets whatever's current, nothing accumulates.
+            "function updateFrame(){"
+            "document.getElementById('videoFrame').src='/latest_frame.jpg?t='+Date.now();"
+            "}"
+            "updateFrame();setInterval(updateFrame,400);"
             "async function updateStatus(){"
             "try{"
             "const d=await (await fetch('/status')).json();"
@@ -182,22 +213,34 @@ if config.ENABLE_LIVE_STREAM:
             "const nearMax=(v,m)=>v!==null&&v!==undefined&&m!==null&&m!==undefined&&v>=0.9*m;"
             "const flag=(v,m)=>overMax(v,m)?' [DANGER]':nearMax(v,m)?' [WARN]':'';"
             "const vsMax=(v,m,u)=>`${fmt(v,u)} / max ${fmt(m,u)}${flag(v,m)}`;"
-            "document.getElementById('status').textContent="
-            "`${d.time}\\n`+"
+            "const hdr=(label)=>`<b style=\"font-size:14px;letter-spacing:0.4px\">${label}</b>\\n`;"
+            "const fmtSpeed=(bps)=>{"
+            "if(bps===null||bps===undefined)return'N/A';"
+            "if(bps>=1e6)return(bps/1e6).toFixed(2)+' MB/s';"
+            "if(bps>=1e3)return(bps/1e3).toFixed(1)+' KB/s';"
+            "return bps.toFixed(0)+' B/s';"
+            "};"
+            "const fmtAge=(s)=>{"
+            "if(s===null||s===undefined)return'N/A';"
+            "if(s<120)return s.toFixed(0)+'s ago';"
+            "return(s/60).toFixed(1)+'m ago';"
+            "};"
+            "document.getElementById('status').innerHTML="
+            "`<b style=\"font-size:15px\">${d.time}</b>\\n`+"
             "`Frames: ${d.frames_analysed_total}  Crops: ${d.crops_produced_total}  "
             "Sampling: every ${d.frame_skip} frame(s)\\n \\n`+"
-            "`--- Queue ---\\n`+"
+            "hdr('QUEUE')+"
             "`Avg processing time: ${fmt(d.avg_processing_time_s,' s')}\\n`+"
             "`Full frames: ${d.que_fullframes_depth}  Crops: ${d.que_crops_depth}\\n \\n`+"
-            "`--- Leak Detection ---\\n`+"
+            "hdr('LEAK DETECTION')+"
             "`Leak: ${d.leak_detected===true?'!!! DETECTED !!!':d.leak_detected===false?'OK':'N/A'}  "
             "Enclosure humidity: ${fmt(d.bme280_humidity_pct,'%')}\\n \\n`+"
-            "`--- Environmental ---\\n`+"
+            "hdr('ENVIRONMENTAL')+"
             "`Bar3XT pressure: ${fmt(d.bar3xt_pressure_mbar,' mbar')}  "
             "depth: ${fmt(d.bar3xt_depth_m,' m')}\\n`+"
             "`Bar3XT temp: ${fmt(d.bar3xt_temp_c,' C')}  "
             "DS18B20 temp: ${fmt(d.ds18b20_temp_c,' C')}\\n \\n`+"
-            "`--- Device ---\\n`+"
+            "hdr('DEVICE')+"
             "`Enclosure pressure: ${fmt(d.bme280_pressure_mbar,' mbar')}  "
             "Enclosure temp (BME280): ${fmt(d.bme280_temp_c,' C')}\\n`+"
             "`Camera: ${vsMax(d.camera_temp_c,d.camera_max_temp_c,' C')}\\n`+"
@@ -206,14 +249,22 @@ if config.ENABLE_LIVE_STREAM:
             "`Jetson: ${vsMax(d.jetson_temp_c_mean,d.jetson_max_temp_c,' C')}\\n`+"
             "`CPU: ${fmt(d.cpu_percent,'%')}  GPU: ${fmt(d.gpu_percent_mean,'%')} (max ${fmt(d.gpu_percent_max,'%')})\\n`+"
             "`Disk free: device: ${fmt(d.disk_root,' GB')} `+"
-            "`ssd1: ${fmt(d.disk_ssd1,' GB')}  ssd2: ${fmt(d.disk_ssd2,' GB')}`;"
+            "`ssd1: ${fmt(d.disk_ssd1,' GB')}  ssd2: ${fmt(d.disk_ssd2,' GB')}\\n \\n`+"
+            "hdr('CONNECTION')+"
+            "`Status: ${!d.send_alive?'PROCESS DOWN':(d.consecutive_upload_failures>0?"
+            "`FAILING (${d.consecutive_upload_failures}x)`:'OK')}\\n`+"
+            "`Last successful upload: ${fmtAge(d.last_success_age_s)}  "
+            "Speed: ${fmtSpeed(d.upload_speed_bps)}\\n`+"
+            "`Crops sent: ${d.crops_sent_total??'N/A'}  Queued: ${d.que_crops_depth}  "
+            "Failed: ${d.que_crops_failed??'N/A'}`;"
             "const danger=d.leak_detected===true||"
             "overMax(d.camera_temp_c,d.camera_max_temp_c)||"
             "overMax(d.strobe_converter_temp_c,d.strobe_max_temp_c)||"
             "overMax(d.strobe_driver_temp_c,d.strobe_max_temp_c)||"
-            "overMax(d.jetson_temp_c_mean,d.jetson_max_temp_c);"
+            "overMax(d.jetson_temp_c_mean,d.jetson_max_temp_c)||"
+            "!d.send_alive||d.consecutive_upload_failures>3;"
             "document.getElementById('status').style.background="
-            "danger?'rgba(192,57,43,0.85)':'rgba(0,0,0,0.6)';"
+            "danger?'rgba(192,57,43,0.85)':'rgba(15,15,15,0.72)';"
             "const statusBox=document.getElementById('status');"
             "document.getElementById('logtail').style.top="
             "(statusBox.offsetTop+statusBox.offsetHeight+12)+'px';"
@@ -226,7 +277,11 @@ if config.ENABLE_LIVE_STREAM:
             "}catch(e){}"
             "}"
             "updateStatus();setInterval(updateStatus,1000);"
-            "updateLogTail();setInterval(updateLogTail,2000);"
+            # 1000ms, not 2000 -- frames are produced roughly every ~0.85-1s (see analyse.log),
+            # so a 2000ms poll reliably skipped ~2 lines' worth each refresh instead of scrolling
+            # by 1, which read as the tail "jumping". Still not a perfect 1:1 match to whatever
+            # the actual per-frame rate happens to be, but far smoother than a fixed 2x mismatch.
+            "updateLogTail();setInterval(updateLogTail,1000);"
             "</script>"
             "</body></html>"
         )
@@ -238,6 +293,9 @@ if config.ENABLE_LIVE_STREAM:
         avg_processing_time_s = (
             total_processing_time_sum / frames_analysed_total if frames_analysed_total else None
         )
+        send_hb = read_send_heartbeat()
+        send_age_s = (time.time() - send_hb["last_update_unix"]) if send_hb.get("last_update_unix") else None
+        last_success_unix = send_hb.get("last_success_unix")
         return jsonify({
             "time": time.strftime("%H:%M:%S"),
             "frames_analysed_total": frames_analysed_total,
@@ -268,11 +326,37 @@ if config.ENABLE_LIVE_STREAM:
             "disk_root": disk.get(str(config.ROOT_DISK_PATH)),
             "disk_ssd1": disk.get(str(config.EXTERNAL_SSD_PATHS[0])),
             "disk_ssd2": disk.get(str(config.EXTERNAL_SSD_PATHS[1])),
+            "send_alive": (send_age_s is not None and send_age_s < config.HEARTBEAT_STALE_S),
+            "send_age_s": send_age_s,
+            "crops_sent_total": send_hb.get("crops_sent_total"),
+            "que_crops_failed": send_hb.get("que_crops_failed"),
+            "upload_speed_bps": send_hb.get("last_speed_bps"),
+            "last_upload_ok": send_hb.get("last_attempt_ok"),
+            "consecutive_upload_failures": send_hb.get("consecutive_failures"),
+            "last_success_age_s": (time.time() - last_success_unix) if last_success_unix else None,
         })
 
     @flask_app.route("/log_tail")
     def _stream_log_tail():
         return jsonify({"lines": _tail_log_lines(ANALYSE_LOG_PATH, 5)})
+
+    @flask_app.route("/latest_frame.jpg")
+    def _latest_frame():
+        # Single-shot fetch of whatever's currently latest, not a persistent multipart
+        # stream -- the index page polls this on a timer instead of using /stream, since
+        # multipart/x-mixed-replace has no way to skip ahead: if the browser's decode or
+        # the network ever falls even briefly behind the ~1fps production rate, it queues
+        # every frame in arrival order and can only fall further behind, never catch up,
+        # since it must display everything already buffered before it reaches "now". A
+        # plain per-request fetch can't accumulate that kind of backlog -- it always
+        # returns whatever's current at request time, dropping anything in between.
+        with latest_frame_lock:
+            frame = latest_frame_jpeg
+        if frame is None:
+            return Response(status=404)
+        resp = Response(frame, mimetype="image/jpeg")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
 
     @flask_app.route("/stream")
     def _stream_feed():
