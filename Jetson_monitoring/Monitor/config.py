@@ -64,7 +64,7 @@ MIN_FREE_BYTES = 2 * 1024**3  # record.py/analyse.py pause producing below this
 ### stream (see analyse.py's /status) so it's visible what rate is actually
 ### being recorded at.
 ### ==========================
-FRAME_SKIP = 1
+FRAME_SKIP = 2
 
 # Optional dark/background reference frame (control/monitoring/record.py's "bkg.png"),
 # subtracted during analyse.py's PREPROCESS step. If this path doesn't exist,
@@ -82,6 +82,13 @@ SEGMENTATION_SCORER_MODEL_PATH = PIPELINE_DIR / "models" / "Kristineberg_251128_
 ### ==========================
 ### ViT classifier checkpoint
 ### ==========================
+# CLASSIFY step (ViT inference, ~0.1-0.4s/frame per analyse.log -- the single biggest
+# per-frame cost besides SEGMENT) can be switched off entirely for throughput debugging
+# or when only crop capture matters, not species labels. SEGMENT still runs either way,
+# so crops are still produced/uploaded -- just with class_label/class_confidence/class_idx
+# left as None in the sidecar, and the classifier engine isn't even loaded at startup.
+CLASSIFY = False
+
 # Migrated (standardized) checkpoint -- see models/migrate_checkpoint.py. Point this
 # at the *_migrated.pth output, not the original raw state_dict, once you've run it.
 VIT_CHECKPOINT_PATH = PIPELINE_DIR / "models" / "vit_classifier_F1_0.8697_acc_0.9293_migrated.pth"
@@ -115,7 +122,7 @@ VIT_ENGINE_BATCH = 16
 IMAGE_SIZE_PX = 4512  # camera frame size -- checked against each frame's actual dims in analyse.py
 IMAGE_W_MM = 91  # physical width of the sensor's field of view, in mm
 
-ROTATE_FRAME = 270.0  # degrees, applied once per frame (and once to the dark frame at load time)
+ROTATE_FRAME = 90.0  # degrees, applied once per frame (and once to the dark frame at load time)
 # before dark-subtract/median-blur/gamma/CLAHE -- corrects for the camera's physical mounting
 # angle, if any. 0 = no rotation. Rotation keeps the frame's original size (it's square), replicate-
 # padding whatever corners the rotation reveals.
@@ -201,10 +208,11 @@ ENVIRONMENTAL_SAMPLE_INTERVAL_S = 1
 ENVIRONMENTAL_UPLOAD_INTERVAL_S = 60
 
 ### ==========================
-### Arduino Metro M0 serial port (M0_metadata.cpp) -- sensors: Bar3XT (water
-### pressure/depth, environmental), BMP280 (enclosure air pressure), leak
-### detector, DS18B20 (enclosure temperature) -- the latter three are device
-### metadata, not environmental (see metadata.py's collect_sample() vs
+### Arduino Metro M0 serial port (M0_metadata_BME280.cpp) -- sensors: Bar3XT
+### (water pressure/depth/temperature, environmental), BME280 (enclosure air
+### pressure/humidity/temperature), leak detector, DS18B20 (enclosure
+### temperature) -- the latter three sensors are device metadata, not
+### environmental (see metadata.py's collect_sample() vs
 ### collect_environmental_sample()).
 ### ==========================
 METRO_M0_SERIAL_PORT = "/dev/ttyACM0"
@@ -220,3 +228,22 @@ SERIAL_TIMEOUT_S = 2  # seconds to wait for a line before giving up and returnin
 STROBE_IP = "192.168.0.32"
 STROBE_MODBUS_PORT = 502
 STROBE_MODBUS_UNIT = 32
+
+### ==========================
+### Hardware thermal limits -- purely informational (not enforced/throttled by
+### this software), for the live-stream's "how close to the danger zone"
+### display. Checked 2026-07-27:
+###   Camera (Opto Engineering ITA204-GM-20C): -25C to +65C ambient operating
+###     range per its datasheet.
+###   Strobe controller (Opto Engineering LTDVE1CH-40F): instruction manual
+###     section on the MEASURED_TEMPERATURE_CONVERTER/_DRIVER Modbus registers
+###     (same ones strobe.py reads) -- shuts off all output channels above
+###     90C heatsink temp, reactivates below 80C. Same limit applied to both
+###     converter and driver readings; the manual doesn't give them separately.
+###   Jetson AGX Orin 64GB: NVIDIA's Thermal Design Guide gives 99C as the
+###     recommended-operation limit before thermal throttling kicks in, and
+###     105C as the hard Tj max. Using 99C (the actionable one) here.
+### ==========================
+CAMERA_MAX_TEMP_C = 65.0
+STROBE_MAX_TEMP_C = 90.0
+JETSON_MAX_TEMP_C = 99.0

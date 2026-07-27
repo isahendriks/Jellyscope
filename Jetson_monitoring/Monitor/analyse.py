@@ -20,6 +20,7 @@ import gc
 import json
 import threading
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -66,12 +67,16 @@ peak_threshold = scorer_threshold
 secondary_threshold = peak_threshold * 0.99
 print(f"Loaded INT8 segmentation engines. Scorer threshold: {scorer_threshold:.4f}")
 
-print("Loading INT8 ViT classifier engine...")
-classifier_engine, idx_to_class = load_classifier_engine(
-    config.VIT_CHECKPOINT_PATH, config.ENGINE_DIR / "vit_classifier_int8.engine", device,
-    class_names_fallback=config.VIT_CLASS_NAMES_FALLBACK,
-)
-print(f"Loaded classifier with {len(idx_to_class)} classes (fixed batch {config.VIT_ENGINE_BATCH}).")
+classifier_engine, idx_to_class = None, {}
+if config.CLASSIFY:
+    print("Loading INT8 ViT classifier engine...")
+    classifier_engine, idx_to_class = load_classifier_engine(
+        config.VIT_CHECKPOINT_PATH, config.ENGINE_DIR / "vit_classifier_int8.engine", device,
+        class_names_fallback=config.VIT_CLASS_NAMES_FALLBACK,
+    )
+    print(f"Loaded classifier with {len(idx_to_class)} classes (fixed batch {config.VIT_ENGINE_BATCH}).")
+else:
+    print("CLASSIFY=False -- skipping ViT classifier engine load, crops will be produced unlabeled.")
 
 dark_frame = None
 if config.DARK_FRAME_PATH.exists():
@@ -106,7 +111,7 @@ def update_live_frame(enhanced, results) -> None:
         x0, y0 = int(sidecar["crop_x0"] * scale), int(sidecar["crop_y0"] * scale)
         x1, y1 = int(sidecar["crop_x1"] * scale), int(sidecar["crop_y1"] * scale)
         cv2.rectangle(display, (x0, y0), (x1, y1), config.CROP_BOX_COLOR, 1)
-        if sidecar["class_confidence"] >= config.CONFIDENCE_THRESHOLD:
+        if sidecar["class_confidence"] is not None and sidecar["class_confidence"] >= config.CONFIDENCE_THRESHOLD:
             cv2.putText(display, sidecar["class_label"], (x0, max(10, y0 - 4)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, config.CROP_BOX_COLOR, 1, cv2.LINE_AA)
 
@@ -134,6 +139,26 @@ if config.ENABLE_LIVE_STREAM:
 
     flask_app = Flask(__name__)
 
+    # Matches supervisor.sh's LOG_DIR/analyse.log -- both live in Monitor/, so this is
+    # the same file supervisor.sh redirects this process's stdout/stderr into.
+    ANALYSE_LOG_PATH = Path(__file__).resolve().parent / "logs" / "analyse.log"
+
+    def _tail_log_lines(path: Path, n: int) -> list:
+        """Reads the last n lines without loading the whole (potentially many-MB,
+        many-hours-old) file -- reads backward in chunks until n+1 newlines are seen."""
+        if not path.exists():
+            return []
+        chunk_size = 4096
+        with path.open("rb") as f:
+            remaining = f.seek(0, 2)
+            data = b""
+            while data.count(b"\n") <= n and remaining > 0:
+                read_size = min(chunk_size, remaining)
+                remaining -= read_size
+                f.seek(remaining)
+                data = f.read(read_size) + data
+        return data.decode(errors="replace").splitlines()[-n:]
+
     @flask_app.route("/")
     def _stream_index():
         return (
@@ -144,11 +169,19 @@ if config.ENABLE_LIVE_STREAM:
             'padding:10px 14px;font-size:11px;line-height:1.5;color:#0f0;'
             'background:rgba(0,0,0,0.6);border-radius:6px;white-space:pre;'
             'font-family:monospace"></pre>'
+            '<pre id="logtail" style="position:fixed;top:16px;left:16px;margin:0;'
+            'max-width:60vw;padding:6px 10px;font-size:8px;line-height:1.4;color:#0f0;'
+            'background:rgba(0,0,0,0.6);border-radius:6px;white-space:pre-wrap;'
+            'font-family:monospace;opacity:0.75"></pre>'
             "<script>"
             "async function updateStatus(){"
             "try{"
             "const d=await (await fetch('/status')).json();"
             "const fmt=(v,u)=>(v===null||v===undefined)?'N/A':v.toFixed(1)+u;"
+            "const overMax=(v,m)=>v!==null&&v!==undefined&&m!==null&&m!==undefined&&v>=m;"
+            "const nearMax=(v,m)=>v!==null&&v!==undefined&&m!==null&&m!==undefined&&v>=0.9*m;"
+            "const flag=(v,m)=>overMax(v,m)?' [DANGER]':nearMax(v,m)?' [WARN]':'';"
+            "const vsMax=(v,m,u)=>`${fmt(v,u)} / max ${fmt(m,u)}${flag(v,m)}`;"
             "document.getElementById('status').textContent="
             "`${d.time}\\n`+"
             "`Frames: ${d.frames_analysed_total}  Crops: ${d.crops_produced_total}  "
@@ -156,24 +189,44 @@ if config.ENABLE_LIVE_STREAM:
             "`--- Queue ---\\n`+"
             "`Avg processing time: ${fmt(d.avg_processing_time_s,' s')}\\n`+"
             "`Full frames: ${d.que_fullframes_depth}  Crops: ${d.que_crops_depth}\\n \\n`+"
-            "`--- Environment ---\\n`+"
+            "`--- Leak Detection ---\\n`+"
+            "`Leak: ${d.leak_detected===true?'!!! DETECTED !!!':d.leak_detected===false?'OK':'N/A'}  "
+            "Enclosure humidity: ${fmt(d.bme280_humidity_pct,'%')}\\n \\n`+"
+            "`--- Environmental ---\\n`+"
             "`Bar3XT pressure: ${fmt(d.bar3xt_pressure_mbar,' mbar')}  "
-            "depth: ${fmt(d.bar3xt_depth_m,' m')}\\n \\n`+"
+            "depth: ${fmt(d.bar3xt_depth_m,' m')}\\n`+"
+            "`Bar3XT temp: ${fmt(d.bar3xt_temp_c,' C')}  "
+            "DS18B20 temp: ${fmt(d.ds18b20_temp_c,' C')}\\n \\n`+"
             "`--- Device ---\\n`+"
-            "`Internal pressure: ${fmt(d.bmp280_pressure_mbar,' mbar')}  "
-            "Internal temp: ${fmt(d.ds18b20_temp_c,' C')}\\n`+"
-            "`Leak: ${d.leak_detected===true?'!!! DETECTED !!!':d.leak_detected===false?'OK':'N/A'}\\n`+"
-            "`Camera: ${fmt(d.camera_temp_c,' C')}  "
-            "Strobe: ${fmt(d.strobe_temp_c_mean,' C')}  "
-            "Jetson: ${fmt(d.jetson_temp_c_mean,' C')}\\n`+"
+            "`Enclosure pressure: ${fmt(d.bme280_pressure_mbar,' mbar')}  "
+            "Enclosure temp (BME280): ${fmt(d.bme280_temp_c,' C')}\\n`+"
+            "`Camera: ${vsMax(d.camera_temp_c,d.camera_max_temp_c,' C')}\\n`+"
+            "`Strobe converter: ${vsMax(d.strobe_converter_temp_c,d.strobe_max_temp_c,' C')}\\n`+"
+            "`Strobe driver: ${vsMax(d.strobe_driver_temp_c,d.strobe_max_temp_c,' C')}\\n`+"
+            "`Jetson: ${vsMax(d.jetson_temp_c_mean,d.jetson_max_temp_c,' C')}\\n`+"
             "`CPU: ${fmt(d.cpu_percent,'%')}  GPU: ${fmt(d.gpu_percent_mean,'%')} (max ${fmt(d.gpu_percent_max,'%')})\\n`+"
             "`Disk free: device: ${fmt(d.disk_root,' GB')} `+"
             "`ssd1: ${fmt(d.disk_ssd1,' GB')}  ssd2: ${fmt(d.disk_ssd2,' GB')}`;"
+            "const danger=d.leak_detected===true||"
+            "overMax(d.camera_temp_c,d.camera_max_temp_c)||"
+            "overMax(d.strobe_converter_temp_c,d.strobe_max_temp_c)||"
+            "overMax(d.strobe_driver_temp_c,d.strobe_max_temp_c)||"
+            "overMax(d.jetson_temp_c_mean,d.jetson_max_temp_c);"
             "document.getElementById('status').style.background="
-            "d.leak_detected===true?'rgba(192,57,43,0.85)':'rgba(0,0,0,0.6)';"
+            "danger?'rgba(192,57,43,0.85)':'rgba(0,0,0,0.6)';"
+            "const statusBox=document.getElementById('status');"
+            "document.getElementById('logtail').style.top="
+            "(statusBox.offsetTop+statusBox.offsetHeight+12)+'px';"
+            "}catch(e){}"
+            "}"
+            "async function updateLogTail(){"
+            "try{"
+            "const d=await (await fetch('/log_tail')).json();"
+            "document.getElementById('logtail').textContent=d.lines.join('\\n');"
             "}catch(e){}"
             "}"
             "updateStatus();setInterval(updateStatus,1000);"
+            "updateLogTail();setInterval(updateLogTail,2000);"
             "</script>"
             "</body></html>"
         )
@@ -195,12 +248,20 @@ if config.ENABLE_LIVE_STREAM:
             "que_crops_depth": queue_io.queue_depth(config.QUE_CROPS),
             "bar3xt_pressure_mbar": live.get("bar3xt_pressure_mbar"),
             "bar3xt_depth_m": live.get("bar3xt_depth_m"),
-            "bmp280_pressure_mbar": live.get("bmp280_pressure_mbar"),
+            "bar3xt_temp_c": live.get("bar3xt_temp_c"),
+            "bme280_pressure_mbar": live.get("bme280_pressure_mbar"),
+            "bme280_humidity_pct": live.get("bme280_humidity_pct"),
+            "bme280_temp_c": live.get("bme280_temp_c"),
             "ds18b20_temp_c": live.get("ds18b20_temp_c"),
             "leak_detected": live.get("leak_detected"),
             "camera_temp_c": live.get("camera_temp_c"),
+            "camera_max_temp_c": config.CAMERA_MAX_TEMP_C,
             "strobe_temp_c_mean": live.get("strobe_temp_c_mean"),
+            "strobe_converter_temp_c": live.get("strobe_converter_temp_c"),
+            "strobe_driver_temp_c": live.get("strobe_driver_temp_c"),
+            "strobe_max_temp_c": config.STROBE_MAX_TEMP_C,
             "jetson_temp_c_mean": live.get("jetson_temp_c_mean"),
+            "jetson_max_temp_c": config.JETSON_MAX_TEMP_C,
             "cpu_percent": live.get("cpu_percent"),
             "gpu_percent_mean": live.get("gpu_percent_mean"),
             "gpu_percent_max": live.get("gpu_percent_max"),
@@ -208,6 +269,10 @@ if config.ENABLE_LIVE_STREAM:
             "disk_ssd1": disk.get(str(config.EXTERNAL_SSD_PATHS[0])),
             "disk_ssd2": disk.get(str(config.EXTERNAL_SSD_PATHS[1])),
         })
+
+    @flask_app.route("/log_tail")
+    def _stream_log_tail():
+        return jsonify({"lines": _tail_log_lines(ANALYSE_LOG_PATH, 5)})
 
     @flask_app.route("/stream")
     def _stream_feed():
@@ -312,42 +377,47 @@ def segment_and_classify(enhanced, image_name: str, source_frame_id=None, source
             crop_image = enhanced[crop_y0:crop_y1, crop_x0:crop_x1]
 
             crop_images.append(crop_image)
-            crop_tensors.append(vit_classifier.preprocess_crop_for_classifier(crop_image, image_size=config.CLASSIFIER_IMAGE_SIZE))
             region_size_pixels_list.append(region_size_pixels)
             region_size_mm2_list.append(region_size_mm2)
             crop_coords_list.append((crop_y0, crop_x0, crop_y1, crop_x1))
+            if config.CLASSIFY:
+                crop_tensors.append(vit_classifier.preprocess_crop_for_classifier(crop_image, image_size=config.CLASSIFIER_IMAGE_SIZE))
 
-        img_batch = torch.stack(crop_tensors, dim=0).to(device, non_blocking=True)
-        size_batch = torch.tensor(region_size_mm2_list, dtype=torch.float32).unsqueeze(1).to(device, non_blocking=True)
+        if config.CLASSIFY:
+            img_batch = torch.stack(crop_tensors, dim=0).to(device, non_blocking=True)
+            size_batch = torch.tensor(region_size_mm2_list, dtype=torch.float32).unsqueeze(1).to(device, non_blocking=True)
 
-        # The ViT INT8 engine has a fixed batch shape (config.VIT_ENGINE_BATCH=16, chosen with
-        # headroom over the observed 0-9 crops/image) -- pad each chunk up to it and slice the
-        # real rows back out; a frame with more than VIT_ENGINE_BATCH crops (rare) just loops.
-        n_crops = img_batch.shape[0]
-        logits_chunks = []
-        with torch.inference_mode():
-            for start_idx in range(0, n_crops, config.VIT_ENGINE_BATCH):
-                end_idx = min(start_idx + config.VIT_ENGINE_BATCH, n_crops)
-                img_chunk = pad_batch(img_batch[start_idx:end_idx], config.VIT_ENGINE_BATCH)
-                size_chunk = pad_batch(size_batch[start_idx:end_idx], config.VIT_ENGINE_BATCH)
-                chunk_logits = classifier_engine(img_chunk, size_chunk)
-                logits_chunks.append(chunk_logits[:end_idx - start_idx])
-            logits = torch.cat(logits_chunks, dim=0)
-            probs = torch.softmax(logits, dim=1)
-            class_indices = torch.argmax(probs, dim=1)
-            confidences = probs.gather(1, class_indices.unsqueeze(1)).squeeze(1)
+            # The ViT INT8 engine has a fixed batch shape (config.VIT_ENGINE_BATCH=16, chosen with
+            # headroom over the observed 0-9 crops/image) -- pad each chunk up to it and slice the
+            # real rows back out; a frame with more than VIT_ENGINE_BATCH crops (rare) just loops.
+            n_crops = img_batch.shape[0]
+            logits_chunks = []
+            with torch.inference_mode():
+                for start_idx in range(0, n_crops, config.VIT_ENGINE_BATCH):
+                    end_idx = min(start_idx + config.VIT_ENGINE_BATCH, n_crops)
+                    img_chunk = pad_batch(img_batch[start_idx:end_idx], config.VIT_ENGINE_BATCH)
+                    size_chunk = pad_batch(size_batch[start_idx:end_idx], config.VIT_ENGINE_BATCH)
+                    chunk_logits = classifier_engine(img_chunk, size_chunk)
+                    logits_chunks.append(chunk_logits[:end_idx - start_idx])
+                logits = torch.cat(logits_chunks, dim=0)
+                probs = torch.softmax(logits, dim=1)
+                class_indices = torch.argmax(probs, dim=1)
+                confidences = probs.gather(1, class_indices.unsqueeze(1)).squeeze(1)
 
-        class_indices = class_indices.cpu().tolist()
-        confidences = confidences.cpu().tolist()
+            class_indices = class_indices.cpu().tolist()
+            confidences = confidences.cpu().tolist()
 
         for crop_idx in range(len(accepted)):
             crop_y0, crop_x0, crop_y1, crop_x1 = crop_coords_list[crop_idx]
             region_size_pixels = region_size_pixels_list[crop_idx]
             region_size_mm2 = region_size_mm2_list[crop_idx]
             crop_image = crop_images[crop_idx]
-            class_idx = class_indices[crop_idx]
-            class_confidence = confidences[crop_idx]
-            class_label = idx_to_class[class_idx]
+            if config.CLASSIFY:
+                class_idx = class_indices[crop_idx]
+                class_confidence = confidences[crop_idx]
+                class_label = idx_to_class[class_idx]
+            else:
+                class_idx = class_confidence = class_label = None
 
             # Predicted species never goes in the filename -- only in the sidecar JSON
             # (class_label/class_confidence below). CONFIDENCE_THRESHOLD still gates
@@ -370,13 +440,15 @@ def segment_and_classify(enhanced, image_name: str, source_frame_id=None, source
                 "class_label": class_label,
                 "class_confidence": class_confidence,
                 "class_idx": class_idx,
-                "classifier_checkpoint": str(config.VIT_CHECKPOINT_PATH),
+                "classifier_checkpoint": str(config.VIT_CHECKPOINT_PATH) if config.CLASSIFY else None,
                 "processed_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z",
                 "upload_attempts": 0,
             }
             results.append((crop_stem, encoded_crop.tobytes(), crop_sidecar))
 
-        del crop_images, crop_tensors, img_batch, size_batch, logits_chunks, logits, probs, class_indices, confidences
+        if config.CLASSIFY:
+            del crop_tensors, img_batch, size_batch, logits_chunks, logits, probs, class_indices, confidences
+        del crop_images
 
     t_classify_end = time.perf_counter()
     timings = {
