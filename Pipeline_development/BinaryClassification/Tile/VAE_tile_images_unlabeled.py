@@ -14,8 +14,8 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from functions import split_image_into_tiles
 #%% Cell 2: Define User Parameters
-ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data\Binary_classifier"
-ROOT_DIR_C = r"C:\Users\Admin\Documents\Jellyscope\Training data\Binary_classifier"   
+ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data new\Binary_classifier"
+ROOT_DIR_C = r"C:\Users\IsaH\Documents\Jellyscope\Training data new\Binary_classifier"   
 
 # Tile parameters
 grid_size = 16  # number of tiles along one side (e.g. 6 means 6x6=36 tiles per image)
@@ -27,13 +27,13 @@ AUGMENTATION = False
 # Set to [] or [0.0] to disable offset cropping (single crop per tile)
 OFFSET_NORMALIZED = [0.0, 0.2, 0.4, 0.6, 0.8]
 
-monitoring_effort = "Kristineberg_250915" #"Kristineberg_260424" 
+monitoring_effort = "Kristineberg_260729" #"Kristineberg_260424" 
 
 # Folder paths
-input_folder = f"{monitoring_effort}\\train_VAE\\OG_images"# Folder containing images to split
-output_folder = f"{monitoring_effort}\\train_VAE\\tiles{grid_size}_offset{len(OFFSET_NORMALIZED)}"# Folder to save the tiles (will be created if it doesn't exist)
+input_folder = f"{monitoring_effort}\\train_scorer\\OG_images"# Folder containing images to split
+output_folder = f"{monitoring_effort}\\train_scorer\\tiles{grid_size}_offsets{len(OFFSET_NORMALIZED)}\\no_obs"# Folder to save the tiles (will be created if it doesn't exist)
 
-input_path = Path(ROOT_DIR_C).joinpath(Path(input_folder))
+input_path = Path(ROOT_DIR_R).joinpath(Path(input_folder))
 total_images = len(list(Path(input_path).rglob('*.png')))
 
 # Calculate expected tiles per image
@@ -59,7 +59,7 @@ if AUGMENTATION:
 #%% Cell 3: Define input and output paths
 
 # Create output folder
-output_paths = [Path(ROOT_DIR_C).joinpath(Path(output_folder))]
+output_paths = [Path(ROOT_DIR_R).joinpath(Path(output_folder))]
 for output_path in output_paths:    
     output_path.mkdir(parents=True, exist_ok=True)
 

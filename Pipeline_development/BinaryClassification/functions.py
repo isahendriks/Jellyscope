@@ -973,19 +973,27 @@ def split_image_into_tiles(image, grid_size):
 
 
 class MahalanobisScorer(nn.Module):
-    def __init__(self, latent_dim=32, grid_size=16, mean_vec=None, cov_inv=None):
+    def __init__(self, latent_dim=32, grid_size=16, mean_vec=None, cov_inv=None,
+                 dist_calib=None, recon_calib=None, alpha=0.5):
         super().__init__()
 
         self.latent_dim = latent_dim
         self.grid_size = grid_size
+        self.alpha = alpha
 
         self.register_buffer("mean_vec", mean_vec)
         self.register_buffer("cov_inv", cov_inv)
 
-        self.register_buffer(
-            "chi2_half_df",
-            torch.tensor(latent_dim / 2, dtype=mean_vec.dtype, device=mean_vec.device)
-        )
+        # Sorted reference samples (Mahalanobis distance / reconstruction error) computed
+        # on held-out empty tiles at fit time. predict_batch scores a new sample by its
+        # percentile rank against these (an empirical CDF), rather than a theoretical
+        # chi-squared CDF: the latent space isn't a single clean Gaussian, so the
+        # theoretical CDF saturates to 1.0 in float precision long before the true tail,
+        # collapsing resolution between merely-unusual and genuinely anomalous tiles.
+        dist_calib_sorted, _ = torch.sort(dist_calib)
+        recon_calib_sorted, _ = torch.sort(recon_calib)
+        self.register_buffer("dist_calib", dist_calib_sorted)
+        self.register_buffer("recon_calib", recon_calib_sorted)
 
         pos_emb_dim = max(16, 10 * 2)
         self.pos_embedding = PositionalEmbedding(input_dim=10, output_dim=pos_emb_dim)
@@ -999,22 +1007,21 @@ class MahalanobisScorer(nn.Module):
 
         return torch.sqrt(dist_sq)
 
+    @staticmethod
+    def _empirical_score(values, calib_sorted):
+        """Percentile rank of `values` against the sorted calibration sample, in [0, 1]."""
+        calib_sorted = calib_sorted.to(device=values.device, dtype=values.dtype)
+        idx = torch.searchsorted(calib_sorted, values.contiguous())
+        return idx.to(values.dtype) / calib_sorted.numel()
+
     def predict_batch(self, mu, recon_err, rows=None, cols=None):
         with torch.no_grad():
             dist = self.mahalanobis_distance(mu)
 
-            dist_scores = torch.special.gammainc(
-                self.chi2_half_df.to(device=dist.device, dtype=dist.dtype),
-                dist ** 2 / 2
-            )
+            dist_scores = self._empirical_score(dist, self.dist_calib)
+            recon_scores = self._empirical_score(recon_err, self.recon_calib)
 
-            recon_scores = torch.special.gammainc(
-                self.chi2_half_df.to(device=recon_err.device, dtype=recon_err.dtype),
-                recon_err ** 2 / 2
-            )
-
-            alpha = 0.5
-            probs = alpha * dist_scores + (1 - alpha) * recon_scores
+            probs = self.alpha * dist_scores + (1 - self.alpha) * recon_scores
 
             return probs
 import json

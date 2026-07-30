@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import random
+import subprocess
 import sys
 from time import time
 
@@ -54,7 +55,7 @@ print(f"Using device:      {device}")
 
 #%% Set parameters and paths
 
-ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data\Binary_classifier"
+ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data new\Binary_classifier"
 ROOT_DIR_C = r"C:\Users\Admin\Documents\Jellyscope\Training data\Binary_classifier"   
 
 SAMPLE_IMAGE_IDX_TRAIN = 0 # Index of the sample image to plot process (0-based)
@@ -64,7 +65,7 @@ DEBUG = False
 N_DEBUG = 5000
 EPOCHS_DEBUG = 10
 
-monitoring_effort = "Kristineberg_250915"  # for titles and saved model names, e.g. "kristineberg_251128" 
+monitoring_effort = "Kristineberg_260729"  # for titles and saved model names, e.g. "kristineberg_251128" 
 grid_size = 16  # number of tiles along one side (e.g. 6 means 6x6=36 tiles per image)
 offsets_normalized = [0.0, 0.2, 0.4, 0.6, 0.8]  # List of normalized offsets [0.0, 0.2, 0.4, 0.6, 0.8] creates crops at 0%, 20%, 40%, 60%, 80% offset; set to [] or [0.0] to disable offset cropping (single crop per tile)
 
@@ -73,8 +74,8 @@ image_size = 128
 latent_dims = 64
 hidden_channels = 32
 
-train_tiles_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train_VAE", f"tiles{grid_size}_offset{len(offsets_normalized)}")
-train_og_images_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train_VAE", "OG_images")
+train_tiles_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train_encoder", f"tiles{grid_size}_offset{len(offsets_normalized)}")
+train_og_images_path = os.path.join(ROOT_DIR_R, monitoring_effort, "train_encoder", "OG_images")
 
 print(f"train_tiles_path: {train_tiles_path}")
 print(f"train_og_images_path: {train_og_images_path}")
@@ -607,4 +608,24 @@ plt.show()
 #%% Model summary
 
 print(f"Bby you are done stop running cells and relax a lil")
+
+#%% Deploy checkpoint to the Jetson
+JETSON_MODELS_DIR = "jellyfish@jellyscope:/home/jellyfish/Github/Jellyscope/Jetson_monitoring/models"
+# BatchMode=yes so a first-time host-key prompt or a password/passphrase request fails fast
+# instead of scp hanging forever waiting for input nothing will ever supply (matches
+# Jetson_monitoring/Monitor/transfer.py's own SSH options).
+SCP_SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"]
+
+try:
+    scp_result = subprocess.run(
+        ["scp", *SCP_SSH_OPTS, str(model_output_path), JETSON_MODELS_DIR],
+        capture_output=True, text=True, timeout=120,
+    )
+    if scp_result.returncode == 0:
+        print(f"✓ Copied {model_output_path.name} to {JETSON_MODELS_DIR}")
+    else:
+        print(f"scp failed (exit {scp_result.returncode}): {scp_result.stderr.strip()}")
+except subprocess.TimeoutExpired:
+    print("scp timed out after 120s -- check that SSH key auth to jellyfish@jellyscope works "
+          "non-interactively (test with: ssh -o BatchMode=yes jellyfish@jellyscope whoami)")
 # %%

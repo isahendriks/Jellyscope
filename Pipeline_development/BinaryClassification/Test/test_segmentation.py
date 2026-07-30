@@ -160,13 +160,17 @@ elif scorer_mode == "mahalanobis":
     checkpoint_scorer = torch.load(scorer_name, map_location=device, weights_only=False)
     mean_vec = checkpoint_scorer["mean_vec"].to(device)
     cov_inv = checkpoint_scorer["cov_inv"].to(device)
+    dist_calib = checkpoint_scorer["dist_calib"].to(device)
+    recon_calib = checkpoint_scorer["recon_calib"].to(device)
     scorer_threshold = float(checkpoint_scorer.get("threshold", 0.5))
-    
+
     scorer = MahalanobisScorer(
             latent_dim=latent_dim,
             grid_size=tile_grid_size,
             mean_vec=mean_vec,
             cov_inv=cov_inv,
+            dist_calib=dist_calib,
+            recon_calib=recon_calib,
         ).to(device)
 
  

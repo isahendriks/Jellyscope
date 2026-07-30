@@ -13,6 +13,7 @@ Before running this:
 """
 
 import os
+import subprocess
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -69,8 +70,10 @@ print(f"Using device:      {device}")
 #%% Configuration and Hyperparameters
 
 # Configuration
-ROOT_DIR_C = r"C:\Users\Admin\Documents\Jellyscope\Training data\Binary_classifier"   
-monitoring_effort = "Kristineberg_250915"
+ROOT_DIR_C = r"C:\Users\Admin\Documents\Jellyscope\Training data new\Binary_classifier"   
+ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data new\Binary_classifier"
+
+monitoring_effort = "Kristineberg_260729"
 grid_size = 16
 tile_size = int(4512/grid_size)
 image_size_vae = 128
@@ -89,7 +92,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
 print(f"Model: {model_name}")
 
-#%% Load VAE model
+#%% Load encoder model
 checkpoint = torch.load(model_name, map_location=device, weights_only=False)
 
 latent_dims = checkpoint.get("latent_dim")
@@ -114,7 +117,7 @@ else:
 print(f"Loaded {encoder} model with latent_dim={latent_dims}, grid_size={grid_size}")
 
 #%% Load training data
-tiles_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train_DNN", f"tiles{grid_size}_offsets{len(offsets_normalized)}_labelme")
+tiles_path = os.path.join(ROOT_DIR_R, monitoring_effort, "train_scorer", f"tiles{grid_size}_offsets{len(offsets_normalized)}")
 tiles_path_obs = os.path.join(tiles_path, "obs")
 tiles_paths_obs = sorted(Path(tiles_path_obs).rglob("*.png"))
 
@@ -902,11 +905,30 @@ X_latent = train_maha_latent
 cov = np.cov(X_latent, rowvar=False)
 cov_inv = np.linalg.inv(cov)
 
+print(f"\nMahalanobis covariance fit on {X_latent.shape[0]} empty samples, latent_dim={X_latent.shape[1]}")
+print(f"  Covariance condition number: {np.linalg.cond(cov):.2e} (>1e6 indicates an unstable/overfit inverse)")
+
 cov = torch.tensor(cov, dtype=torch.float32).to(device)
 cov_inv = torch.tensor(cov_inv, dtype=torch.float32).to(device)
 mean_vec = torch.mean(X_latent, dim=0).to(device)
 
-scorer_maha = MahalanobisScorer(cov_inv=cov_inv, mean_vec=mean_vec)
+# Calibrate the empirical-CDF scoring against a held-out empty split (val_dataset_oneclass,
+# drawn from different original images than the ones used to fit mean_vec/cov_inv above) so
+# the reference distribution isn't biased by points always looking "close" to their own fit.
+calib_latent = val_dataset_oneclass.tensors[0].to(device)
+calib_recon = val_dataset_oneclass.tensors[1].to(device)
+
+diff = calib_latent - mean_vec
+dist_calib = torch.sqrt(torch.clamp(torch.sum((diff @ cov_inv) * diff, dim=1), min=0))
+
+print(f"Calibration set: {calib_latent.shape[0]} held-out empty samples")
+
+scorer_maha = MahalanobisScorer(
+    cov_inv=cov_inv,
+    mean_vec=mean_vec,
+    dist_calib=dist_calib,
+    recon_calib=calib_recon,
+)
 
 #%% EVALUATION: Find optimal threshold and plot ROC curve and confusion matrix
 test_loader = DataLoader(test_dataset_lat, batch_size=batch_size, shuffle=False, num_workers=0)
@@ -916,7 +938,7 @@ n_empty = len(test_loader.dataset) - n_obs
 
 print(f"\nEvaluating on test set with {len(test_loader.dataset)} samples, n_obs={n_obs:.0f}, n_empty={n_empty:.0f}")
 
-mode = "binary"  # Change to "one_class" if evaluating one-class model
+mode = "mahalanobis"  # Change to "one_class" if evaluating one-class model
 
 if mode == "one_class":
     scorer = scorer_oc
@@ -941,7 +963,7 @@ with torch.no_grad():
         rows = rows.to(device, non_blocking=True)
         cols = cols.to(device, non_blocking=True)
         # y = y.to(device, non_blocking=True)
-        
+
         if mode == "one_class":
             z = scorer(X_latent, X_recon, rows, cols)
             scores = ((z - center) ** 2).sum(dim=1)
@@ -963,79 +985,111 @@ all_labels = np.concatenate(all_labels)
 all_recon = np.concatenate(all_recon)
 all_scores = np.concatenate(all_scores)  # Combine model score and reconstruction error for evaluation
 
-# Plot precision-recall curve
-precision, recall, thresholds = precision_recall_curve(all_labels, all_scores)
-avg_precision = average_precision_score(all_labels, all_scores)
+if n_obs == 0:
+    # No observation samples in the test set: classification metrics (ROC/PR/confusion
+    # matrix) are undefined without a positive class, so fall back to a one-class threshold
+    # chosen from the empty-sample score distribution instead (e.g. "flag the top 1% most
+    # anomalous empty tiles").
+    print(
+        "\nNo observation samples in test set (n_obs=0): skipping ROC/PR/confusion-matrix "
+        "evaluation since those metrics require a positive class.\n"
+        "Falling back to one-class thresholding based on the empty-tile score distribution."
+    )
 
-# calculate threshold based on optimized F-scores
-# Note: precision and recall have length n_thresholds+1, thresholds has length n_thresholds
-# So we only use the first n_thresholds elements of precision/recall
-f0_25_scores = 1.0625 * (precision[:-1] * recall[:-1]) / (0.0625 * precision[:-1] + recall[:-1] + 1e-8)
-f0_5_scores = 1.25 * (precision[:-1] * recall[:-1]) / (0.25 * precision[:-1] + recall[:-1] + 1e-8)
-f1_scores = 2 * (precision[:-1] * recall[:-1]) / (precision[:-1] + recall[:-1] + 1e-8)
-f2_scores = 5 * (precision[:-1] * recall[:-1]) / (4 * precision[:-1] + recall[:-1] + 1e-8)
-f3_scores = 10 * (precision[:-1] * recall[:-1]) / (9 * precision[:-1] + recall[:-1] + 1e-8)
+    avg_precision = float('nan')
 
-# Calculate best threshold for each F-score
-best_idx_f0_25 = np.argmax(f0_25_scores)
-best_idx_f0_5 = np.argmax(f0_5_scores)
-best_idx_f1 = np.argmax(f1_scores)
-best_idx_f2 = np.argmax(f2_scores)
-best_idx_f3 = np.argmax(f3_scores)
+    percentile = 99.0
+    best_threshold = float(np.percentile(all_scores, percentile))
 
-best_threshold_f0_25 = thresholds[best_idx_f0_25]
-best_threshold_f0_5 = thresholds[best_idx_f0_5]
-best_threshold_f1 = thresholds[best_idx_f1]
-best_threshold_f2 = thresholds[best_idx_f2]
-best_threshold_f3 = thresholds[best_idx_f3]
-youdens_j = recall - (1 - precision)
-best_idx_youden = np.argmax(youdens_j)
-best_threshold_youden = thresholds[best_idx_youden]
+    print(f"\nEmpty-tile score distribution:")
+    print(f"  mean = {all_scores.mean():.4f}, std = {all_scores.std():.4f}")
+    print(f"  min = {all_scores.min():.4f}, max = {all_scores.max():.4f}")
+    print(f"\nRecommended threshold ({percentile:.0f}th percentile of empty scores): {best_threshold:.4f}")
+    print("  (Tiles scoring above this are flagged as anomalies/observations)")
 
-print(f"Optimal thresholds:")
-print(f"  0.25 score: {best_threshold_f0_25:.4f} (0.25={f0_25_scores[best_idx_f0_25]:.4f})")
-print(f"  0.5 score: {best_threshold_f0_5:.4f} (0.5={f0_5_scores[best_idx_f0_5]:.4f})")
-print(f"  F1 score: {best_threshold_f1:.4f} (F1={f1_scores[best_idx_f1]:.4f})")
-print(f"  F2 score: {best_threshold_f2:.4f} (F2={f2_scores[best_idx_f2]:.4f})")
-print(f"  F3 score: {best_threshold_f3:.4f} (F3={f3_scores[best_idx_f3]:.4f})")
+    plt.figure(figsize=(6, 6))
+    plt.hist(all_scores, bins=50, alpha=0.7, label='Empty tiles')
+    plt.axvline(best_threshold, color='r', linestyle='--', label=f'Threshold = {best_threshold:.4f}')
+    plt.xlabel('Anomaly score')
+    plt.ylabel('Count')
+    plt.title('Score Distribution on Empty Tiles (one-class evaluation)')
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.show()
+else:
+    # Plot precision-recall curve
+    precision, recall, thresholds = precision_recall_curve(all_labels, all_scores)
+    avg_precision = average_precision_score(all_labels, all_scores)
 
-# Use F3 since you prefer recall (catching obs) over precision
-best_threshold = best_threshold_f3
-print(f"\nRecommended threshold based on Youden's J statistic: {best_threshold:.4f}")
+    # calculate threshold based on optimized F-scores
+    # Note: precision and recall have length n_thresholds+1, thresholds has length n_thresholds
+    # So we only use the first n_thresholds elements of precision/recall
+    f0_25_scores = 1.0625 * (precision[:-1] * recall[:-1]) / (0.0625 * precision[:-1] + recall[:-1] + 1e-8)
+    f0_5_scores = 1.25 * (precision[:-1] * recall[:-1]) / (0.25 * precision[:-1] + recall[:-1] + 1e-8)
+    f1_scores = 2 * (precision[:-1] * recall[:-1]) / (precision[:-1] + recall[:-1] + 1e-8)
+    f2_scores = 5 * (precision[:-1] * recall[:-1]) / (4 * precision[:-1] + recall[:-1] + 1e-8)
+    f3_scores = 10 * (precision[:-1] * recall[:-1]) / (9 * precision[:-1] + recall[:-1] + 1e-8)
 
-plt.figure(figsize=(6, 6))
-plt.plot(recall, precision, label=f'Precision-Recall curve (AP = {avg_precision:.4f})')
-plt.xlabel('Recall')
-plt.ylabel('Precision')
-plt.title('Precision-Recall Curve')
-plt.legend()
-plt.grid(alpha=0.3)
-plt.show()
+    # Calculate best threshold for each F-score
+    best_idx_f0_25 = np.argmax(f0_25_scores)
+    best_idx_f0_5 = np.argmax(f0_5_scores)
+    best_idx_f1 = np.argmax(f1_scores)
+    best_idx_f2 = np.argmax(f2_scores)
+    best_idx_f3 = np.argmax(f3_scores)
 
-# Plot ROC curve and confusion matrix
-fpr, tpr, _ = roc_curve(all_labels, all_scores)
-roc_auc = auc(fpr, tpr)
-x_threshold = fpr[np.argmin(np.abs(_ - best_threshold))]
-y_threshold = tpr[np.argmin(np.abs(_ - best_threshold))]
+    best_threshold_f0_25 = thresholds[best_idx_f0_25]
+    best_threshold_f0_5 = thresholds[best_idx_f0_5]
+    best_threshold_f1 = thresholds[best_idx_f1]
+    best_threshold_f2 = thresholds[best_idx_f2]
+    best_threshold_f3 = thresholds[best_idx_f3]
+    youdens_j = recall - (1 - precision)
+    best_idx_youden = np.argmax(youdens_j)
+    best_threshold_youden = thresholds[best_idx_youden]
 
-plt.figure(figsize=(6, 6))
-plt.plot(fpr, tpr, label=f'ROC curve (AUC = {roc_auc:.4f})')
-plt.plot(x_threshold, y_threshold, 'ro', label=f'Threshold = {best_threshold:.4f}')
-plt.plot([0, 1], [0, 1], 'k--')
-plt.xlabel('False Positive Rate')
-plt.ylabel('True Positive Rate')
-plt.title('ROC Curve')
-plt.legend()
-plt.grid(alpha=0.3)
-plt.show()
+    print(f"Optimal thresholds:")
+    print(f"  0.25 score: {best_threshold_f0_25:.4f} (0.25={f0_25_scores[best_idx_f0_25]:.4f})")
+    print(f"  0.5 score: {best_threshold_f0_5:.4f} (0.5={f0_5_scores[best_idx_f0_5]:.4f})")
+    print(f"  F1 score: {best_threshold_f1:.4f} (F1={f1_scores[best_idx_f1]:.4f})")
+    print(f"  F2 score: {best_threshold_f2:.4f} (F2={f2_scores[best_idx_f2]:.4f})")
+    print(f"  F3 score: {best_threshold_f3:.4f} (F3={f3_scores[best_idx_f3]:.4f})")
 
-preds = (all_scores >= best_threshold).astype(int)
-cm = confusion_matrix(all_labels, preds)
-disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Empty', 'Observation'])
-disp.plot(cmap='Blues')
+    # Use F3 since you prefer recall (catching obs) over precision
+    best_threshold = best_threshold_f3
+    print(f"\nRecommended threshold based on Youden's J statistic: {best_threshold:.4f}")
 
-plt.title('Confusion Matrix')
-plt.show()
+    plt.figure(figsize=(6, 6))
+    plt.plot(recall, precision, label=f'Precision-Recall curve (AP = {avg_precision:.4f})')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title('Precision-Recall Curve')
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.show()
+
+    # Plot ROC curve and confusion matrix
+    fpr, tpr, _ = roc_curve(all_labels, all_scores)
+    roc_auc = auc(fpr, tpr)
+    x_threshold = fpr[np.argmin(np.abs(_ - best_threshold))]
+    y_threshold = tpr[np.argmin(np.abs(_ - best_threshold))]
+
+    plt.figure(figsize=(6, 6))
+    plt.plot(fpr, tpr, label=f'ROC curve (AUC = {roc_auc:.4f})')
+    plt.plot(x_threshold, y_threshold, 'ro', label=f'Threshold = {best_threshold:.4f}')
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC Curve')
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.show()
+
+    preds = (all_scores >= best_threshold).astype(int)
+    cm = confusion_matrix(all_labels, preds)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Empty', 'Observation'])
+    disp.plot(cmap='Blues')
+
+    plt.title('Confusion Matrix')
+    plt.show()
 
 # Plot score distribution for empty vs observation samples on PCA of latent space, labels in different shapes, and color by score
 # Make colorbar change colors at the threshold for better visualization
@@ -1102,6 +1156,8 @@ elif mode == "mahalanobis":
     checkpoint = {
                 'mean_vec': mean_vec.cpu(),
                 'cov_inv': cov_inv.cpu(),
+                'dist_calib': dist_calib.cpu(),
+                'recon_calib': calib_recon.cpu(),
                 'threshold': best_threshold,
                 'latent_dim': latent_dims,
                 'grid_size': grid_size,
@@ -1139,9 +1195,34 @@ elif mode == "binary":
     print(f"  Threshold: {checkpoint['threshold']:.4f}")
     print(f"  Average Precision: {checkpoint['average_precision']:.4f}")
 elif mode == "mahalanobis":
-    scorer_loaded = MahalanobisScorer(cov_inv=checkpoint['cov_inv'].to(device), mean_vec=checkpoint['mean_vec'].to(device))
+    scorer_loaded = MahalanobisScorer(
+        cov_inv=checkpoint['cov_inv'].to(device),
+        mean_vec=checkpoint['mean_vec'].to(device),
+        dist_calib=checkpoint['dist_calib'].to(device),
+        recon_calib=checkpoint['recon_calib'].to(device),
+    )
     print(f"✓ Loaded Mahalanobis scorer model from {scorer_model_name}")
     print(f"  Threshold: {checkpoint['threshold']:.4f}")
     print(f"  Average Precision: {checkpoint['average_precision']:.4f}")
 else:
-    raise ValueError(f"Invalid mode: {mode}. Cannot load model.")   
+    raise ValueError(f"Invalid mode: {mode}. Cannot load model.")
+
+#%% Deploy scorer checkpoint to the Jetson
+JETSON_MODELS_DIR = "jellyfish@jellyscope:/home/jellyfish/Github/Jellyscope/Jetson_monitoring/models"
+# BatchMode=yes so a first-time host-key prompt or a password/passphrase request fails fast
+# instead of scp hanging forever waiting for input nothing will ever supply (matches
+# Jetson_monitoring/Monitor/transfer.py's own SSH options).
+SCP_SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"]
+
+try:
+    scp_result = subprocess.run(
+        ["scp", *SCP_SSH_OPTS, scorer_model_name, JETSON_MODELS_DIR],
+        capture_output=True, text=True, timeout=120,
+    )
+    if scp_result.returncode == 0:
+        print(f"✓ Copied {Path(scorer_model_name).name} to {JETSON_MODELS_DIR}")
+    else:
+        print(f"scp failed (exit {scp_result.returncode}): {scp_result.stderr.strip()}")
+except subprocess.TimeoutExpired:
+    print("scp timed out after 120s -- check that SSH key auth to jellyfish@jellyscope works "
+          "non-interactively (test with: ssh -o BatchMode=yes jellyfish@jellyscope whoami)")
