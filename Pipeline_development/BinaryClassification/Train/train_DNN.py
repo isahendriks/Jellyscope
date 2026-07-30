@@ -32,6 +32,7 @@ import sys
 
 # import PCA
 from sklearn.decomposition import PCA
+from sklearn.covariance import LedoitWolf
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -897,38 +898,31 @@ plt.show()
 #%% Mahalanobis distance scorer with torch implementation for fast distance calculation in latent space
 
 # calculate covariance matrice of empty samples in latent space for Mahalanobis distance
-# scaler = StandardScaler()
 
 train_maha_latent = train_dataset_oneclass.tensors[0]  # Get latent features of empty samples
 X_latent = train_maha_latent
 
-cov = np.cov(X_latent, rowvar=False)
+# Ledoit-Wolf shrinkage instead of the raw sample covariance (np.cov) -- estimating a
+# latent_dim=64-dimensional covariance needs far more samples than a modest set of empty
+# tiles to be well-conditioned. A poorly-conditioned cov_inv (observed in practice with
+# eigenvalue ratios in the hundreds of thousands) makes the Mahalanobis distance blow up
+# from any small deviation in mu along the covariance's near-zero-variance directions --
+# including ordinary encoder imprecision (e.g. INT8 quantization drift on the Jetson side),
+# not just genuine anomalies, saturating every tile's score to the same ceiling regardless
+# of content. LedoitWolf picks its shrinkage intensity analytically (Ledoit & Wolf, 2004),
+# not a hand-tuned constant, pulling the estimate toward a well-conditioned diagonal target.
+X_latent_np = X_latent.cpu().numpy()
+lw = LedoitWolf().fit(X_latent_np)
+cov = lw.covariance_
 cov_inv = np.linalg.inv(cov)
-
-print(f"\nMahalanobis covariance fit on {X_latent.shape[0]} empty samples, latent_dim={X_latent.shape[1]}")
-print(f"  Covariance condition number: {np.linalg.cond(cov):.2e} (>1e6 indicates an unstable/overfit inverse)")
+print(f"Covariance shrinkage intensity (Ledoit-Wolf): {lw.shrinkage_:.4f}")
+print(f"cov_inv condition number: {np.linalg.cond(cov_inv):.3e} (was unbounded/huge with raw np.cov on undersampled data)")
 
 cov = torch.tensor(cov, dtype=torch.float32).to(device)
 cov_inv = torch.tensor(cov_inv, dtype=torch.float32).to(device)
 mean_vec = torch.mean(X_latent, dim=0).to(device)
 
-# Calibrate the empirical-CDF scoring against a held-out empty split (val_dataset_oneclass,
-# drawn from different original images than the ones used to fit mean_vec/cov_inv above) so
-# the reference distribution isn't biased by points always looking "close" to their own fit.
-calib_latent = val_dataset_oneclass.tensors[0].to(device)
-calib_recon = val_dataset_oneclass.tensors[1].to(device)
-
-diff = calib_latent - mean_vec
-dist_calib = torch.sqrt(torch.clamp(torch.sum((diff @ cov_inv) * diff, dim=1), min=0))
-
-print(f"Calibration set: {calib_latent.shape[0]} held-out empty samples")
-
-scorer_maha = MahalanobisScorer(
-    cov_inv=cov_inv,
-    mean_vec=mean_vec,
-    dist_calib=dist_calib,
-    recon_calib=calib_recon,
-)
+scorer_maha = MahalanobisScorer(cov_inv=cov_inv, mean_vec=mean_vec)
 
 #%% EVALUATION: Find optimal threshold and plot ROC curve and confusion matrix
 test_loader = DataLoader(test_dataset_lat, batch_size=batch_size, shuffle=False, num_workers=0)
@@ -1195,12 +1189,7 @@ elif mode == "binary":
     print(f"  Threshold: {checkpoint['threshold']:.4f}")
     print(f"  Average Precision: {checkpoint['average_precision']:.4f}")
 elif mode == "mahalanobis":
-    scorer_loaded = MahalanobisScorer(
-        cov_inv=checkpoint['cov_inv'].to(device),
-        mean_vec=checkpoint['mean_vec'].to(device),
-        dist_calib=checkpoint['dist_calib'].to(device),
-        recon_calib=checkpoint['recon_calib'].to(device),
-    )
+    scorer_loaded = MahalanobisScorer(cov_inv=checkpoint['cov_inv'].to(device), mean_vec=checkpoint['mean_vec'].to(device))
     print(f"✓ Loaded Mahalanobis scorer model from {scorer_model_name}")
     print(f"  Threshold: {checkpoint['threshold']:.4f}")
     print(f"  Average Precision: {checkpoint['average_precision']:.4f}")

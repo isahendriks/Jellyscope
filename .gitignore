@@ -34,8 +34,11 @@ wandb/
 **/models/
 **/logs/
 
-# TensorRT export/calibration/build artifacts (monitoring/ INT8 pipeline)
-monitoring/trt/
+# TensorRT export/calibration/build artifacts (Jetson_monitoring/ INT8 pipeline).
+# NOTE: this directory used to be named "monitoring/" -- if it gets renamed again,
+# update this pattern too, or it'll silently stop matching (a slash in the middle
+# root-anchors it to a literal path, it won't match anywhere the dir shows up).
+Jetson_monitoring/trt/
 
 # Data files (optional - if you don't want to track large datasets)
 *.png
@@ -43,5 +46,6 @@ monitoring/trt/
 *.jpeg
 data/
 
-# Secrets (webhook URLs, API keys, etc.) -- see secrets_example.py for the template
-Jetson_monitoring/Monitor/secrets.py
+# Secrets (webhook URLs, API keys, etc.) -- see webhook_secrets_example.py for the
+# template. Named webhook_secrets.py, not secrets.py -- see that file's docstring.
+Jetson_monitoring/Monitor/webhook_secrets.py
