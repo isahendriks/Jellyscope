@@ -915,8 +915,6 @@ X_latent_np = X_latent.cpu().numpy()
 lw = LedoitWolf().fit(X_latent_np)
 cov = lw.covariance_
 cov_inv = np.linalg.inv(cov)
-print(f"Covariance shrinkage intensity (Ledoit-Wolf): {lw.shrinkage_:.4f}")
-print(f"cov_inv condition number: {np.linalg.cond(cov_inv):.3e} (was unbounded/huge with raw np.cov on undersampled data)")
 
 cov = torch.tensor(cov, dtype=torch.float32).to(device)
 cov_inv = torch.tensor(cov_inv, dtype=torch.float32).to(device)
