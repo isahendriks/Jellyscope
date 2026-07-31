@@ -27,10 +27,10 @@ AUGMENTATION = False
 # Set to [] or [0.0] to disable offset cropping (single crop per tile)
 OFFSET_NORMALIZED = [0.0, 0.2, 0.4, 0.6, 0.8]
 
-monitoring_effort = "Kristineberg_260729" #"Kristineberg_260424" 
+monitoring_effort = "Kristineberg_260730" #"Kristineberg_260424" 
 
 # Folder paths
-input_folder = f"{monitoring_effort}\\train_scorer\\OG_images"# Folder containing images to split
+input_folder = f"{monitoring_effort}\\train_scorer\\no_obs\\OG_images"# Folder containing images to split
 output_folder = f"{monitoring_effort}\\train_scorer\\tiles{grid_size}_offsets{len(OFFSET_NORMALIZED)}\\no_obs"# Folder to save the tiles (will be created if it doesn't exist)
 
 input_path = Path(ROOT_DIR_R).joinpath(Path(input_folder))
@@ -120,7 +120,6 @@ def process_single_image(args):
         
     except Exception as e:
         return 0, f"✗ Error processing {image_file.name}: {e}"
-
 
 #%% Cell 5: Process images using multiprocessing
 

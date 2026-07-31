@@ -31,7 +31,7 @@ from collections import defaultdict
 grid_size = 16
 tile_size = int(4512 / grid_size)
 
-monitoring_effort = "Kristineberg_250915"
+monitoring_effort = "Kristineberg_260730"
 
 OFFSET_NORMALIZED = [0.0, 0.2, 0.4, 0.6, 0.8]
 
@@ -43,7 +43,7 @@ MIN_MASK_FRACTION = 0.01
 sort_species = False
 ROOT_C = f"C:\\Users\\Admin\\Documents\\Jellyscope\\Training data\\Binary_classifier\\{monitoring_effort}"
 
-folder = Path("test")
+folder = Path("test\\obs")
 
 input_folder = rf"OG_images"
 output_folder = rf"tiles{grid_size}_offsets{len(OFFSET_NORMALIZED)}_labelme"

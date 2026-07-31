@@ -65,7 +65,7 @@ DEBUG = False
 N_DEBUG = 5000
 EPOCHS_DEBUG = 10
 
-monitoring_effort = "Kristineberg_260729"  # for titles and saved model names, e.g. "kristineberg_251128" 
+monitoring_effort = "Kristineberg_260730"  # for titles and saved model names, e.g. "kristineberg_251128" 
 grid_size = 16  # number of tiles along one side (e.g. 6 means 6x6=36 tiles per image)
 offsets_normalized = [0.0, 0.2, 0.4, 0.6, 0.8]  # List of normalized offsets [0.0, 0.2, 0.4, 0.6, 0.8] creates crops at 0%, 20%, 40%, 60%, 80% offset; set to [] or [0.0] to disable offset cropping (single crop per tile)
 
@@ -74,8 +74,8 @@ image_size = 128
 latent_dims = 64
 hidden_channels = 32
 
-train_tiles_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train_encoder", f"tiles{grid_size}_offset{len(offsets_normalized)}")
-train_og_images_path = os.path.join(ROOT_DIR_R, monitoring_effort, "train_encoder", "OG_images")
+train_tiles_path = os.path.join(ROOT_DIR_R, monitoring_effort, "train_encoder", f"tiles{grid_size}_offsets{len(offsets_normalized)}", "no_obs")
+train_og_images_path = os.path.join(ROOT_DIR_R, monitoring_effort, "train_encoder", "OG_images", "no_obs")
 
 print(f"train_tiles_path: {train_tiles_path}")
 print(f"train_og_images_path: {train_og_images_path}")
@@ -194,7 +194,6 @@ SAMPLE_IMAGE_IDX_TRAIN = random.randint(0, len(images_train) - 1)  # Index of th
 sample_image_path_train = images_train[SAMPLE_IMAGE_IDX_TRAIN] 
 sample_image_name_train = sample_image_path_train.stem
 
-
 # Find all tiles corresponding to the sample image
 _r_patterns = ("?", "??", "???", "????")
 _c_patterns = ("?", "??", "???", "????")
@@ -207,8 +206,6 @@ sample_image_tiles_path_train = sorted({
         f"{sample_image_name_train}_r{r_pat}_c{c_pat}_o0.png"
     )
 })
-
-
 
 print(f"Loaded sample train image: {sample_image_name_train}, #tiles: {len(sample_image_tiles_path_train)}")
  

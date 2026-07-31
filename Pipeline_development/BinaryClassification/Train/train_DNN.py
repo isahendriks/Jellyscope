@@ -74,7 +74,7 @@ print(f"Using device:      {device}")
 ROOT_DIR_C = r"C:\Users\Admin\Documents\Jellyscope\Training data new\Binary_classifier"   
 ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data new\Binary_classifier"
 
-monitoring_effort = "Kristineberg_260729"
+monitoring_effort = "Kristineberg_260730"
 grid_size = 16
 tile_size = int(4512/grid_size)
 image_size_vae = 128
@@ -920,7 +920,21 @@ cov = torch.tensor(cov, dtype=torch.float32).to(device)
 cov_inv = torch.tensor(cov_inv, dtype=torch.float32).to(device)
 mean_vec = torch.mean(X_latent, dim=0).to(device)
 
-scorer_maha = MahalanobisScorer(cov_inv=cov_inv, mean_vec=mean_vec)
+# Calibration reference: Mahalanobis distance and reconstruction error of held-out empty
+# tiles (val split, distinct from the train split used to fit mean_vec/cov_inv above), so
+# predict_batch's percentile-rank scoring isn't optimistic about its own fitting data.
+oneclass_mask_val = val_dataset_lat.tensors[4] == 0
+calib_latent = val_dataset_lat.tensors[0][oneclass_mask_val].to(device)
+calib_recon = val_dataset_lat.tensors[1][oneclass_mask_val].to(device)
+
+calib_diff = calib_latent - mean_vec
+dist_calib = torch.sqrt(torch.clamp(torch.sum((calib_diff @ cov_inv) * calib_diff, dim=1), min=0))
+
+scorer_maha = MahalanobisScorer(
+    cov_inv=cov_inv, mean_vec=mean_vec,
+    dist_calib=dist_calib, recon_calib=calib_recon,
+    latent_dim=latent_dims, grid_size=grid_size,
+)
 
 #%% EVALUATION: Find optimal threshold and plot ROC curve and confusion matrix
 test_loader = DataLoader(test_dataset_lat, batch_size=batch_size, shuffle=False, num_workers=0)
@@ -1187,7 +1201,11 @@ elif mode == "binary":
     print(f"  Threshold: {checkpoint['threshold']:.4f}")
     print(f"  Average Precision: {checkpoint['average_precision']:.4f}")
 elif mode == "mahalanobis":
-    scorer_loaded = MahalanobisScorer(cov_inv=checkpoint['cov_inv'].to(device), mean_vec=checkpoint['mean_vec'].to(device))
+    scorer_loaded = MahalanobisScorer(
+        cov_inv=checkpoint['cov_inv'].to(device), mean_vec=checkpoint['mean_vec'].to(device),
+        dist_calib=checkpoint['dist_calib'].to(device), recon_calib=checkpoint['recon_calib'].to(device),
+        latent_dim=checkpoint['latent_dim'], grid_size=checkpoint['grid_size'],
+    )
     print(f"✓ Loaded Mahalanobis scorer model from {scorer_model_name}")
     print(f"  Threshold: {checkpoint['threshold']:.4f}")
     print(f"  Average Precision: {checkpoint['average_precision']:.4f}")
