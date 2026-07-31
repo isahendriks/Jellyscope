@@ -29,7 +29,7 @@ from collections import deque
 import requests
 
 import config
-import secrets
+import webhook_secrets
 
 # (timestamp, dew_point_c, bme280_pressure_mbar) tuples, trimmed to config.LEAK_WARNING_WINDOW_S
 _history: deque = deque()
@@ -53,11 +53,11 @@ def send_slack_alert(text: str) -> bool:
     """Best-effort -- never raises. If the webhook itself is unreachable (same
     flaky-5G/Tailscale link everything else here contends with), logs and
     moves on rather than blocking metadata.py's sample loop."""
-    if not secrets.SLACK_WEBHOOK_URL:
-        print("[leak_alert] SLACK_WEBHOOK_URL not configured, skipping alert -- see secrets_example.py")
+    if not webhook_secrets.SLACK_WEBHOOK_URL:
+        print("[leak_alert] SLACK_WEBHOOK_URL not configured, skipping alert -- see webhook_secrets_example.py")
         return False
     try:
-        resp = requests.post(secrets.SLACK_WEBHOOK_URL, json={"text": text}, timeout=10)
+        resp = requests.post(webhook_secrets.SLACK_WEBHOOK_URL, json={"text": text}, timeout=10)
         if resp.status_code != 200:
             print(f"[leak_alert] Slack webhook returned {resp.status_code}: {resp.text[:200]}")
             return False

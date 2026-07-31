@@ -14,8 +14,8 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from functions import split_image_into_tiles
 #%% Cell 2: Define User Parameters
-ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data new\Binary_classifier"
-ROOT_DIR_C = r"C:\Users\IsaH\Documents\Jellyscope\Training data new\Binary_classifier"   
+ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data\Binary_classifier"
+ROOT_DIR_C = r"C:\Users\Admin\Documents\Jellyscope\Training data\Binary_classifier"   
 
 # Tile parameters
 grid_size = 16  # number of tiles along one side (e.g. 6 means 6x6=36 tiles per image)

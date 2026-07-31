@@ -14,13 +14,21 @@ by train/ and engines/build_trt_int8.py; nothing here ever trains anything.
 The FP32 loaders (models/segmentation.py, models/vit_classifier.py's
 load_classifier) still exist, but only for engines/export_onnx.py's tracing
 step -- this file no longer imports them.
+
+One exception: SEGMENT's scorer stage can be either a "binary" TwoClassScorer
+(INT8 TensorRT, same as everything else) or a "mahalanobis" distance-based
+scorer, which models/segmentation_trt.py runs directly as FP32 PyTorch instead
+(cheap linear algebra, and its chi-squared CDF can't be traced to ONNX/TensorRT
+in the first place). Whichever mode config.SEGMENTATION_SCORER_MODEL_PATH's
+checkpoint was saved in is auto-detected and used -- see
+models/segmentation.py's build_scorer()/detect_scorer_type().
 """
 
 import gc
 import json
 import threading
 import time
-from pathlib import Path
+from collections import deque
 
 import cv2
 import numpy as np
@@ -55,7 +63,7 @@ queue_io.ensure_queue_dirs(config.QUE_FULLFRAMES)
 queue_io.ensure_queue_dirs(config.QUE_CROPS)
 config.HEARTBEAT_DIR.mkdir(parents=True, exist_ok=True)
 
-print("Loading INT8 segmentation engines (encoder/decoder/scorer)...")
+print("Loading segmentation engines (encoder/decoder always INT8; scorer is INT8 or FP32 Mahalanobis, auto-detected)...")
 encoder_engine, decoder_engine, scorer_engine, scorer_threshold, seg_grid_size, seg_image_size = load_segmentation_engines(
     config.SEGMENTATION_AE_MODEL_PATH, config.SEGMENTATION_SCORER_MODEL_PATH, config.ENGINE_DIR, device,
 )
@@ -63,9 +71,13 @@ encoder_engine, decoder_engine, scorer_engine, scorer_threshold, seg_grid_size, 
 if seg_grid_size != config.SEG_TILE_GRID_SIZE:
     raise ValueError(f"Segmentation checkpoint grid_size={seg_grid_size} does not match "
                      f"config.SEG_TILE_GRID_SIZE={config.SEG_TILE_GRID_SIZE}")
+if config.SEGMENTATION_SCORER_THRESHOLD_OVERRIDE is not None:
+    print(f"Overriding checkpoint's threshold ({scorer_threshold:.4f}) with "
+          f"config.SEGMENTATION_SCORER_THRESHOLD_OVERRIDE={config.SEGMENTATION_SCORER_THRESHOLD_OVERRIDE:.4f}")
+    scorer_threshold = config.SEGMENTATION_SCORER_THRESHOLD_OVERRIDE
 peak_threshold = scorer_threshold
 secondary_threshold = peak_threshold * 0.99
-print(f"Loaded INT8 segmentation engines. Scorer threshold: {scorer_threshold:.4f}")
+print(f"Loaded segmentation engines. Scorer threshold: {scorer_threshold:.4f}")
 
 classifier_engine, idx_to_class = None, {}
 if config.CLASSIFY:
@@ -95,6 +107,13 @@ total_processing_time_sum = 0.0  # sum of each frame's "total" (record->stream);
 latest_frame_lock = threading.Lock()
 latest_frame_jpeg = None
 
+# Most-recent confidently-labeled crops (oldest evicted automatically past
+# RECENT_CROPS_COUNT) plus the rendered thumbnail-strip JPEG built from them --
+# same lock/publish idiom as latest_frame_jpeg above, just a second image.
+recent_crops_lock = threading.Lock()
+recent_labeled_crops = deque(maxlen=config.RECENT_CROPS_COUNT)
+latest_crops_strip_jpeg = None
+
 
 def update_live_frame(enhanced, results) -> None:
     """Draws a green box around each accepted crop (+ its label once confidence
@@ -119,6 +138,59 @@ def update_live_frame(enhanced, results) -> None:
     if ok:
         with latest_frame_lock:
             latest_frame_jpeg = encoded.tobytes()
+
+
+def update_recent_crops_strip(results) -> None:
+    """Appends this frame's confidently-labeled crops (same CONFIDENCE_THRESHOLD
+    gate as the box labels drawn in update_live_frame above) to recent_labeled_crops,
+    then re-renders the whole deque into a single side-by-side thumbnail-strip JPEG
+    for the live-stream window. Decodes crop_image back out of results' already-encoded
+    PNG bytes rather than re-slicing `enhanced`, so this has no dependency on the
+    full-resolution frame surviving past this call."""
+    global latest_crops_strip_jpeg
+    with recent_crops_lock:
+        for _crop_stem, encoded_bytes, sidecar in results:
+            if sidecar["class_confidence"] is not None and sidecar["class_confidence"] >= config.CONFIDENCE_THRESHOLD:
+                recent_labeled_crops.append((encoded_bytes, sidecar["class_label"]))
+
+        if not recent_labeled_crops:
+            return
+
+        # Each tile: the crop image, boxed in the same green used for the main frame's
+        # crop boxes (config.CROP_BOX_COLOR), with its class label captioned in a black
+        # band underneath -- centered, white-on-black so it stays legible regardless of
+        # how bright/dark the crop itself is (green-on-crop, tried first, washed out on
+        # brighter crops). Tiles are separated by a gap column, not butted edge-to-edge,
+        # so each one's border reads as its own box rather than one continuous grid line.
+        thumb_px = config.RECENT_CROPS_THUMB_PX
+        caption_px = config.RECENT_CROPS_CAPTION_PX
+        gap_px = 6
+        tile_h = thumb_px + caption_px
+        tiles = []
+        for encoded_bytes, class_label in recent_labeled_crops:
+            crop_image = cv2.imdecode(np.frombuffer(encoded_bytes, np.uint8), cv2.IMREAD_UNCHANGED)
+            body = cv2.resize(crop_image, (thumb_px, thumb_px), interpolation=cv2.INTER_AREA)
+            body = cv2.cvtColor(body, cv2.COLOR_GRAY2BGR)
+
+            tile = np.zeros((tile_h, thumb_px, 3), dtype=np.uint8)
+            tile[:thumb_px, :] = body
+            cv2.rectangle(tile, (0, 0), (thumb_px - 1, thumb_px - 1), config.CROP_BOX_COLOR, 1)
+
+            label_text = class_label or "?"
+            (text_w, _text_h), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+            text_x = max(2, (thumb_px - text_w) // 2)
+            cv2.putText(tile, label_text, (text_x, thumb_px + caption_px - 7),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+            tiles.append(tile)
+
+        gap = np.zeros((tile_h, gap_px, 3), dtype=np.uint8)
+        row = tiles[0]
+        for tile in tiles[1:]:
+            row = np.hstack([row, gap, tile])
+        # oldest first (deque append order) -> newest tile at the right
+        ok, encoded_strip = cv2.imencode(".jpg", row)
+        if ok:
+            latest_crops_strip_jpeg = encoded_strip.tobytes()
 
 
 def read_live_metadata() -> dict:
@@ -153,48 +225,56 @@ if config.ENABLE_LIVE_STREAM:
 
     flask_app = Flask(__name__)
 
-    # Matches supervisor.sh's LOG_DIR/analyse.log -- both live in Monitor/, so this is
-    # the same file supervisor.sh redirects this process's stdout/stderr into.
-    ANALYSE_LOG_PATH = Path(__file__).resolve().parent / "logs" / "analyse.log"
-
-    def _tail_log_lines(path: Path, n: int) -> list:
-        """Reads the last n lines without loading the whole (potentially many-MB,
-        many-hours-old) file -- reads backward in chunks until n+1 newlines are seen."""
-        if not path.exists():
-            return []
-        chunk_size = 4096
-        with path.open("rb") as f:
-            remaining = f.seek(0, 2)
-            data = b""
-            while data.count(b"\n") <= n and remaining > 0:
-                read_size = min(chunk_size, remaining)
-                remaining -= read_size
-                f.seek(remaining)
-                data = f.read(read_size) + data
-        return data.decode(errors="replace").splitlines()[-n:]
-
     @flask_app.route("/")
     def _stream_index():
         return (
-            '<html><body style="margin:0;background:#000;height:100vh;overflow:hidden">'
+            '<html><head><title>Jellyscope Livestream</title></head>'
+            '<body style="margin:0;background:#000;height:100vh;overflow:hidden">'
             # width/height (not max-width/max-height) so a small source image -- e.g. at a low
             # LIVESTREAM_DISP_SCALE, chosen for faster transmit/decode -- gets scaled UP to fill
-            # the viewport instead of rendering at its tiny native pixel size; object-fit:contain
-            # preserves aspect ratio (letterboxed, not stretched/cropped either way), and
-            # object-position pins the visible image to the bottom-right corner of that box
-            # instead of object-fit's default centering.
-            '<img id="videoFrame" style="width:100vw;height:100vh;object-fit:contain;'
-            'object-position:right bottom;display:block">'
-            '<pre id="status" style="position:fixed;top:16px;left:16px;margin:0;'
-            'padding:14px 18px;font-size:12px;line-height:1.6;color:#fff;'
-            'background:rgba(15,15,15,0.72);border-radius:10px;white-space:pre;'
-            'font-family:-apple-system,Menlo,Consolas,monospace;'
+            # the viewport instead of rendering at its tiny native pixel size. min(100vw,100vh)
+            # instead of object-fit:contain -- the source frame is always square (IMAGE_SIZE_PX x
+            # IMAGE_SIZE_PX, downscaled with equal fx/fy in update_live_frame), so sizing both
+            # width/height to the smaller viewport dimension reproduces contain's letterboxing
+            # exactly, but as the img element's own box -- not a transparent box around it -- so
+            # the border below hugs the visible video, not empty space out to the viewport edge.
+            # position:fixed;bottom:0;right:0 replaces object-position for the same bottom-right pin.
+            '<img id="videoFrame" style="position:fixed;bottom:0;right:0;'
+            'width:min(100vw,100vh);height:min(100vw,100vh);display:block;'
+            'border:2px solid #00ff00;box-sizing:border-box">'
+            '<div style="position:fixed;top:16px;right:16px;padding:4px 10px;'
+            'font-size:11px;font-weight:bold;letter-spacing:0.6px;color:#fff;'
+            'background:rgba(0,0,0,0.6);border:1px solid #00ff00;border-radius:4px;'
+            'font-family:-apple-system,Menlo,Consolas,monospace">LIVESTREAM</div>'
+            # Single fixed top-left column, in normal document flow (not each child
+            # individually position:fixed like the old status/logtail pair was) -- crops
+            # stacks above metadata here, and neither can ever overlap or need a
+            # JS-computed offset to avoid each other, unlike the old logtail box that
+            # measured status's rendered height on every /status poll to place itself.
+            '<div style="position:fixed;top:16px;left:16px;max-width:calc(100vw - 32px);'
+            'display:flex;flex-direction:column;gap:10px">'
+            # Crops panel (border + header) is always visible, even before any labeled crop
+            # exists yet -- only the <img> itself and the placeholder text toggle, so it's
+            # always clear from the page whether the feature is present vs. genuinely has
+            # nothing to show yet (CLASSIFY=False, or no crop has cleared CONFIDENCE_THRESHOLD).
+            # Same background as the metadata panel below it, so the two read as one group.
+            '<div style="padding:8px;border:2px solid #00ff00;border-radius:6px;'
+            'background:rgba(10,10,10,0.88);box-shadow:0 4px 18px rgba(0,0,0,0.45)">'
+            '<div style="font-size:11px;font-weight:bold;letter-spacing:0.6px;color:#fff;'
+            'font-family:-apple-system,Menlo,Consolas,monospace;margin-bottom:6px">LAST 10 CROPS</div>'
+            '<img id="cropsStrip" style="display:none;max-width:100%;border-radius:3px">'
+            '<span id="cropsPlaceholder" style="display:block;font-size:11px;color:#aaa;'
+            'font-family:-apple-system,Menlo,Consolas,monospace">Waiting for labeled crops...</span>'
+            "</div>"
+            "<div>"
+            '<div style="font-size:11px;font-weight:bold;letter-spacing:0.6px;color:#fff;'
+            'font-family:-apple-system,Menlo,Consolas,monospace;margin-bottom:6px">METADATA</div>'
+            '<pre id="status" style="margin:0;padding:14px 18px;font-size:12px;line-height:1.6;'
+            'color:#fff;background:rgba(10,10,10,0.88);border:2px solid #00ff00;border-radius:10px;'
+            'white-space:pre;font-family:-apple-system,Menlo,Consolas,monospace;'
             'box-shadow:0 4px 18px rgba(0,0,0,0.45)"></pre>'
-            '<pre id="logtail" style="position:fixed;top:16px;left:16px;margin:0;'
-            'max-width:60vw;padding:8px 12px;font-size:9px;line-height:1.5;color:#fff;'
-            'background:rgba(15,15,15,0.72);border-radius:10px;white-space:pre-wrap;'
-            'font-family:Menlo,Consolas,monospace;opacity:0.8;'
-            'box-shadow:0 4px 18px rgba(0,0,0,0.45)"></pre>'
+            "</div>"
+            "</div>"
             "<script>"
             # Polls a single always-fresh frame instead of holding open a multipart MJPEG
             # stream -- see /latest_frame.jpg's comment for why: a persistent stream can only
@@ -205,6 +285,20 @@ if config.ENABLE_LIVE_STREAM:
             "document.getElementById('videoFrame').src='/latest_frame.jpg?t='+Date.now();"
             "}"
             "updateFrame();setInterval(updateFrame,400);"
+            # Polled slower than the main frame (1s vs 400ms) -- labeled crops accumulate
+            # far slower than raw frames, so there's nothing to gain from a faster poll here.
+            "const cropsStripImg=document.getElementById('cropsStrip');"
+            "const cropsPlaceholder=document.getElementById('cropsPlaceholder');"
+            "cropsStripImg.onload=function(){"
+            "cropsStripImg.style.display='block';cropsPlaceholder.style.display='none';"
+            "};"
+            "cropsStripImg.onerror=function(){"
+            "cropsStripImg.style.display='none';cropsPlaceholder.style.display='block';"
+            "};"
+            "function updateCropsStrip(){"
+            "cropsStripImg.src='/latest_crops_strip.jpg?t='+Date.now();"
+            "}"
+            "updateCropsStrip();setInterval(updateCropsStrip,1000);"
             "async function updateStatus(){"
             "try{"
             "const d=await (await fetch('/status')).json();"
@@ -265,24 +359,10 @@ if config.ENABLE_LIVE_STREAM:
             "overMax(d.jetson_temp_c_mean,d.jetson_max_temp_c)||"
             "!d.send_alive||d.consecutive_upload_failures>3;"
             "document.getElementById('status').style.background="
-            "danger?'rgba(192,57,43,0.85)':'rgba(15,15,15,0.72)';"
-            "const statusBox=document.getElementById('status');"
-            "document.getElementById('logtail').style.top="
-            "(statusBox.offsetTop+statusBox.offsetHeight+12)+'px';"
-            "}catch(e){}"
-            "}"
-            "async function updateLogTail(){"
-            "try{"
-            "const d=await (await fetch('/log_tail')).json();"
-            "document.getElementById('logtail').textContent=d.lines.join('\\n');"
+            "danger?'rgba(192,57,43,0.85)':'rgba(10,10,10,0.88)';"
             "}catch(e){}"
             "}"
             "updateStatus();setInterval(updateStatus,1000);"
-            # 1000ms, not 2000 -- frames are produced roughly every ~0.85-1s (see analyse.log),
-            # so a 2000ms poll reliably skipped ~2 lines' worth each refresh instead of scrolling
-            # by 1, which read as the tail "jumping". Still not a perfect 1:1 match to whatever
-            # the actual per-frame rate happens to be, but far smoother than a fixed 2x mismatch.
-            "updateLogTail();setInterval(updateLogTail,1000);"
             "</script>"
             "</body></html>"
         )
@@ -338,10 +418,6 @@ if config.ENABLE_LIVE_STREAM:
             "last_success_age_s": (time.time() - last_success_unix) if last_success_unix else None,
         })
 
-    @flask_app.route("/log_tail")
-    def _stream_log_tail():
-        return jsonify({"lines": _tail_log_lines(ANALYSE_LOG_PATH, 5)})
-
     @flask_app.route("/latest_frame.jpg")
     def _latest_frame():
         # Single-shot fetch of whatever's currently latest, not a persistent multipart
@@ -354,6 +430,18 @@ if config.ENABLE_LIVE_STREAM:
         # returns whatever's current at request time, dropping anything in between.
         with latest_frame_lock:
             frame = latest_frame_jpeg
+        if frame is None:
+            return Response(status=404)
+        resp = Response(frame, mimetype="image/jpeg")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @flask_app.route("/latest_crops_strip.jpg")
+    def _latest_crops_strip():
+        # Same single-shot-fetch reasoning as /latest_frame.jpg above, and same
+        # 404-when-nothing-yet behavior -- the index page's JS hides the <img> on error.
+        with recent_crops_lock:
+            frame = latest_crops_strip_jpeg
         if frame is None:
             return Response(status=404)
         resp = Response(frame, mimetype="image/jpeg")
@@ -586,6 +674,7 @@ def process_frame(image_path, json_path, claim_duration: float = 0.0) -> None:
     t_stream_start = time.perf_counter()
     if config.ENABLE_LIVE_STREAM:
         update_live_frame(enhanced, results)
+        update_recent_crops_strip(results)
     t_stream_end = time.perf_counter()
 
     t_send_start = time.perf_counter()

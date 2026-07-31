@@ -5,7 +5,9 @@
       "Bash(bash -n *)",
       "Bash(pip show *)",
       "Bash(journalctl -k *)",
-      "Bash(df -h *)"
+      "Bash(df -h *)",
+      "Bash(tailscale status *)",
+      "Bash(lsblk *)"
     ]
   }
 }

@@ -40,13 +40,50 @@ run_loop() {
   done
 }
 
+run_tegrastats_loop() {
+  # Same restart-loop shape as run_loop, but wraps the tegrastats binary instead of a
+  # venv script -- logs CPU/GPU/RAM/thermal/power every 5s so a system-wide freeze
+  # (like the 2026-07-29 watchdog reset -- see leak_alert.py's git history / postmortem)
+  # leaves telemetry up to the last sample instead of nothing at all.
+  local logfile="${LOG_DIR}/tegrastats.log"
+  while true; do
+    echo "[$(date '+%F %T')] Starting tegrastats..." >> "${logfile}"
+    tegrastats --interval 5000 >> "${logfile}" 2>&1
+    echo "[$(date '+%F %T')] tegrastats exited, restarting in 2s..." >> "${logfile}"
+    sleep 2
+  done
+}
+
 cd "${SCRIPT_DIR}"
+
+# A single direct echo to this terminal, not through any per-stage pipe -- safe
+# (nothing to deadlock on, see run_loop's comment above) and worth it, since a
+# silent terminal here has twice now been mistaken for a hang when the pipeline
+# was actually running fine.
+echo "Starting record/analyse/send/metadata/tegrastats. Each stage's output goes to"
+echo "its own file under ${LOG_DIR}/ -- NOT to this terminal -- so seeing nothing"
+echo "print here is normal, not a hang. Watch live progress with:"
+echo "  tail -f ${LOG_DIR}/analyse.log"
+echo "Ctrl-C here stops all stages."
+echo
 
 run_loop "record"   "${SCRIPT_DIR}/record.py"   &
 run_loop "analyse"  "${SCRIPT_DIR}/analyse.py"  &
 run_loop "send"     "${SCRIPT_DIR}/send.py"     &
 run_loop "metadata" "${SCRIPT_DIR}/metadata.py" &
+run_tegrastats_loop                             &
 
-trap 'echo "Stopping all stages..."; kill $(jobs -p) 2>/dev/null' INT TERM
+# `kill $(jobs -p)` only signals the run_loop/run_tegrastats_loop subshells
+# themselves, not the venv python / tegrastats processes they run in the foreground --
+# those are separate child PIDs the subshell is merely wait()-ing on, and SIGTERM to
+# the subshell doesn't propagate to them, leaving them orphaned and still holding the
+# camera device (confirmed by testing in livestream_supervisor.sh, which had the same
+# pattern). Since this script isn't run with job control (`set -m`), all of its
+# descendants share its own PGID, so signaling the negative PGID reaches every stage's
+# actual worker process too -- but that also re-signals this script's own PID (it's a
+# member of its own group), which would re-enter this same trap forever. `trap - INT
+# TERM` first drops back to the default disposition so the repeat signal just lets the
+# script die instead of recursing.
+trap 'echo "Stopping all stages..."; trap - INT TERM; kill -TERM -- -$$ 2>/dev/null' INT TERM
 
 wait

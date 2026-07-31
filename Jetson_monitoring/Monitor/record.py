@@ -18,9 +18,9 @@ import queue_io
 ### ==========================
 ### Recording parameters
 ### ==========================
-# FRAME_SKIP (keep every Nth triggered frame) lives in config.py, not here -- analyse.py's
-# live-stream /status reports it too, so both need to agree on the same value.
-GAIN_DB = 20.0  # hardware gain
+# FRAME_SKIP (keep every Nth triggered frame) and GAIN_DB live in config.py, not here --
+# analyse.py's live-stream /status reports FRAME_SKIP too, and livestream.py also sets
+# GAIN_DB on the camera, so all three need to agree on the same values.
 HDR_MAX = 4094  # should not be changed!!!!
 
 DISK_CHECK_EVERY_N_FRAMES = 20
@@ -54,7 +54,7 @@ nodemap.TriggerSource.from_string("Line0")
 nodemap.LineSelector.from_string("Line0")
 nodemap.LineMode.from_string("Input")
 nodemap.GainAuto.from_string("Off")
-nodemap.Gain.set_value(GAIN_DB)
+nodemap.Gain.set_value(config.GAIN_DB)
 
 target = 4000  # booster frame size (4000)
 valid_val = target - ((target - 560) % 8)
@@ -164,7 +164,7 @@ try:
             "width": width,
             "height": height,
             "hdr_max": HDR_MAX,
-            "gain_db": GAIN_DB,
+            "gain_db": config.GAIN_DB,
             "camera_serial": camera_serial,
         }
         queue_io.write_item(config.QUE_FULLFRAMES, stem, encoded.tobytes(), ".tiff", sidecar)

@@ -117,8 +117,22 @@ def find_candidates(prob_map_small, peak_threshold, secondary_threshold, upscale
     maxima_small = seg_models.find_local_maxima(prob_map_small, peak_threshold)
 
     candidates = []
+    # A single connected high-confidence blob can register many tied local maxima --
+    # maximum_filter treats every cell on a flat plateau as its own local max -- each of
+    # which would otherwise trigger an independent, redundant flood-fill of the *same*
+    # region via the pure-Python BFS in flood_fill_region. Harmless for a small object
+    # (few peaks), but for a larger one (bigger, flatter high-confidence blob -> far more
+    # tied peaks) this was measured re-walking the same region dozens of times over,
+    # accounting for multi-second stalls. Track which patches are already claimed by a
+    # found region and skip any later peak landing inside one -- same candidates result
+    # (the connected region is identical regardless of which peak inside it started the
+    # flood-fill), just without the redundant re-walks.
+    assigned = set()
     for peak_y_small, peak_x_small, peak_val in maxima_small:
+        if (peak_y_small, peak_x_small) in assigned:
+            continue
         region_small = seg_models.flood_fill_region(prob_map_small, peak_y_small, peak_x_small, secondary_threshold)
+        assigned.update(region_small)
         if len(region_small) < min_region_size_patches ** 2:
             continue
         region_small_points = np.asarray(list(region_small), dtype=np.int32)

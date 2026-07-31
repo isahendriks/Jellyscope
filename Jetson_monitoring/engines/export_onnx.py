@@ -14,8 +14,19 @@ predict_batch themselves are untouched.
 Produces, under monitoring/trt/onnx/:
   seg_encoder.onnx     (tiles, rows, cols)             -> mu
   seg_decoder.onnx     (mu)                            -> x_hat
-  seg_scorer.onnx      (mu, recon_err, rows, cols)     -> scores
+  seg_scorer.onnx      (mu, recon_err, rows, cols)     -> scores  (only if
+                                                          config.SEGMENTATION_SCORER_MODEL_PATH
+                                                          is a "binary" TwoClassScorer checkpoint --
+                                                          skipped for a "mahalanobis" one, see below)
   vit_classifier.onnx  (img_batch, size_batch)         -> logits
+
+A "mahalanobis" scorer checkpoint (mean_vec/cov_inv, no learned weights) never gets
+a seg_scorer.onnx/engine at all -- models/segmentation_trt.py runs it directly as
+FP32 PyTorch instead, since its chi-squared CDF (torch.special.gammainc) has no ONNX
+op to trace to, and the underlying computation (a latent_dim x latent_dim matmul) is
+too cheap to need INT8 acceleration anyway. build_trt_int8.py already skips building
+an engine for any *.onnx file that doesn't exist, so nothing else needs to know this
+scorer mode was used.
 
 Each is exported with a dynamic batch/tile-count axis (name "n") so one
 engine can serve any batch size -- analyse.py's batch_size is 8912 tiles,
@@ -56,7 +67,7 @@ N_EXAMPLE = 8  # only fixes dtypes for tracing; exported batch dim is dynamic
 device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 print(f"Using device: {device}")
 
-print("Loading segmentation models (AE + BinaryScorer)...")
+print("Loading segmentation models (AE + scorer)...")
 seg_model, scorer, scorer_threshold, seg_grid_size, seg_image_size = seg_models.load_segmentation_models(
     config.SEGMENTATION_AE_MODEL_PATH, config.SEGMENTATION_SCORER_MODEL_PATH,
     config.SEGMENTATION_ENCODER_TYPE, device,
@@ -133,14 +144,18 @@ export(
     {"mu": {0: "n"}, "x_hat": {0: "n"}},
 )
 
-print("Exporting SEGMENT scorer...")
 recon_err_example = ((tiles - x_hat_example) ** 2).flatten(1).mean(dim=1)
-scorer_wrap = ScorerWrapper(scorer).to(device)
-export(
-    scorer_wrap, (mu_example, recon_err_example, rows, cols), ONNX_DIR / "seg_scorer.onnx",
-    ["mu", "recon_err", "rows", "cols"], ["scores"],
-    {"mu": {0: "n"}, "recon_err": {0: "n"}, "rows": {0: "n"}, "cols": {0: "n"}, "scores": {0: "n"}},
-)
+if isinstance(scorer, seg_models.MahalanobisScorer):
+    print("Scorer is 'mahalanobis' -- skipping seg_scorer.onnx/engine export. "
+          "It runs directly as FP32 PyTorch in production instead (see models/segmentation_trt.py).")
+else:
+    print("Exporting SEGMENT scorer...")
+    scorer_wrap = ScorerWrapper(scorer).to(device)
+    export(
+        scorer_wrap, (mu_example, recon_err_example, rows, cols), ONNX_DIR / "seg_scorer.onnx",
+        ["mu", "recon_err", "rows", "cols"], ["scores"],
+        {"mu": {0: "n"}, "recon_err": {0: "n"}, "rows": {0: "n"}, "cols": {0: "n"}, "scores": {0: "n"}},
+    )
 
 print("Exporting CLASSIFY (ViT)...")
 img_batch = torch.rand(N_EXAMPLE, 1, CLASSIFIER_IMAGE_SIZE, CLASSIFIER_IMAGE_SIZE, device=device)

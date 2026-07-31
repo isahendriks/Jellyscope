@@ -24,3 +24,5 @@ try:
         print(line)
 except KeyboardInterrupt:
     ser.close()  # close serial port
+
+# %%

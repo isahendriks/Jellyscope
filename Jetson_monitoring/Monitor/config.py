@@ -76,8 +76,27 @@ DARK_FRAME_PATH = PIPELINE_DIR / "bkg.png"
 ### on-board retraining lives in train/, sibling to this repo's Jetson_monitoring/ folder)
 ### ==========================
 SEGMENTATION_ENCODER_TYPE = "AE"  # "AE" or "VAE" -- must match whichever class the checkpoint below was trained with
-SEGMENTATION_AE_MODEL_PATH = PIPELINE_DIR / "models" / "Kristineberg_251128_ae_model16_l64_img128.pth"
-SEGMENTATION_SCORER_MODEL_PATH = PIPELINE_DIR / "models" / "Kristineberg_251128_scorer_binary_model16_l64_img128.pth"
+SEGMENTATION_AE_MODEL_PATH = PIPELINE_DIR / "models" / "Kristineberg_260730_AE_model16_l64_img128.pth"
+
+# Either scorer mode Pipeline_development/BinaryClassification/Train/train_DNN.py
+# can save works here directly, no other change needed: a "binary" checkpoint
+# (TwoClassScorer, saved under .../NN/TwoClass/) or a "mahalanobis" one (mean_vec/
+# cov_inv, saved under .../NN/Mahalanobis/). Which mode this file is in gets
+# auto-detected from its own keys (models/segmentation.py's detect_scorer_type()) --
+# there's no separate flag here to keep in sync with whichever one you point at.
+# A "binary" scorer runs as an INT8 TensorRT engine like everything else; a
+# "mahalanobis" one runs directly as FP32 PyTorch (see models/segmentation_trt.py's
+# module docstring for why).
+SEGMENTATION_SCORER_MODEL_PATH = PIPELINE_DIR / "models" / "Kristineberg_260730_scorer_mahalanobis_model16_l64_img128.pth"
+
+# Overrides the checkpoint's own saved threshold (best_threshold_f3 at training time --
+# see train_DNN.py) without hand-editing/re-saving the .pth file. None = use whatever the
+# checkpoint stored. Handy for quickly sweeping thresholds against a labeled test folder
+# (Test/test_analyse_on_folder.py) when the trained threshold turns out too strict/loose
+# for real data -- e.g. a Mahalanobis checkpoint whose saved 0.9224 finds zero crops on
+# known-observation frames. Applies uniformly to either scorer mode (analyse.py just does
+# peak_threshold = scorer_threshold either way).
+SEGMENTATION_SCORER_THRESHOLD_OVERRIDE = None  # reset by update_segmentation_model.sh for 'Kristineberg_260730' -- re-add manually if you want to override its trained threshold
 
 ### ==========================
 ### ViT classifier checkpoint
@@ -87,7 +106,7 @@ SEGMENTATION_SCORER_MODEL_PATH = PIPELINE_DIR / "models" / "Kristineberg_251128_
 # or when only crop capture matters, not species labels. SEGMENT still runs either way,
 # so crops are still produced/uploaded -- just with class_label/class_confidence/class_idx
 # left as None in the sidecar, and the classifier engine isn't even loaded at startup.
-CLASSIFY = False
+CLASSIFY = True
 
 # Migrated (standardized) checkpoint -- see models/migrate_checkpoint.py. Point this
 # at the *_migrated.pth output, not the original raw state_dict, once you've run it.
@@ -122,6 +141,8 @@ VIT_ENGINE_BATCH = 16
 IMAGE_SIZE_PX = 4512  # camera frame size -- checked against each frame's actual dims in analyse.py
 IMAGE_W_MM = 91  # physical width of the sensor's field of view, in mm
 
+GAIN_DB = 20.0  # hardware gain -- set on the camera's nodemap at acquisition start (record.py, livestream.py)
+
 ROTATE_FRAME = 90.0  # degrees, applied once per frame (and once to the dark frame at load time)
 # before dark-subtract/median-blur/gamma/CLAHE -- corrects for the camera's physical mounting
 # angle, if any. 0 = no rotation. Rotation keeps the frame's original size (it's square), replicate-
@@ -132,7 +153,7 @@ HDR_MAX = 4094  # should not be changed!!!!
 MEDIAN_KERNEL_SIZE = 3
 POST_GAIN = 1
 GAMMA = 0.7
-CLAHE_CLIP = 0.01
+CLAHE_CLIP = 0.01 * 400
 CLAHE_TILE_PX = 512  # CLAHE grid size = IMAGE_SIZE_PX / CLAHE_TILE_PX, rounded to nearest int
 
 # SEGMENT
@@ -155,7 +176,7 @@ N_CROPS_PER_IMAGE = 1  # cap crops per frame -- freely tunable for speed/complet
 
 # CLASSIFY
 CLASSIFIER_IMAGE_SIZE = 256  # must match Train_ViT.py's preprocess Resize((256,256))
-CONFIDENCE_THRESHOLD = 0.9  # live-stream box only gets a species label at/above this
+CONFIDENCE_THRESHOLD = 0.7  # live-stream box only gets a species label at/above this
 
 DISK_CHECK_EVERY_N_FRAMES = 5
 
@@ -181,6 +202,11 @@ LIVESTREAM_PORT = 8080  # view at http://<jetson-ip>:8080/
 # livestream.py's own downscale-before-draw convention (see update_live_frame()).
 LIVESTREAM_DISP_SCALE = 10
 CROP_BOX_COLOR = (0, 255, 0)  # green, BGR (cv2 convention)
+RECENT_CROPS_COUNT = 10  # how many of the most recent confidently-labeled crops (same
+# CONFIDENCE_THRESHOLD gate as the main frame's box labels) to keep in the live-stream
+# window's thumbnail strip
+RECENT_CROPS_THUMB_PX = 96  # each strip thumbnail's square size in pixels, post-resize
+RECENT_CROPS_CAPTION_PX = 22  # height of the white-on-black class-label band under each thumbnail
 
 ### ==========================
 ### Remote server (Tailscale)
@@ -213,17 +239,27 @@ ENVIRONMENTAL_SAMPLE_INTERVAL_S = 1
 ENVIRONMENTAL_UPLOAD_INTERVAL_S = 60
 
 ### ==========================
-### Leak alerting (leak_alert.py) -- direct sensor tier is unambiguous, but
-### THE INDIRECT (dew point / pressure) THRESHOLDS BELOW ARE PLACEHOLDERS.
-### There's no baseline data from this deployment yet to calibrate against --
-### watch actual dew_point_c/bme280_pressure_mbar behavior over a few days of
-### normal operation before trusting these numbers. See leak_alert.py's
-### module docstring for the full reasoning.
+### Leak alerting (leak_alert.py) -- direct sensor tier is unambiguous. The indirect
+### (dew point / pressure / temperature) thresholds below are calibrated from an actual
+### overnight pump-down test (Test/leak_test_logs/leak_test_20260727_212454.csv, ~16h),
+### via Test/calibrate_leak_thresholds.py -- not hand-guessed placeholders anymore. That
+### script detrends the test's own large, benign pump-down-decay/warm-up curves out of
+### each signal first (see its module docstring for why a raw calibration off that CSV
+### would badly overshoot), then sets each threshold at 2x the residual 99.5th-percentile
+### noise floor over the LEAK_WARNING_WINDOW_S window. Re-run it against a fresh overnight
+### test any time the enclosure, sensor, or firmware changes enough that this baseline
+### might no longer hold.
+### LEAK_TEMP_DEVIATION_THRESHOLD_C is calibrated here but NOT currently wired into
+### leak_alert.check_for_leak() -- kept as a reference value only, deliberately not
+### added to the Tier-2 AND-condition (see leak_alert.py's module docstring for why
+### dew point, not raw temperature or humidity, is what that check actually combines
+### with pressure).
 ### ==========================
 LEAK_SENSOR_CONSECUTIVE_READS = 2  # ~20s at METADATA_SAMPLE_INTERVAL_S=10 -- rules out one glitchy read
 LEAK_WARNING_WINDOW_S = 900  # 15 min -- trend window for the indirect BME280 signals
-LEAK_DEW_POINT_RISE_THRESHOLD_C = 3.0  # PLACEHOLDER
-LEAK_PRESSURE_DEVIATION_THRESHOLD_MBAR = 5.0  # PLACEHOLDER
+LEAK_DEW_POINT_RISE_THRESHOLD_C = 0.60
+LEAK_PRESSURE_DEVIATION_THRESHOLD_MBAR = 9.74
+LEAK_TEMP_DEVIATION_THRESHOLD_C = 0.74
 LEAK_ALERT_COOLDOWN_S = 1800  # 30 min -- don't re-spam the same tier while a condition persists
 
 ### ==========================
