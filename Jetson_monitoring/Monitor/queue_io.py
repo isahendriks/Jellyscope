@@ -30,12 +30,37 @@ def _atomic_write(final_path: Path, data: bytes) -> None:
     os.replace(tmp_path, final_path)
 
 
-def write_item(queue_root: Path, stem: str, image_bytes: bytes, image_ext: str, sidecar: dict) -> None:
-    """Producer: write one queue item. Image is written (atomically) before the
-    JSON sidecar, so consumers can treat "sidecar exists" as "item is complete"."""
+def write_item(queue_root: Path, stem: str, image_bytes: bytes, image_ext: str, sidecar: dict,
+               atomic_image: bool = True, atomic_json: bool = True) -> None:
+    """Producer: write one queue item. Image is written before the JSON sidecar, so
+    consumers can treat "sidecar exists" as "item is complete".
+
+    The image is safe to write non-atomically (atomic_image=False): a crash mid-write
+    just means the sidecar (written second) never gets created, so list_ready_stems()
+    -- which globs *.json -- never surfaces the stem at all. The partial image is an
+    orphaned file no consumer ever looks at, not a corruption risk.
+
+    The JSON sidecar's presence is the completeness marker every consumer relies on, so
+    atomic_json defaults to True -- a torn write there could leave a corrupt file a
+    consumer's json.loads() chokes on (read_sidecar() has no error handling of its own).
+    atomic_json=False trades that small, narrow-window risk for cutting this write's I/O
+    further (que_crops uses both flags together -- see the 2026-08-10 investigation into
+    exFAT's per-operation contention cost under concurrent record.py/analyse.py/
+    send.py/metadata.py access); callers opting into it should make sure whatever reads
+    the sidecar back handles a corrupt/truncated file gracefully (see send.py's
+    read_sidecar call sites, hardened alongside this)."""
     incoming = queue_root / "incoming"
-    _atomic_write(incoming / f"{stem}{image_ext}", image_bytes)
-    _atomic_write(incoming / f"{stem}.json", json.dumps(sidecar, indent=2).encode("utf-8"))
+    image_path = incoming / f"{stem}{image_ext}"
+    if atomic_image:
+        _atomic_write(image_path, image_bytes)
+    else:
+        image_path.write_bytes(image_bytes)
+    json_path = incoming / f"{stem}.json"
+    json_bytes = json.dumps(sidecar, indent=2).encode("utf-8")
+    if atomic_json:
+        _atomic_write(json_path, json_bytes)
+    else:
+        json_path.write_bytes(json_bytes)
 
 
 def list_ready_stems(queue_root: Path) -> list[str]:
@@ -43,6 +68,32 @@ def list_ready_stems(queue_root: Path) -> list[str]:
     so lexical sort is chronological)."""
     incoming = queue_root / "incoming"
     return sorted(p.stem for p in incoming.glob("*.json") if not p.name.startswith(".tmp_"))
+
+
+def move_between_queues(src_queue_root: Path, dst_queue_root: Path, stem: str, image_ext: str) -> bool:
+    """Producer-side move of one complete item (image + json) from src's incoming/
+    straight to dst's incoming/ -- for moving live-queue overflow into the backlog
+    queue (analyse.py's overflow_live_queue_if_needed()), not a consumer claiming work,
+    so unlike claim() this never touches processing/.
+
+    Uses shutil.move rather than os.rename because src and dst can be on different
+    physical disks (the live queue on sda1, backlog on sdb1) -- os.rename requires the
+    same filesystem; shutil.move falls back to copy+delete when it isn't. Moves the
+    image first, matching write_item()'s ordering, so a crash mid-move leaves at worst
+    an orphaned image with no json at the destination (invisible to every consumer,
+    same reasoning as write_item()'s atomic_image=False docstring) rather than a
+    half-registered item any consumer could trip over."""
+    src_incoming = src_queue_root / "incoming"
+    dst_incoming = dst_queue_root / "incoming"
+    src_img, src_json = src_incoming / f"{stem}{image_ext}", src_incoming / f"{stem}.json"
+    if not src_img.exists() or not src_json.exists():
+        return False
+    try:
+        shutil.move(str(src_img), str(dst_incoming / f"{stem}{image_ext}"))
+        shutil.move(str(src_json), str(dst_incoming / f"{stem}.json"))
+    except (FileNotFoundError, OSError):
+        return False
+    return True
 
 
 def claim(queue_root: Path, stem: str, image_ext: str) -> tuple[Path, Path] | None:
@@ -96,6 +147,19 @@ def fail_item(queue_root: Path, stem: str, image_ext: str, error_text: str) -> N
 
 def read_sidecar(json_path: Path) -> dict:
     return json.loads(json_path.read_text())
+
+
+def read_sidecar_or_none(json_path: Path) -> dict | None:
+    """Same as read_sidecar(), but returns None instead of raising on a corrupt/
+    unparseable file -- for callers reading a sidecar that may have been written with
+    write_item(..., atomic_json=False) (que_crops), where a crash at exactly the wrong
+    moment could in principle leave a torn JSON file behind. Callers should treat None
+    as "this item's metadata is unrecoverable" (e.g. fail_item it), not retry blindly --
+    a torn file won't un-tear itself on the next attempt."""
+    try:
+        return read_sidecar(json_path)
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def recover_processing(queue_root: Path, image_ext: str, grace_seconds: float = 5.0) -> list[str]:

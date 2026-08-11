@@ -38,13 +38,58 @@ VENV_PYTHON = PIPELINE_DIR / ".venv-jellyscope_on_jetson" / "bin" / "python"
 ### ==========================
 ### Disk-backed queues
 ### ==========================
-# On the mounted external SSD, not the Jetson's own ~57GB root partition (which sat at
-# 98% full / 1.6GB free before this moved here) -- /mnt/sdb1, not /mnt/sda1, since sda1
-# holds the training data corpus and this pipeline's queues are unrelated to that.
-QUEUE_ROOT = Path("/mnt/sdb1/jellyscope_queues")
+# QUEUE_ROOT lives entirely on sda1 as of 2026-08-11 -- both external SSDs are the same
+# "Portable SSD" model on paper, but a raw dd read test found sdb1 negotiating its USB
+# link at ~5.7 MB/s versus sda1's ~219 MB/s (confirmed via kernel device paths: sdb sits
+# on usb1, the tegra-xusb controller's USB2 companion root hub, while sda sits on usb2,
+# its USB3 root hub -- a cable/connection-negotiation problem on that specific port/cable,
+# not a "wrong port" one, since this devkit's ports are all USB 3.2 electrically). That
+# ~38x gap was the real, dominant cause of the record/imread slowness chased through most
+# of the 2026-08-10 investigation -- exFAT contention was real but secondary. Decision
+# (2026-08-11): rather than keep fighting sdb1's throughput ceiling, leave its ~36k-frame
+# backlog untouched ("let it rest" -- see QUE_FULLFRAMES_BACKLOG_RESTING below) and run
+# the entire active pipeline -- que_fullframes (already here since 2026-08-10 for a
+# different reason, see git history), que_crops, que_training_frames, oversized_crops --
+# on sda1 instead.
+QUEUE_ROOT = Path("/mnt/sda1/jellyscope_queues")
 
-QUE_FULLFRAMES = QUEUE_ROOT / "que_fullframes"
+QUE_FULLFRAMES = QUEUE_ROOT / "que_fullframes"  # record.py's target
+
+# sdb1's old backlog (merged 2026-08-10 from two separate incidents -- see git history for
+# that whole story) -- as of 2026-08-11, deliberately NOT part of analyse.py's active
+# queue list anymore (see its main loop) and not referenced by anything else in this
+# file. Left in place on sdb1, untouched, since sdb1's throughput problem (see QUEUE_ROOT
+# above) makes continuing to drain it impractical for now. Kept as a named constant purely
+# so its location doesn't need rediscovering if it's ever revisited.
+QUE_FULLFRAMES_BACKLOG_RESTING = Path("/mnt/sdb1/jellyscope_queues/que_fullframes_backlog")
+
 QUE_CROPS = QUEUE_ROOT / "que_crops"
+QUE_TRAINING_FRAMES = QUEUE_ROOT / "que_training_frames"  # periodic post-PREPROCESS full
+# frames sampled by analyse.py (see TRAINING_FRAME_INTERVAL_S) for send.py to upload --
+# separate from QUE_CROPS, which holds individual per-crop classifier images instead
+
+TRAINING_FRAME_INTERVAL_S = 30 * 60  # how often analyse.py samples one full frame (after
+# PREPROCESS, before SEGMENT) into QUE_TRAINING_FRAMES, for periodic offline classifier
+# retraining -- independent of and much sparser than the per-crop que_crops upload path
+
+### ==========================
+### Oversized crop handling (send.py) -- see the 2026-07-31 incident: something (camera
+### obstruction, lighting glitch, or a SEGMENT false-positive -- still unconfirmed which)
+### made SEGMENT briefly treat several whole 4512x4512 frames as one giant "crop" each
+### (~7-10MB PNGs, vs ~100KB for a normal crop). scp uploads a batch in one shot, so a
+### single one of these made its whole 20-item batch too big to transfer inside
+### UPLOAD_TIMEOUT_S over the field link -- which jammed every normal crop queued behind
+### it too, since que_crops is strict FIFO. MAX_UPLOAD_ATTEMPTS_TOTAL would eventually
+### fail an item like this out on its own, but at ~minutes per attempt that's far too
+### slow to be a real mitigation.
+### ==========================
+MAX_CROP_UPLOAD_BYTES = 2_000_000  # 2MB -- comfortably above any real crop seen so far
+# (largest observed ~380KB), well below the ~7-10MB pathological full-frame ones. A
+# crop's PNG over this size is archived straight to OVERSIZED_CROPS_DIR instead of ever
+# being hand to scp -- see send.py's process_batch().
+OVERSIZED_CROPS_DIR = QUEUE_ROOT / "oversized_crops"  # local-only, never uploaded -- kept
+# on disk for manual review/retrieval rather than lost, without blocking the rest of the
+# queue or burning retry cycles on a transfer that's very unlikely to complete in time
 
 # The two mounted external SSDs -- sda1 (training data) and sdb1 (this pipeline's
 # queues) -- reported alongside the Jetson's own root partition in metadata.py's
@@ -55,7 +100,19 @@ EXTERNAL_SSD_PATHS = [Path("/mnt/sda1"), Path("/mnt/sdb1")]
 # Standard Jetson/Tegra sysfs GPU load node -- reports 0-1000 (permille), not 0-100.
 GPU_LOAD_PATH = Path("/sys/devices/platform/bus@0/17000000.gpu/load")
 
-MIN_FREE_BYTES = 2 * 1024**3  # record.py/analyse.py pause producing below this
+MIN_FREE_BYTES = 2 * 1024**3  # record.py pauses acquisition (stops *producing* new raw
+# frames into que_fullframes) below this.
+
+# analyse.py *consumes* que_fullframes -- it deletes each raw frame (tens of MB) after
+# extracting a handful of much smaller crop PNGs from it, so low free space is a reason
+# for it to keep draining the backlog, not a reason to stop. Gating it on MIN_FREE_BYTES
+# the same way record.py is caused the 2026-08-10 incident: disk fills up, analyse.py
+# pauses right alongside record.py, so nothing ever gets deleted and free space can
+# never recover on its own -- record.py stays paused forever too, since its own
+# MIN_FREE_BYTES check never sees space come back. This is only a hard floor against
+# ENOSPC crashing mid-write on the crop files analyse.py still writes, not a real
+# backpressure threshold, so it's kept far below MIN_FREE_BYTES.
+ANALYSE_MIN_FREE_BYTES = 200 * 1024**2
 
 ### ==========================
 ### Camera sampling rate -- the hardware trigger itself can't be changed (fixed
@@ -64,7 +121,11 @@ MIN_FREE_BYTES = 2 * 1024**3  # record.py/analyse.py pause producing below this
 ### stream (see analyse.py's /status) so it's visible what rate is actually
 ### being recorded at.
 ### ==========================
-FRAME_SKIP = 1
+FRAME_SKIP = 3  # 2026-08-10: raised from 2 -- at FRAME_SKIP=2 (~0.48 kept frames/s) record.py
+# outpaced analyse.py's measured ~0.39 frames/s, so the live queue would only ever grow
+# once the historical backlogs cleared, never reach empty. At 3 (~0.32 kept frames/s),
+# analyse.py should net-drain rather than net-fill it. See analyse.py's live-stream ETA
+# for whether this is actually holding in practice.
 
 # Optional dark/background reference frame (control/monitoring/record.py's "bkg.png"),
 # subtracted during analyse.py's PREPROCESS step. If this path doesn't exist,
@@ -96,7 +157,7 @@ SEGMENTATION_SCORER_MODEL_PATH = PIPELINE_DIR / "models" / "Kristineberg_260730_
 # for real data -- e.g. a Mahalanobis checkpoint whose saved 0.9224 finds zero crops on
 # known-observation frames. Applies uniformly to either scorer mode (analyse.py just does
 # peak_threshold = scorer_threshold either way).
-SEGMENTATION_SCORER_THRESHOLD_OVERRIDE = None  # reset by update_segmentation_model.sh for 'Kristineberg_260730' -- re-add manually if you want to override its trained threshold
+SEGMENTATION_SCORER_THRESHOLD_OVERRIDE = 0.95  # reset by update_segmentation_model.sh for 'Kristineberg_260730' -- re-add manually if you want to override its trained threshold
 
 ### ==========================
 ### ViT classifier checkpoint
@@ -106,7 +167,10 @@ SEGMENTATION_SCORER_THRESHOLD_OVERRIDE = None  # reset by update_segmentation_mo
 # or when only crop capture matters, not species labels. SEGMENT still runs either way,
 # so crops are still produced/uploaded -- just with class_label/class_confidence/class_idx
 # left as None in the sidecar, and the classifier engine isn't even loaded at startup.
-CLASSIFY = True
+# Off as of 2026-08-10 to speed backlog draining -- crops go out unlabeled until this is
+# flipped back on; nothing needs reprocessing to relabel them later since re-running
+# CLASSIFY only needs the already-uploaded crop images, not the original full frames.
+CLASSIFY = False
 
 # Migrated (standardized) checkpoint -- see models/migrate_checkpoint.py. Point this
 # at the *_migrated.pth output, not the original raw state_dict, once you've run it.
@@ -116,6 +180,11 @@ VIT_CHECKPOINT_PATH = PIPELINE_DIR / "models" / "vit_classifier_F1_0.8697_acc_0.
 # embedded class list. Run models/migrate_checkpoint.py once to bake the class list into
 # the checkpoint permanently and this fallback stops being needed.
 VIT_CLASS_NAMES_FALLBACK = None  # e.g. ["calanus", "clytia_spp1", ...] in the exact training order
+
+# Exact class_label string (see Pipeline_development/ClassClassification/Train_ViT.py's
+# Ctenophora list) that analyse.py's daily Slack report counts as a mnemiopsis sighting --
+# must match the training label exactly, including case.
+MNEMIOPSIS_CLASS_LABEL = "mnemiopsis"
 
 ### ==========================
 ### INT8 TensorRT engines
@@ -162,7 +231,7 @@ SEG_OFFSETS_NORM = [0, 0.2, 0.4, 0.6, 0.8]  # relative offsets for tile grid (e.
 MIN_REGION_SIZE_PATCHES = 3
 CROP_PADDING_PIXELS = 0
 IOU_DEDUP_THRESHOLD = 0.3  # matches segment_labeled_images.py's working reference
-N_CROPS_PER_IMAGE = 1  # cap crops per frame -- freely tunable for speed/completeness tradeoff.
+N_CROPS_PER_IMAGE = 5  # cap crops per frame -- freely tunable for speed/completeness tradeoff.
 # dedup_candidates sorts by peak_val descending before capping, so the strongest peaks survive
 # and only the weakest excess get dropped when a frame has more than this many. Keep this <=
 # VIT_ENGINE_BATCH: going over it forces a second (third, ...) full classify batch, each paying
@@ -193,8 +262,40 @@ CUDA_CACHE_CLEANUP_EVERY_N_FRAMES = 100
 ### Flask/MJPEG pattern -- but showing the actual production pipeline's output
 ### and metadata, not a separate dev/test capture.
 ### ==========================
-ENABLE_LIVE_STREAM = True
+ENABLE_LIVE_STREAM = True  # the whole monitoring web server -- /status JSON panel (temps,
+# disk, connection, last-recorded/analysed timers, backlog progress) plus the video/crops
+# UI. Keep this True to keep monitoring available at all; see BACKLOG_MODE_* below for
+# what turns off just the camera-image/crops-thumbnail rendering without losing the
+# status panel.
 LIVESTREAM_PORT = 8080  # view at http://<jetson-ip>:8080/
+
+### ==========================
+### Backlog mode vs live mode (analyse.py's update_system_mode()) -- automatically
+### switches the per-frame video-image and crops-thumbnail rendering
+### (update_live_frame/update_recent_crops_strip) off while there's a substantial backlog
+### of unanalysed raw frames sitting on disk (old backlog + sdb1 backlog + live queue,
+### combined), since that rendering costs real per-frame time (resize/draw-boxes/
+### JPEG-encode, ~0.15-0.3s/frame observed) that's pure overhead while nobody's watching
+### and analyse.py could instead spend on actually draining the backlog. The /status JSON
+### panel keeps working in either mode -- only the live video image and crops-thumbnail
+### strip go dark in backlog mode (the page shows a placeholder instead of a broken
+### image).
+###
+### Two separate thresholds, not one, deliberately: a single threshold would flap video
+### on/off repeatedly whenever the backlog hovers right around it (e.g. draining down to
+### 950, ticking back up to 1050, etc.) -- the gap between ENTER and EXIT is a hysteresis
+### band, so once in backlog mode it takes dropping meaningfully lower (not just below
+### the same number that triggered it) to switch back.
+###
+### ENTER raised sharply 2026-08-11, after the sdb1->sda1 move: the ~0.15-0.3s/frame
+### render cost that motivated the original 1000 barely matters now that analyse.py runs
+### at ~1.79 frames/s (vs record.py's ~0.32 frames/s at FRAME_SKIP=3) -- there's enough
+### throughput margin either way. Kept as a real (if now much higher) threshold rather
+### than removed entirely, so it still trips as a genuine emergency tripwire if the queue
+### ever balloons to incident scale again (the 2026-08-03 incident reached ~63k files).
+### ==========================
+BACKLOG_MODE_ENTER_THRESHOLD = 50_000  # total pending fullframes above this -> backlog mode
+BACKLOG_MODE_EXIT_THRESHOLD = 100  # total pending fullframes below this -> live mode
 # % downscale. Was 50 (2256x2256, ~670KB/JPEG) -- at the pipeline's current ~1fps
 # analysis rate, that much data per frame added real transmission/decode lag on top
 # of the already-slow update rate, making the live view feel even more sluggish than
@@ -202,9 +303,13 @@ LIVESTREAM_PORT = 8080  # view at http://<jetson-ip>:8080/
 # livestream.py's own downscale-before-draw convention (see update_live_frame()).
 LIVESTREAM_DISP_SCALE = 10
 CROP_BOX_COLOR = (0, 255, 0)  # green, BGR (cv2 convention)
-RECENT_CROPS_COUNT = 10  # how many of the most recent confidently-labeled crops (same
-# CONFIDENCE_THRESHOLD gate as the main frame's box labels) to keep in the live-stream
-# window's thumbnail strip
+RECENT_CROPS_COUNT = 40  # how many of the most recent confidently-labeled crops (same
+# CONFIDENCE_THRESHOLD gate as the main frame's box labels, plus RECENT_CROPS_MIN_PEAK_VAL
+# below) to keep in the live-stream window's thumbnail strip
+RECENT_CROPS_MIN_PEAK_VAL = 0.98  # display-only gate -- a crop's segment peak scorer value
+# must clear this to show up in the strip, on top of the CONFIDENCE_THRESHOLD gate above
+RECENT_CROPS_COLUMNS = 8  # thumbnail strip wraps into a grid this many columns wide
+# (RECENT_CROPS_COUNT=40 -> 5 rows) instead of one long unbounded row
 RECENT_CROPS_THUMB_PX = 96  # each strip thumbnail's square size in pixels, post-resize
 RECENT_CROPS_CAPTION_PX = 22  # height of the white-on-black class-label band under each thumbnail
 
@@ -215,6 +320,9 @@ REMOTE_HOST = "server-lab"
 REMOTE_BASE = "jellyscope_incoming"  # relative to the SSH user's home on the remote host
 SSH_CONNECT_TIMEOUT_S = 10
 UPLOAD_TIMEOUT_S = 60
+TRAINING_FRAME_UPLOAD_TIMEOUT_S = 180  # full frames (4512x4512) are far bigger than crops --
+# UPLOAD_TIMEOUT_S=60 is tuned for small crop batches and could cut off a slow scp of one
+# of these over a flaky 5G/Tailscale link before it genuinely finishes
 MAX_UPLOAD_RETRIES_PER_CYCLE = 6      # exponential-backoff attempts within one polling cycle
 MAX_UPLOAD_ATTEMPTS_TOTAL = 50        # escalate an item to failed/ past this many cycle-level attempts
 
@@ -223,6 +331,13 @@ MAX_UPLOAD_ATTEMPTS_TOTAL = 50        # escalate an item to failed/ past this ma
 ### ==========================
 HEARTBEAT_DIR = PIPELINE_DIR / "logs"
 HEARTBEAT_STALE_S = 30  # a stage is considered "down" if its heartbeat is older than this
+
+PIPELINE_ALERT_STALE_READS = 2  # ~20s at METADATA_SAMPLE_INTERVAL_S=10 -- consecutive stale
+# heartbeat_status() reads pipeline_alert.py requires before firing a "stage down" Slack
+# alert, so one missed/racy heartbeat-file read doesn't look like a real outage
+PIPELINE_ALERT_COOLDOWN_S = 1800  # 30 min -- same spirit as LEAK_ALERT_COOLDOWN_S: throttles
+# repeated "down" alerts if a stage flaps rather than staying cleanly down. Recovery alerts
+# are never throttled -- see pipeline_alert.py
 
 ### ==========================
 ### Metadata cadence

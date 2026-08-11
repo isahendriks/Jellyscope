@@ -24,7 +24,10 @@ import queue_io
 HDR_MAX = 4094  # should not be changed!!!!
 
 DISK_CHECK_EVERY_N_FRAMES = 20
-HEARTBEAT_EVERY_N_FRAMES = 10
+HEARTBEAT_EVERY_N_FRAMES = 1  # every kept frame -- HEARTBEAT_DIR lives on the Jetson's own
+# local root disk (Jetson_monitoring/logs/), not the contended exFAT queue disks, so this
+# costs nothing toward that contention. Was 10 (up to ~30s of staleness on the live-stream's
+# "last recorded" timer at FRAME_SKIP=3's 3s cadence) before 2026-08-10.
 
 HEARTBEAT_PATH = config.HEARTBEAT_DIR / "record.heartbeat.json"
 
@@ -72,6 +75,15 @@ frame_counter = 0
 time_counter = 0
 consecutive_missed = 0
 camera_temp_supported = True  # some firmware/nodemaps don't expose DeviceTemperature
+last_frame_timestamp_unix = None  # set only when a frame is actually kept and written,
+# not on every heartbeat write -- write_heartbeat() also fires from the disk-pause and
+# no-image branches below, where nothing was actually captured, so reusing "now" there
+# would make analyse.py's live-stream "last recorded" timer look healthy even while the
+# camera is stalled or acquisition is paused.
+process_start_unix = time.time()  # lets analyse.py compute record.py's actual kept-frame
+# rate as frames_recorded_total/(now-process_start_unix) -- a lifetime average that
+# naturally resets to reflect the current FRAME_SKIP every time this process restarts,
+# rather than needing separate tracking for "since config last changed."
 
 
 def read_camera_temp_c():
@@ -99,6 +111,8 @@ def write_heartbeat(camera_connected: bool) -> None:
         "frames_recorded_total": frame_counter,
         "camera_connected": camera_connected,
         "camera_temp_c": read_camera_temp_c() if camera_connected else None,
+        "last_frame_timestamp_unix": last_frame_timestamp_unix,
+        "process_start_unix": process_start_unix,
     }
     tmp = HEARTBEAT_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(heartbeat))
@@ -109,7 +123,7 @@ try:
     while True:
         # Disk-space backpressure: pause producing rather than crash/fill the disk.
         if frame_counter % DISK_CHECK_EVERY_N_FRAMES == 0:
-            free = queue_io.disk_free_bytes(config.QUEUE_ROOT)
+            free = queue_io.disk_free_bytes(config.QUE_FULLFRAMES)
             if free < config.MIN_FREE_BYTES:
                 print(f"Low disk space ({free / 1e9:.2f} GB free), pausing acquisition...")
                 write_heartbeat(camera_connected=True)
@@ -146,6 +160,7 @@ try:
 
         frame_counter += 1
         timestamp = time.time()
+        last_frame_timestamp_unix = timestamp
         stem = f"frame_{time.strftime('%Y%m%d_%H%M%S')}_{frame_counter:08d}"
 
         # Uncompressed TIFF: record.py is a real-time acquisition loop, so skipping

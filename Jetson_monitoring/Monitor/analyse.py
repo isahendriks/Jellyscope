@@ -38,6 +38,7 @@ import config
 import queue_io
 import gpu_preprocess
 import segment_core
+import leak_alert  # send_slack_alert only -- generic webhook helper, not leak-specific despite the module name
 from models.segmentation_trt import load_segmentation_engines
 from models.vit_classifier_trt import load_classifier_engine, pad_batch
 from models import vit_classifier  # preprocess_crop_for_classifier / pad_to_square only -- no FP32 model
@@ -61,6 +62,7 @@ print(f"Using device: {device}")
 
 queue_io.ensure_queue_dirs(config.QUE_FULLFRAMES)
 queue_io.ensure_queue_dirs(config.QUE_CROPS)
+queue_io.ensure_queue_dirs(config.QUE_TRAINING_FRAMES)
 config.HEARTBEAT_DIR.mkdir(parents=True, exist_ok=True)
 
 print("Loading segmentation engines (encoder/decoder always INT8; scorer is INT8 or FP32 Mahalanobis, auto-detected)...")
@@ -103,6 +105,63 @@ upscale_factor = config.IMAGE_SIZE_PX / grid_size_small
 frames_analysed_total = 0
 crops_produced_total = 0
 total_processing_time_sum = 0.0  # sum of each frame's "total" (record->stream); /status divides by frames_analysed_total for the running average
+process_start_unix = time.time()  # this process's own lifetime, for the "fully live" ETA
+# below -- frames_analysed_total/(now-process_start_unix) gives a stable rate estimate
+# that naturally resets on every restart, same reasoning as record.py's own field of the
+# same name.
+
+# "backlog" or "live" -- see update_system_mode(). Starts in "live" since, as of
+# 2026-08-11, fullframe_queues is just the live queue -- sdb1's old backlog is
+# deliberately left out (see config.py's QUE_FULLFRAMES_BACKLOG_RESTING), so there's
+# nothing to be "in backlog mode" about until/unless the live queue itself grows past
+# BACKLOG_MODE_ENTER_THRESHOLD.
+system_mode = "live"
+
+# Live-stream summary stats -- deliberately NOT lifetime running totals like
+# frames_analysed_total/crops_produced_total above. Over a 3-month unattended
+# deployment a growing counter tells an operator glancing at the stream nothing
+# about whether the system is *currently* healthy; a timestamp + a bounded
+# 24h window do. last_analysed_unix/last_analysed_crops are just the most recent
+# process_frame() call's numbers -- the frame's own capture timestamp, not when
+# analysis happened, so it's directly comparable to record.py's "last recorded"
+# heartbeat field (read_record_heartbeat()) to see how far analysis is lagging
+# live capture. crops_last_24h_window is a rolling (timestamp, crop_count) deque
+# pruned to the last 24h on every frame, with crops_last_24h kept as a running
+# sum over just that window (not recomputed by summing the deque each time) so
+# a poll of /status stays O(1) regardless of frame rate.
+last_analysed_unix: float | None = None
+last_analysed_crops = 0
+crops_last_24h = 0
+crops_last_24h_window: deque = deque()
+
+# Fullframe backlog-drain state (oldest data first -- see config.py's docstrings on the
+# three QUE_FULLFRAMES* paths), declared here rather than only inside the __main__ block
+# below so /status can read it for progress reporting even in the narrow window right
+# after a restart, before __main__ has populated it for real -- an empty list here just
+# means _stream_status() reports no backlog info yet instead of raising NameError.
+fullframe_queues: list[tuple] = []
+active_queue_idx = 0
+fullframe_backlog: list[str] = []
+
+# Backlog-drain rate, for the live-stream's BACKLOG section. Tracked as a plain
+# processed-count + start-time pair (reset whenever active_queue_idx changes), NOT
+# derived from watching fullframe_backlog's length shrink -- that works fine for the
+# two one-shot backlogs (nothing refills them), but the live queue (last stage) gets
+# refilled by record.py's own ongoing production, so its list length isn't a shrinking
+# subset of any fixed starting count. A plain "how many has this stage actually
+# processed, and over how long" counter stays meaningful either way.
+active_queue_started_unix: float | None = None
+active_queue_processed_count = 0
+
+# Daily Slack report counters -- reset whenever the local calendar date rolls over
+# (see maybe_send_daily_report()), independent of crops_produced_total above (which
+# is a lifetime total, never reset).
+daily_crops_count = 0
+daily_mnemiopsis_count = 0
+daily_report_date = time.strftime("%Y-%m-%d", time.localtime())
+
+last_training_frame_unix = 0.0  # 0 (not time.time()) so the very first frame after a
+# fresh start samples immediately instead of waiting a full TRAINING_FRAME_INTERVAL_S
 
 latest_frame_lock = threading.Lock()
 latest_frame_jpeg = None
@@ -150,7 +209,9 @@ def update_recent_crops_strip(results) -> None:
     global latest_crops_strip_jpeg
     with recent_crops_lock:
         for _crop_stem, encoded_bytes, sidecar in results:
-            if sidecar["class_confidence"] is not None and sidecar["class_confidence"] >= config.CONFIDENCE_THRESHOLD:
+            if (sidecar["class_confidence"] is not None
+                    and sidecar["class_confidence"] >= config.CONFIDENCE_THRESHOLD
+                    and sidecar["peak_val"] > config.RECENT_CROPS_MIN_PEAK_VAL):
                 recent_labeled_crops.append((encoded_bytes, sidecar["class_label"]))
 
         if not recent_labeled_crops:
@@ -160,7 +221,7 @@ def update_recent_crops_strip(results) -> None:
         # crop boxes (config.CROP_BOX_COLOR), with its class label captioned in a black
         # band underneath -- centered, white-on-black so it stays legible regardless of
         # how bright/dark the crop itself is (green-on-crop, tried first, washed out on
-        # brighter crops). Tiles are separated by a gap column, not butted edge-to-edge,
+        # brighter crops). Tiles are separated by a gap column/row, not butted edge-to-edge,
         # so each one's border reads as its own box rather than one continuous grid line.
         thumb_px = config.RECENT_CROPS_THUMB_PX
         caption_px = config.RECENT_CROPS_CAPTION_PX
@@ -183,12 +244,42 @@ def update_recent_crops_strip(results) -> None:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
             tiles.append(tile)
 
-        gap = np.zeros((tile_h, gap_px, 3), dtype=np.uint8)
-        row = tiles[0]
-        for tile in tiles[1:]:
-            row = np.hstack([row, gap, tile])
-        # oldest first (deque append order) -> newest tile at the right
-        ok, encoded_strip = cv2.imencode(".jpg", row)
+        # Wraps into a grid up to RECENT_CROPS_COLUMNS wide instead of one ever-widening
+        # row -- at RECENT_CROPS_COUNT=40 a single row would be ~4000px wide, well past
+        # the browser viewport, forcing the page to scroll/clip it. Padded with blank
+        # tiles up to a full last row so every row hstacks to the same width (a ragged
+        # last row would fail vstack's shape check, not just look uneven).
+        #
+        # Deque rarely holds a clean multiple of RECENT_CROPS_COLUMNS (it fills up
+        # gradually, and RECENT_CROPS_MIN_PEAK_VAL makes qualifying crops sparse), so
+        # always using exactly RECENT_CROPS_COLUMNS columns would routinely leave a
+        # chunk of the last row visibly blank. Instead pick, from a small window of
+        # column counts near RECENT_CROPS_COLUMNS, whichever leaves the least padding --
+        # ties broken toward more columns, to keep the grid wide rather than tall. Never
+        # narrower than 4 columns even if that means accepting some padding -- a tall
+        # 1-2 column strip is a worse look than a partly-blank last row.
+        n_tiles = len(tiles)
+        max_cols = min(config.RECENT_CROPS_COLUMNS, n_tiles)
+        min_cols = min(max_cols, 4)
+        n_cols = min(range(min_cols, max_cols + 1), key=lambda c: ((-n_tiles) % c, -c))
+        blank_tile = np.zeros((tile_h, thumb_px, 3), dtype=np.uint8)
+        tiles += [blank_tile] * (-len(tiles) % n_cols)
+
+        gap_col = np.zeros((tile_h, gap_px, 3), dtype=np.uint8)
+        row_imgs = []
+        for i in range(0, len(tiles), n_cols):
+            row_tiles = tiles[i:i + n_cols]
+            row_img = row_tiles[0]
+            for tile in row_tiles[1:]:
+                row_img = np.hstack([row_img, gap_col, tile])
+            row_imgs.append(row_img)
+
+        gap_row = np.zeros((gap_px, row_imgs[0].shape[1], 3), dtype=np.uint8)
+        grid = row_imgs[0]
+        for row_img in row_imgs[1:]:
+            grid = np.vstack([grid, gap_row, row_img])
+
+        ok, encoded_strip = cv2.imencode(".jpg", grid)
         if ok:
             latest_crops_strip_jpeg = encoded_strip.tobytes()
 
@@ -220,6 +311,91 @@ def read_send_heartbeat() -> dict:
         return {}
 
 
+def read_record_heartbeat() -> dict:
+    """Reads record.py's own heartbeat.json, same pattern as read_send_heartbeat()
+    above -- used for the live-stream's "last recorded" timer. last_frame_timestamp_unix
+    is only set there when a frame was actually captured and kept (not on every
+    heartbeat write), so this reflects real camera activity, not just process liveness."""
+    path = config.HEARTBEAT_DIR / "record.heartbeat.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def compute_stage_remaining() -> list[int]:
+    """Current remaining count for each stage in fullframe_queues, in order -- 0 for
+    stages already finished, fullframe_backlog's length for the active stage. As of
+    2026-08-11, fullframe_queues is just the live queue (sdb1's old backlog is
+    deliberately left out -- see config.py's QUE_FULLFRAMES_BACKLOG_RESTING), so this is
+    just [len(fullframe_backlog)] in practice; kept list-shaped rather than hardcoded to
+    one stage in case a backlog stage is ever reintroduced. Shared by
+    estimate_camera_live_eta() and the backlog/live mode switch below."""
+    return [len(fullframe_backlog) if i == active_queue_idx else 0 for i in range(len(fullframe_queues))]
+
+
+def compute_total_backlog() -> int:
+    return sum(compute_stage_remaining())
+
+
+def update_system_mode() -> None:
+    """Hysteresis-based backlog-mode/live-mode switch -- see config.py's
+    BACKLOG_MODE_ENTER_THRESHOLD/EXIT_THRESHOLD docstring for why two thresholds, not
+    one. Cheap enough to call every loop iteration: compute_total_backlog() only touches
+    already-in-memory/cached state, never lists a directory itself."""
+    global system_mode
+    total_backlog = compute_total_backlog()
+    if system_mode == "live" and total_backlog > config.BACKLOG_MODE_ENTER_THRESHOLD:
+        system_mode = "backlog"
+        print(f"Total backlog ({total_backlog}) exceeded BACKLOG_MODE_ENTER_THRESHOLD "
+              f"({config.BACKLOG_MODE_ENTER_THRESHOLD}) -- entering backlog mode, video stream off.")
+    elif system_mode == "backlog" and total_backlog < config.BACKLOG_MODE_EXIT_THRESHOLD:
+        system_mode = "live"
+        print(f"Total backlog ({total_backlog}) dropped below BACKLOG_MODE_EXIT_THRESHOLD "
+              f"({config.BACKLOG_MODE_EXIT_THRESHOLD}) -- entering live mode, video stream on.")
+
+
+def estimate_camera_live_eta(record_hb: dict) -> dict:
+    """Projects when every currently-queued frame will be processed AND analyse.py will
+    have caught up to record.py's live production -- i.e. 'no images waiting on disk
+    anywhere.' Simplified 2026-08-11: with sdb1's old backlog deliberately left out of
+    fullframe_queues (see config.py's QUE_FULLFRAMES_BACKLOG_RESTING), there's no
+    separate backlog phase to account for anymore, just a straight chase -- the total
+    queued (compute_total_backlog()) closing at (analyse_rate - record_rate) if that's
+    positive. If it isn't, there's no finite ETA (returns catching_up=False,
+    eta_hours=None) rather than a nonsense negative/infinite number.
+
+    Both rates are lifetime averages since each process's own last restart (see
+    process_start_unix in both analyse.py and record.py) -- noisy right after either
+    restarts, converging to a stable estimate as more frames accumulate."""
+    now = time.time()
+    analyse_elapsed = now - process_start_unix
+    analyse_rate = frames_analysed_total / analyse_elapsed if analyse_elapsed > 0 and frames_analysed_total else None
+
+    record_start = record_hb.get("process_start_unix")
+    record_total = record_hb.get("frames_recorded_total")
+    record_rate = (
+        record_total / (now - record_start)
+        if record_start and record_total and now > record_start else None
+    )
+
+    if not analyse_rate or record_rate is None:
+        return {"eta_hours": None, "analyse_rate_per_hour": None, "record_rate_per_hour": None, "catching_up": None}
+
+    net_rate = analyse_rate - record_rate
+    catching_up = net_rate > 0
+    eta_hours = (compute_total_backlog() / net_rate) / 3600 if catching_up else None
+
+    return {
+        "eta_hours": eta_hours,
+        "analyse_rate_per_hour": analyse_rate * 3600,
+        "record_rate_per_hour": record_rate * 3600,
+        "catching_up": catching_up,
+    }
+
+
 if config.ENABLE_LIVE_STREAM:
     from flask import Flask, Response, jsonify
 
@@ -227,25 +403,87 @@ if config.ENABLE_LIVE_STREAM:
 
     @flask_app.route("/")
     def _stream_index():
+        # Video image + crops-thumbnail panel, and the JS that polls/renders them --
+        # entirely skipped in backlog mode (2026-08-10, see update_system_mode() /
+        # config.py's BACKLOG_MODE_ENTER_THRESHOLD) to save the per-frame render cost
+        # while draining the fullframe backlogs, so the page just shows a plain note
+        # instead of a permanently-broken image, and doesn't poll two endpoints that
+        # would 404 forever. The METADATA status panel below is unaffected either way --
+        # /status keeps reporting everything (temps, disk, connection, last-recorded/
+        # analysed timers, backlog progress) regardless of mode.
+        if system_mode == "live":
+            video_html = (
+                # width/height (not max-width/max-height) so a small source image -- e.g. at a low
+                # LIVESTREAM_DISP_SCALE, chosen for faster transmit/decode -- gets scaled UP to fill
+                # the viewport instead of rendering at its tiny native pixel size. min(100vw,100vh)
+                # instead of object-fit:contain -- the source frame is always square (IMAGE_SIZE_PX x
+                # IMAGE_SIZE_PX, downscaled with equal fx/fy in update_live_frame), so sizing both
+                # width/height to the smaller viewport dimension reproduces contain's letterboxing
+                # exactly, but as the img element's own box -- not a transparent box around it -- so
+                # the border below hugs the visible video, not empty space out to the viewport edge.
+                # position:fixed;bottom:0;right:0 replaces object-position for the same bottom-right pin.
+                '<img id="videoFrame" style="position:fixed;bottom:0;right:0;'
+                'width:min(100vw,100vh);height:min(100vw,100vh);display:block;'
+                'border:2px solid #00ff00;box-sizing:border-box">'
+                '<div style="position:fixed;top:16px;right:16px;padding:4px 10px;'
+                'font-size:11px;font-weight:bold;letter-spacing:0.6px;color:#fff;'
+                'background:rgba(0,0,0,0.6);border:1px solid #00ff00;border-radius:4px;'
+                'font-family:-apple-system,Menlo,Consolas,monospace">LIVESTREAM</div>'
+            )
+            crops_panel_html = (
+                # Crops panel (border + header) is always visible, even before any labeled crop
+                # exists yet -- only the <img> itself and the placeholder text toggle, so it's
+                # always clear from the page whether the feature is present vs. genuinely has
+                # nothing to show yet (CLASSIFY=False, or no crop has cleared CONFIDENCE_THRESHOLD).
+                # Same background as the metadata panel below it, so the two read as one group.
+                '<div style="padding:8px;border:2px solid #00ff00;border-radius:6px;'
+                'background:rgba(10,10,10,0.88);box-shadow:0 4px 18px rgba(0,0,0,0.45)">'
+                '<div style="font-size:11px;font-weight:bold;letter-spacing:0.6px;color:#fff;'
+                f'font-family:-apple-system,Menlo,Consolas,monospace;margin-bottom:6px">LAST {config.RECENT_CROPS_COUNT} CROPS</div>'
+                '<img id="cropsStrip" style="display:none;max-width:100%;border-radius:3px">'
+                '<span id="cropsPlaceholder" style="display:block;font-size:11px;color:#aaa;'
+                'font-family:-apple-system,Menlo,Consolas,monospace">Waiting for labeled crops...</span>'
+                "</div>"
+            )
+            video_js = (
+                # Polls a single always-fresh frame instead of holding open a multipart MJPEG
+                # stream -- see /latest_frame.jpg's comment for why: a persistent stream can only
+                # fall further behind if the browser/network ever briefly lags the production
+                # rate, since it must display every buffered frame in order before reaching "now".
+                # A fresh request each tick always gets whatever's current, nothing accumulates.
+                "function updateFrame(){"
+                "document.getElementById('videoFrame').src='/latest_frame.jpg?t='+Date.now();"
+                "}"
+                "updateFrame();setInterval(updateFrame,400);"
+                # Polled slower than the main frame (1s vs 400ms) -- labeled crops accumulate
+                # far slower than raw frames, so there's nothing to gain from a faster poll here.
+                "const cropsStripImg=document.getElementById('cropsStrip');"
+                "const cropsPlaceholder=document.getElementById('cropsPlaceholder');"
+                "cropsStripImg.onload=function(){"
+                "cropsStripImg.style.display='block';cropsPlaceholder.style.display='none';"
+                "};"
+                "cropsStripImg.onerror=function(){"
+                "cropsStripImg.style.display='none';cropsPlaceholder.style.display='block';"
+                "};"
+                "function updateCropsStrip(){"
+                "cropsStripImg.src='/latest_crops_strip.jpg?t='+Date.now();"
+                "}"
+                "updateCropsStrip();setInterval(updateCropsStrip,1000);"
+            )
+        else:
+            video_html = ""
+            crops_panel_html = (
+                '<div style="padding:8px 12px;border:2px solid #00ff00;border-radius:6px;'
+                'background:rgba(10,10,10,0.88);box-shadow:0 4px 18px rgba(0,0,0,0.45);'
+                'font-size:11px;color:#aaa;font-family:-apple-system,Menlo,Consolas,monospace">'
+                "Video + crops feed off (backlog mode) -- draining fullframe backlogs.</div>"
+            )
+            video_js = ""
+
         return (
             '<html><head><title>Jellyscope Livestream</title></head>'
-            '<body style="margin:0;background:#000;height:100vh;overflow:hidden">'
-            # width/height (not max-width/max-height) so a small source image -- e.g. at a low
-            # LIVESTREAM_DISP_SCALE, chosen for faster transmit/decode -- gets scaled UP to fill
-            # the viewport instead of rendering at its tiny native pixel size. min(100vw,100vh)
-            # instead of object-fit:contain -- the source frame is always square (IMAGE_SIZE_PX x
-            # IMAGE_SIZE_PX, downscaled with equal fx/fy in update_live_frame), so sizing both
-            # width/height to the smaller viewport dimension reproduces contain's letterboxing
-            # exactly, but as the img element's own box -- not a transparent box around it -- so
-            # the border below hugs the visible video, not empty space out to the viewport edge.
-            # position:fixed;bottom:0;right:0 replaces object-position for the same bottom-right pin.
-            '<img id="videoFrame" style="position:fixed;bottom:0;right:0;'
-            'width:min(100vw,100vh);height:min(100vw,100vh);display:block;'
-            'border:2px solid #00ff00;box-sizing:border-box">'
-            '<div style="position:fixed;top:16px;right:16px;padding:4px 10px;'
-            'font-size:11px;font-weight:bold;letter-spacing:0.6px;color:#fff;'
-            'background:rgba(0,0,0,0.6);border:1px solid #00ff00;border-radius:4px;'
-            'font-family:-apple-system,Menlo,Consolas,monospace">LIVESTREAM</div>'
+            '<body style="margin:0;background:#000;min-height:100vh;overflow:auto">'
+            + video_html +
             # Single fixed top-left column, in normal document flow (not each child
             # individually position:fixed like the old status/logtail pair was) -- crops
             # stacks above metadata here, and neither can ever overlap or need a
@@ -253,52 +491,24 @@ if config.ENABLE_LIVE_STREAM:
             # measured status's rendered height on every /status poll to place itself.
             '<div style="position:fixed;top:16px;left:16px;max-width:calc(100vw - 32px);'
             'display:flex;flex-direction:column;gap:10px">'
-            # Crops panel (border + header) is always visible, even before any labeled crop
-            # exists yet -- only the <img> itself and the placeholder text toggle, so it's
-            # always clear from the page whether the feature is present vs. genuinely has
-            # nothing to show yet (CLASSIFY=False, or no crop has cleared CONFIDENCE_THRESHOLD).
-            # Same background as the metadata panel below it, so the two read as one group.
-            '<div style="padding:8px;border:2px solid #00ff00;border-radius:6px;'
-            'background:rgba(10,10,10,0.88);box-shadow:0 4px 18px rgba(0,0,0,0.45)">'
-            '<div style="font-size:11px;font-weight:bold;letter-spacing:0.6px;color:#fff;'
-            'font-family:-apple-system,Menlo,Consolas,monospace;margin-bottom:6px">LAST 10 CROPS</div>'
-            '<img id="cropsStrip" style="display:none;max-width:100%;border-radius:3px">'
-            '<span id="cropsPlaceholder" style="display:block;font-size:11px;color:#aaa;'
-            'font-family:-apple-system,Menlo,Consolas,monospace">Waiting for labeled crops...</span>'
-            "</div>"
+            + crops_panel_html +
             "<div>"
             '<div style="font-size:11px;font-weight:bold;letter-spacing:0.6px;color:#fff;'
             'font-family:-apple-system,Menlo,Consolas,monospace;margin-bottom:6px">METADATA</div>'
-            '<pre id="status" style="margin:0;padding:14px 18px;font-size:12px;line-height:1.6;'
+            # <div>, not <pre> -- a multi-column layout needs a block container it can
+            # split into columns; individual lines below still get pre's whitespace
+            # preservation (double-space field separators, explicit \n line breaks) via
+            # white-space:pre-wrap instead, which additionally (unlike plain pre) wraps a
+            # too-long line within its column rather than overflowing it horizontally.
+            '<div id="status" style="margin:0;padding:16px 20px;font-size:15px;line-height:1.6;'
             'color:#fff;background:rgba(10,10,10,0.88);border:2px solid #00ff00;border-radius:10px;'
-            'white-space:pre;font-family:-apple-system,Menlo,Consolas,monospace;'
-            'box-shadow:0 4px 18px rgba(0,0,0,0.45)"></pre>'
+            'white-space:pre-wrap;font-family:-apple-system,Menlo,Consolas,monospace;'
+            'column-count:3;column-gap:26px;'
+            'box-shadow:0 4px 18px rgba(0,0,0,0.45)"></div>'
             "</div>"
             "</div>"
             "<script>"
-            # Polls a single always-fresh frame instead of holding open a multipart MJPEG
-            # stream -- see /latest_frame.jpg's comment for why: a persistent stream can only
-            # fall further behind if the browser/network ever briefly lags the production
-            # rate, since it must display every buffered frame in order before reaching "now".
-            # A fresh request each tick always gets whatever's current, nothing accumulates.
-            "function updateFrame(){"
-            "document.getElementById('videoFrame').src='/latest_frame.jpg?t='+Date.now();"
-            "}"
-            "updateFrame();setInterval(updateFrame,400);"
-            # Polled slower than the main frame (1s vs 400ms) -- labeled crops accumulate
-            # far slower than raw frames, so there's nothing to gain from a faster poll here.
-            "const cropsStripImg=document.getElementById('cropsStrip');"
-            "const cropsPlaceholder=document.getElementById('cropsPlaceholder');"
-            "cropsStripImg.onload=function(){"
-            "cropsStripImg.style.display='block';cropsPlaceholder.style.display='none';"
-            "};"
-            "cropsStripImg.onerror=function(){"
-            "cropsStripImg.style.display='none';cropsPlaceholder.style.display='block';"
-            "};"
-            "function updateCropsStrip(){"
-            "cropsStripImg.src='/latest_crops_strip.jpg?t='+Date.now();"
-            "}"
-            "updateCropsStrip();setInterval(updateCropsStrip,1000);"
+            + video_js +
             "async function updateStatus(){"
             "try{"
             "const d=await (await fetch('/status')).json();"
@@ -306,8 +516,10 @@ if config.ENABLE_LIVE_STREAM:
             "const overMax=(v,m)=>v!==null&&v!==undefined&&m!==null&&m!==undefined&&v>=m;"
             "const nearMax=(v,m)=>v!==null&&v!==undefined&&m!==null&&m!==undefined&&v>=0.9*m;"
             "const flag=(v,m)=>overMax(v,m)?' [DANGER]':nearMax(v,m)?' [WARN]':'';"
-            "const vsMax=(v,m,u)=>`${fmt(v,u)} / max ${fmt(m,u)}${flag(v,m)}`;"
-            "const hdr=(label)=>`<b style=\"font-size:14px;letter-spacing:0.4px\">${label}</b>\\n`;"
+            "const colorize=(text,color)=>color?`<span style=\"color:${color}\">${text}</span>`:text;"
+            "const tempColor=(v,m)=>overMax(v,m)?'#ff4d4d':nearMax(v,m)?'#ffa64d':null;"
+            "const vsMax=(v,m,u)=>colorize(`${fmt(v,u)} / max ${fmt(m,u)}${flag(v,m)}`,tempColor(v,m));"
+            "const hdr=(label)=>`<b style=\"font-size:17px;letter-spacing:0.4px\">${label}</b>\\n`;"
             "const fmtSpeed=(bps)=>{"
             "if(bps===null||bps===undefined)return'N/A';"
             "if(bps>=1e6)return(bps/1e6).toFixed(2)+' MB/s';"
@@ -317,47 +529,79 @@ if config.ENABLE_LIVE_STREAM:
             "const fmtAge=(s)=>{"
             "if(s===null||s===undefined)return'N/A';"
             "if(s<120)return s.toFixed(0)+'s ago';"
-            "return(s/60).toFixed(1)+'m ago';"
+            "if(s<7200)return(s/60).toFixed(1)+'m ago';"
+            "if(s<172800)return(s/3600).toFixed(1)+'h ago';"
+            "return(s/86400).toFixed(1)+'d ago';"
             "};"
+            "const fmtTime=(u)=>(u===null||u===undefined)?'N/A':new Date(u*1000).toLocaleTimeString();"
+            "const age=(u)=>(u===null||u===undefined)?null:(Date.now()/1000)-u;"
+            "const fmtEta=(h)=>{"
+            "if(h===null||h===undefined)return'N/A';"
+            "if(h<48)return h.toFixed(1)+'h';"
+            "return(h/24).toFixed(1)+'d';"
+            "};"
+            # Each section is its own break-inside:avoid block, so the column layout
+            # below only ever breaks *between* sections, never through the middle of
+            # one -- margin-bottom (not the old blank "\n \n" line) provides the gap
+            # between sections stacked in the same column. Optional `color` tints the
+            # whole section (header + lines) -- used for CONNECTION when send.py is
+            # down, so only that section goes red instead of the whole box.
+            "const section=(title,lines,color)=>`<div style=\"break-inside:avoid;"
+            "-webkit-column-break-inside:avoid;margin-bottom:10px${color?`;color:${color}`:''}\">`+"
+            "hdr(title)+lines.join('\\n')+`</div>`;"
             "document.getElementById('status').innerHTML="
-            "`<b style=\"font-size:15px\">${d.time}</b>\\n`+"
-            "`Frames: ${d.frames_analysed_total}  Crops: ${d.crops_produced_total}  "
-            "Sampling: every ${d.frame_skip} frame(s)\\n \\n`+"
-            "hdr('QUEUE')+"
-            "`Avg processing time: ${fmt(d.avg_processing_time_s,' s')}\\n`+"
-            "`Full frames: ${d.que_fullframes_depth}  Crops: ${d.que_crops_depth}\\n \\n`+"
-            "hdr('LEAK DETECTION')+"
-            "`Leak: ${d.leak_detected===true?'!!! DETECTED !!!':d.leak_detected===false?'OK':'N/A'}  "
-            "Enclosure humidity: ${fmt(d.bme280_humidity_pct,'%')}  "
-            "Dew point: ${fmt(d.dew_point_c,' C')}\\n \\n`+"
-            "hdr('ENVIRONMENTAL')+"
+            "`<div style=\"break-inside:avoid;-webkit-column-break-inside:avoid;margin-bottom:10px\">"
+            "<b style=\"font-size:18px\">${d.time}</b>\\n"
+            "Mode: ${colorize(d.system_mode==='live'?'LIVE':'BACKLOG',d.system_mode==='live'?null:'#ffa64d')}"
+            " (${(d.total_backlog||0).toLocaleString()} pending)\\n"
+            "Last recorded: ${fmtTime(d.last_recorded_unix)} (${fmtAge(age(d.last_recorded_unix))})\\n"
+            "Last analysed: ${fmtTime(d.last_analysed_unix)} (${fmtAge(age(d.last_analysed_unix))})\\n"
+            "Crops in last image: ${d.last_analysed_crops}  Crops in last 24h: ${d.crops_last_24h}\\n"
+            "Fully live in: ${d.camera_live_catching_up===true?fmtEta(d.camera_live_eta_hours):"
+            "d.camera_live_catching_up===false?`NOT catching up (record ${fmt(d.record_rate_per_hour,'/hr')} "
+            "vs analyse ${fmt(d.analyse_rate_per_hour,'/hr')})`:'estimating...'}\\n"
+            "Sampling: every ${d.frame_skip} frame(s)</div>`+"
+            "section('BACKLOG',(d.backlog_stages||[]).map(s=>"
+            "`${s.label}: ${s.status==='done'?'done':s.status==='pending'?'pending':"
+            "'active, '+s.remaining.toLocaleString()+' remaining'"
+            "+(s.rate_per_hour?' -- '+s.rate_per_hour.toFixed(0)+'/hr, ETA '+fmtEta(s.eta_hours):'')}`"
+            "))+"
+            "section('QUEUE',["
+            "`Avg processing time: ${fmt(d.avg_processing_time_s,' s')}`,"
+            "])+"
+            "section('LEAK DETECTION',["
+            "`Leak: ${d.leak_detected===true?'!!! DETECTED !!!':d.leak_detected===false?'OK':'N/A'}`,"
+            "`Enclosure humidity: ${fmt(d.bme280_humidity_pct,'%')}  "
+            "Dew point: ${fmt(d.dew_point_c,' C')}`,"
+            "])+"
+            "section('ENVIRONMENTAL',["
             "`Bar3XT pressure: ${fmt(d.bar3xt_pressure_mbar,' mbar')}  "
-            "depth: ${fmt(d.bar3xt_depth_m,' m')}\\n`+"
+            "depth: ${fmt(d.bar3xt_depth_m,' m')}`,"
             "`Bar3XT temp: ${fmt(d.bar3xt_temp_c,' C')}  "
-            "DS18B20 temp: ${fmt(d.ds18b20_temp_c,' C')}\\n \\n`+"
-            "hdr('DEVICE')+"
-            "`Enclosure pressure: ${fmt(d.bme280_pressure_mbar,' mbar')}  "
-            "Enclosure temp (BME280): ${fmt(d.bme280_temp_c,' C')}\\n`+"
-            "`Camera: ${vsMax(d.camera_temp_c,d.camera_max_temp_c,' C')}\\n`+"
-            "`Strobe converter: ${vsMax(d.strobe_converter_temp_c,d.strobe_max_temp_c,' C')}\\n`+"
-            "`Strobe driver: ${vsMax(d.strobe_driver_temp_c,d.strobe_max_temp_c,' C')}\\n`+"
-            "`Jetson: ${vsMax(d.jetson_temp_c_mean,d.jetson_max_temp_c,' C')}\\n`+"
-            "`CPU: ${fmt(d.cpu_percent,'%')}  GPU: ${fmt(d.gpu_percent_mean,'%')} (max ${fmt(d.gpu_percent_max,'%')})\\n`+"
-            "`Disk free: device: ${fmt(d.disk_root,' GB')} `+"
-            "`ssd1: ${fmt(d.disk_ssd1,' GB')}  ssd2: ${fmt(d.disk_ssd2,' GB')}\\n \\n`+"
-            "hdr('CONNECTION')+"
+            "DS18B20 temp: ${fmt(d.ds18b20_temp_c,' C')}`,"
+            "])+"
+            "section('DEVICE',["
+            "`Enclosure pressure: ${fmt(d.bme280_pressure_mbar,' mbar')}`,"
+            "`Enclosure temp (BME280): ${fmt(d.bme280_temp_c,' C')}`,"
+            "`Camera: ${vsMax(d.camera_temp_c,d.camera_max_temp_c,' C')}`,"
+            "`Strobe converter: ${vsMax(d.strobe_converter_temp_c,d.strobe_max_temp_c,' C')}`,"
+            "`Strobe driver: ${vsMax(d.strobe_driver_temp_c,d.strobe_max_temp_c,' C')}`,"
+            "`Jetson: ${vsMax(d.jetson_temp_c_mean,d.jetson_max_temp_c,' C')}`,"
+            "`CPU: ${fmt(d.cpu_percent,'%')}  GPU: ${fmt(d.gpu_percent_mean,'%')} (max ${fmt(d.gpu_percent_max,'%')})`,"
+            "`Disk free: device: ${fmt(d.disk_root,' GB')}  "
+            "ssd1: ${fmt(d.disk_ssd1,' GB')}  ssd2: ${fmt(d.disk_ssd2,' GB')}`,"
+            "])+"
+            "section('CONNECTION',["
             "`Status: ${!d.send_alive?'PROCESS DOWN':(d.consecutive_upload_failures>0?"
-            "`FAILING (${d.consecutive_upload_failures}x)`:'OK')}\\n`+"
+            "`FAILING (${d.consecutive_upload_failures}x)`:'OK')}`,"
             "`Last successful upload: ${fmtAge(d.last_success_age_s)}  "
-            "Speed: ${fmtSpeed(d.upload_speed_bps)}\\n`+"
-            "`Crops sent: ${d.crops_sent_total??'N/A'}  Queued: ${d.que_crops_depth}  "
-            "Failed: ${d.que_crops_failed??'N/A'}`;"
-            "const danger=d.leak_detected===true||"
-            "overMax(d.camera_temp_c,d.camera_max_temp_c)||"
-            "overMax(d.strobe_converter_temp_c,d.strobe_max_temp_c)||"
-            "overMax(d.strobe_driver_temp_c,d.strobe_max_temp_c)||"
-            "overMax(d.jetson_temp_c_mean,d.jetson_max_temp_c)||"
-            "!d.send_alive||d.consecutive_upload_failures>3;"
+            "Speed: ${fmtSpeed(d.upload_speed_bps)}`,"
+            "],!d.send_alive?'#ff4d4d':null);"
+            # Only a positive leak reading turns the whole box red -- temperature
+            # readings are flagged in place per-value (tempColor/vsMax above) and a
+            # down send.py only tints the CONNECTION section (color arg above), so
+            # one bad reading doesn't drown out everything else on the page.
+            "const danger=d.leak_detected===true;"
             "document.getElementById('status').style.background="
             "danger?'rgba(192,57,43,0.85)':'rgba(10,10,10,0.88)';"
             "}catch(e){}"
@@ -377,14 +621,52 @@ if config.ENABLE_LIVE_STREAM:
         send_hb = read_send_heartbeat()
         send_age_s = (time.time() - send_hb["last_update_unix"]) if send_hb.get("last_update_unix") else None
         last_success_unix = send_hb.get("last_success_unix")
+        record_hb = read_record_heartbeat()
+        # Cheap by construction -- reads already-in-memory state (which backlog is active,
+        # how many stems are left in its cached listing) rather than re-listing any
+        # directory, so this costs nothing extra on top of what the main loop already
+        # does. See fullframe_queues' module-level declaration above.
+        active_queue_elapsed_s = time.time() - active_queue_started_unix if active_queue_started_unix else None
+        active_queue_rate_per_hour = (
+            active_queue_processed_count / active_queue_elapsed_s * 3600
+            if active_queue_elapsed_s and active_queue_processed_count else None
+        )
+        backlog_stages = [
+            {
+                "label": label,
+                "status": "done" if i < active_queue_idx else ("active" if i == active_queue_idx else "pending"),
+                "remaining": (0 if i < active_queue_idx
+                              else len(fullframe_backlog) if i == active_queue_idx
+                              else None),
+                # Only meaningful for the active stage -- rate of frames actually
+                # processed since this stage began (not derived from watching remaining
+                # shrink, which would be misleading once the live stage keeps refilling
+                # from record.py's ongoing production -- see the module-level comment
+                # on active_queue_started_unix/active_queue_processed_count).
+                "rate_per_hour": active_queue_rate_per_hour if i == active_queue_idx else None,
+                "eta_hours": (len(fullframe_backlog) / active_queue_rate_per_hour
+                              if i == active_queue_idx and active_queue_rate_per_hour else None),
+            }
+            for i, (_, label) in enumerate(fullframe_queues)
+        ]
+        camera_live = estimate_camera_live_eta(record_hb)
         return jsonify({
             "time": time.strftime("%H:%M:%S"),
-            "frames_analysed_total": frames_analysed_total,
-            "crops_produced_total": crops_produced_total,
+            "last_recorded_unix": record_hb.get("last_frame_timestamp_unix"),
+            "last_analysed_unix": last_analysed_unix,
+            "last_analysed_crops": last_analysed_crops,
+            "crops_last_24h": crops_last_24h,
+            "backlog_stages": backlog_stages,
+            "system_mode": system_mode,
+            "total_backlog": sum(compute_stage_remaining()),
+            "backlog_mode_enter_threshold": config.BACKLOG_MODE_ENTER_THRESHOLD,
+            "backlog_mode_exit_threshold": config.BACKLOG_MODE_EXIT_THRESHOLD,
+            "camera_live_eta_hours": camera_live["eta_hours"],
+            "camera_live_catching_up": camera_live["catching_up"],
+            "analyse_rate_per_hour": camera_live["analyse_rate_per_hour"],
+            "record_rate_per_hour": camera_live["record_rate_per_hour"],
             "frame_skip": config.FRAME_SKIP,
             "avg_processing_time_s": avg_processing_time_s,
-            "que_fullframes_depth": queue_io.queue_depth(config.QUE_FULLFRAMES),
-            "que_crops_depth": queue_io.queue_depth(config.QUE_CROPS),
             "bar3xt_pressure_mbar": live.get("bar3xt_pressure_mbar"),
             "bar3xt_depth_m": live.get("bar3xt_depth_m"),
             "bar3xt_temp_c": live.get("bar3xt_temp_c"),
@@ -410,8 +692,6 @@ if config.ENABLE_LIVE_STREAM:
             "disk_ssd2": disk.get(str(config.EXTERNAL_SSD_PATHS[1])),
             "send_alive": (send_age_s is not None and send_age_s < config.HEARTBEAT_STALE_S),
             "send_age_s": send_age_s,
-            "crops_sent_total": send_hb.get("crops_sent_total"),
-            "que_crops_failed": send_hb.get("que_crops_failed"),
             "upload_speed_bps": send_hb.get("last_speed_bps"),
             "last_upload_ok": send_hb.get("last_attempt_ok"),
             "consecutive_upload_failures": send_hb.get("consecutive_failures"),
@@ -471,6 +751,53 @@ def write_heartbeat() -> None:
     tmp = HEARTBEAT_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(heartbeat))
     tmp.replace(HEARTBEAT_PATH)
+
+
+def maybe_send_daily_report() -> None:
+    """Checked once per main-loop tick (idle or not, see bottom of file) rather than
+    only when a frame is processed -- so the report still fires close to midnight on
+    a quiet night with no frames arriving right at the rollover. Fires at most once
+    per calendar date change (local time, same time.localtime() basis write_heartbeat()
+    already uses), covering whatever date just ended."""
+    global daily_report_date, daily_crops_count, daily_mnemiopsis_count
+    today = time.strftime("%Y-%m-%d", time.localtime())
+    if today == daily_report_date:
+        return
+    leak_alert.send_slack_alert(
+        f":bar_chart: *Daily report for {daily_report_date}*\n"
+        f"Crops detected: {daily_crops_count}\n"
+        f"Mnemiopsis sightings: {daily_mnemiopsis_count}"
+    )
+    daily_report_date = today
+    daily_crops_count = 0
+    daily_mnemiopsis_count = 0
+
+
+def maybe_queue_training_frame(enhanced, image_name: str, source_frame_id, source_timestamp_unix) -> None:
+    """Every TRAINING_FRAME_INTERVAL_S, queues the current post-PREPROCESS (pre-SEGMENT)
+    full frame into QUE_TRAINING_FRAMES for send.py to upload -- periodic full-frame
+    samples for offline classifier retraining, independent of and much sparser than the
+    per-crop que_crops path. Encoded as PNG (lossless, same as crops) rather than TIFF --
+    smaller for the same pixels since `enhanced` is already 8-bit, not worth trading
+    losslessness away over a per-30-minutes upload."""
+    global last_training_frame_unix
+    now = time.time()
+    if now - last_training_frame_unix < config.TRAINING_FRAME_INTERVAL_S:
+        return
+    last_training_frame_unix = now
+
+    ok, encoded = cv2.imencode(".png", enhanced)
+    if not ok:
+        print(f"Failed to encode training frame {image_name}, skipping")
+        return
+    sidecar = {
+        "source_frame_id": source_frame_id,
+        "source_timestamp_unix": source_timestamp_unix,
+        "image_name": image_name,
+        "processed_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z",
+        "upload_attempts": 0,
+    }
+    queue_io.write_item(config.QUE_TRAINING_FRAMES, image_name, encoded.tobytes(), ".png", sidecar)
 
 
 def segment_and_classify(enhanced, image_name: str, source_frame_id=None, source_timestamp_unix=None) -> tuple[list, dict]:
@@ -543,6 +870,7 @@ def segment_and_classify(enhanced, image_name: str, source_frame_id=None, source
     if accepted:
         crop_images, crop_tensors = [], []
         region_size_pixels_list, region_size_mm2_list, crop_coords_list = [], [], []
+        peak_val_list, mean_val_list = [], []
 
         for cand in accepted:
             crop_y0, crop_x0, crop_y1, crop_x1 = cand["crop_coords"]
@@ -554,6 +882,8 @@ def segment_and_classify(enhanced, image_name: str, source_frame_id=None, source
             region_size_pixels_list.append(region_size_pixels)
             region_size_mm2_list.append(region_size_mm2)
             crop_coords_list.append((crop_y0, crop_x0, crop_y1, crop_x1))
+            peak_val_list.append(cand["peak_val"])
+            mean_val_list.append(cand["mean_val"])
             if config.CLASSIFY:
                 crop_tensors.append(vit_classifier.preprocess_crop_for_classifier(crop_image, image_size=config.CLASSIFIER_IMAGE_SIZE))
 
@@ -585,6 +915,8 @@ def segment_and_classify(enhanced, image_name: str, source_frame_id=None, source
             crop_y0, crop_x0, crop_y1, crop_x1 = crop_coords_list[crop_idx]
             region_size_pixels = region_size_pixels_list[crop_idx]
             region_size_mm2 = region_size_mm2_list[crop_idx]
+            peak_val = peak_val_list[crop_idx]
+            mean_val = mean_val_list[crop_idx]
             crop_image = crop_images[crop_idx]
             if config.CLASSIFY:
                 class_idx = class_indices[crop_idx]
@@ -611,6 +943,8 @@ def segment_and_classify(enhanced, image_name: str, source_frame_id=None, source
                 "crop_y0": crop_y0, "crop_x0": crop_x0, "crop_y1": crop_y1, "crop_x1": crop_x1,
                 "region_size_pixels": region_size_pixels,
                 "region_size_mm2": region_size_mm2,
+                "peak_val": peak_val,
+                "mean_val": mean_val,
                 "class_label": class_label,
                 "class_confidence": class_confidence,
                 "class_idx": class_idx,
@@ -633,26 +967,48 @@ def segment_and_classify(enhanced, image_name: str, source_frame_id=None, source
     return results, timings
 
 
-def process_frame(image_path, json_path, claim_duration: float = 0.0) -> None:
-    """`claim_duration` is however long the caller's queue_io.claim() took, folded
-    into the "record" timing below alongside this function's own read cost --
-    together they're the full cost of retrieving what record.py already produced,
-    as opposed to the preprocess/segment/inference/send/stream work analyse.py
-    itself does on it."""
-    global crops_produced_total, total_processing_time_sum
-    t_read_start = time.perf_counter()
+def read_frame_ahead(image_path, json_path) -> dict:
+    """Reads one claimed frame's sidecar JSON and TIFF bytes into memory, timed the same
+    way process_frame() used to time this inline before the two were split apart (kept
+    split -- it's harmless and arguably cleaner -- even though the background-thread
+    prefetch this split originally enabled was tried and reverted the same day; see the
+    main loop's call site for why)."""
+    t_start = time.perf_counter()
     sidecar = queue_io.read_sidecar(json_path)
+    t_sidecar_end = time.perf_counter()
     image_gray = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
     if image_gray is None:
         raise ValueError(f"Failed to read {image_path}")
     t_read_end = time.perf_counter()
-    record_time = claim_duration + (t_read_end - t_read_start)
+    return {
+        "sidecar": sidecar,
+        "image_gray": image_gray,
+        "sidecar_time": t_sidecar_end - t_start,
+        "imread_time": t_read_end - t_sidecar_end,
+    }
+
+
+def process_frame(stem: str, read_result: dict, claim_duration: float = 0.0) -> None:
+    """`claim_duration` is however long the caller's queue_io.claim() took; `read_result`
+    is whatever read_frame_ahead() produced -- together they fold into the "record"
+    timing below, the full cost of retrieving what record.py already produced, as
+    opposed to the preprocess/segment/inference/send/stream work analyse.py itself does
+    on it."""
+    global crops_produced_total, total_processing_time_sum, daily_crops_count, daily_mnemiopsis_count
+    global last_analysed_unix, last_analysed_crops, crops_last_24h
+    sidecar = read_result["sidecar"]
+    image_gray = read_result["image_gray"]
+    # TEMP diagnostic breakdown (2026-08-10, investigating the record/send slowdown) --
+    # sidecar_time/imread_time split out of record_time below; remove once resolved.
+    sidecar_time = read_result["sidecar_time"]
+    imread_time = read_result["imread_time"]
+    record_time = claim_duration + sidecar_time + imread_time
 
     height, width = image_gray.shape[:2]
     if width != config.IMAGE_SIZE_PX or height != config.IMAGE_SIZE_PX:
-        raise ValueError(f"Frame {image_path.name} is {width}x{height}, expected {config.IMAGE_SIZE_PX}x{config.IMAGE_SIZE_PX}")
+        raise ValueError(f"Frame {stem} is {width}x{height}, expected {config.IMAGE_SIZE_PX}x{config.IMAGE_SIZE_PX}")
 
-    image_name = image_path.stem
+    image_name = stem
 
     ### ==========================
     ### PREPROCESS
@@ -666,22 +1022,40 @@ def process_frame(image_path, json_path, claim_duration: float = 0.0) -> None:
     )
     t_preprocess_end = time.perf_counter()
 
+    maybe_queue_training_frame(enhanced, image_name, sidecar["frame_id"], sidecar["timestamp_unix"])
+
     results, seg_timings = segment_and_classify(
         enhanced, image_name,
         source_frame_id=sidecar["frame_id"], source_timestamp_unix=sidecar["timestamp_unix"],
     )
 
     t_stream_start = time.perf_counter()
-    if config.ENABLE_LIVE_STREAM:
+    if config.ENABLE_LIVE_STREAM and system_mode == "live":
         update_live_frame(enhanced, results)
         update_recent_crops_strip(results)
     t_stream_end = time.perf_counter()
 
     t_send_start = time.perf_counter()
+    write_item_times = []  # TEMP diagnostic (2026-08-10) -- remove once resolved
     for crop_stem, encoded_bytes, crop_sidecar in results:
-        queue_io.write_item(config.QUE_CROPS, crop_stem, encoded_bytes, ".png", crop_sidecar)
+        t_write_start = time.perf_counter()
+        queue_io.write_item(config.QUE_CROPS, crop_stem, encoded_bytes, ".png", crop_sidecar,
+                             atomic_image=False, atomic_json=False)
+        write_item_times.append(time.perf_counter() - t_write_start)
         crops_produced_total += 1
+        daily_crops_count += 1
+        if crop_sidecar.get("class_label") == config.MNEMIOPSIS_CLASS_LABEL:
+            daily_mnemiopsis_count += 1
     t_send_end = time.perf_counter()
+
+    last_analysed_unix = sidecar["timestamp_unix"]
+    last_analysed_crops = len(results)
+    crops_last_24h_window.append((last_analysed_unix, last_analysed_crops))
+    crops_last_24h += last_analysed_crops
+    cutoff = last_analysed_unix - 24 * 3600
+    while crops_last_24h_window and crops_last_24h_window[0][0] < cutoff:
+        _, expired_count = crops_last_24h_window.popleft()
+        crops_last_24h -= expired_count
 
     preprocess_time = t_preprocess_end - t_preprocess_start
     segment_time = seg_timings["segment"]
@@ -691,9 +1065,11 @@ def process_frame(image_path, json_path, claim_duration: float = 0.0) -> None:
     total_time = record_time + preprocess_time + segment_time + inference_time + send_time + stream_time
     total_processing_time_sum += total_time
 
-    print(f"[{image_name}] record={record_time:.3f}s preprocess={preprocess_time:.3f}s "
+    write_times_str = ",".join(f"{t:.3f}" for t in write_item_times)
+    print(f"[{image_name}] record={record_time:.3f}s(claim={claim_duration:.3f} "
+          f"sidecar={sidecar_time:.3f} imread={imread_time:.3f}) preprocess={preprocess_time:.3f}s "
           f"segment={segment_time:.3f}s inference={inference_time:.3f}s "
-          f"send={send_time:.3f}s stream={stream_time:.3f}s "
+          f"send={send_time:.3f}s[{write_times_str}] stream={stream_time:.3f}s "
           f"total={total_time:.3f}s crops={len(results)}")
 
     del image_gray, enhanced, results, sidecar
@@ -731,48 +1107,109 @@ if __name__ == "__main__":
         ).start()
         print(f"Live stream enabled at http://<jetson-ip>:{config.LIVESTREAM_PORT}/")
 
-    for stem in queue_io.recover_processing(config.QUE_FULLFRAMES, ".tiff"):
-        print(f"Recovering {stem} from a previous crash...")
-        image_path = config.QUE_FULLFRAMES / "processing" / f"{stem}.tiff"
-        json_path = config.QUE_FULLFRAMES / "processing" / f"{stem}.json"
-        try:
-            process_frame(image_path, json_path)
-            queue_io.ack_delete(config.QUE_FULLFRAMES, stem, ".tiff")
-            frames_analysed_total += 1
-        except Exception as exc:
-            queue_io.fail_item(config.QUE_FULLFRAMES, stem, ".tiff", str(exc))
+    # Just the live queue (sda1, where record.py writes) as of 2026-08-11 -- sdb1's old
+    # backlog is deliberately left out (see config.py's QUE_FULLFRAMES_BACKLOG_RESTING
+    # docstring for why: sdb1 turned out to have a ~38x throughput ceiling versus sda1,
+    # a physical USB-negotiation problem, not something worth continuing to fight in
+    # software). Kept list-shaped rather than hardcoded to one queue in case a backlog
+    # stage is ever reintroduced -- see compute_stage_remaining().
+    fullframe_queues = [
+        (config.QUE_FULLFRAMES, "live"),
+    ]
+    for queue_root, label in fullframe_queues:
+        for stem in queue_io.recover_processing(queue_root, ".tiff"):
+            print(f"Recovering {stem} from a previous crash ({label})...")
+            image_path = queue_root / "processing" / f"{stem}.tiff"
+            json_path = queue_root / "processing" / f"{stem}.json"
+            try:
+                process_frame(stem, read_frame_ahead(image_path, json_path))
+                queue_io.ack_delete(queue_root, stem, ".tiff")
+                frames_analysed_total += 1
+            except Exception as exc:
+                queue_io.fail_item(queue_root, stem, ".tiff", str(exc))
 
-    print("analyse.py ready, watching que_fullframes...")
+    print("analyse.py ready, watching the live (sda1) queue...")
+
+    # Stems already listed from disk but not yet claimed -- refilled by list_ready_stems()
+    # only once empty, rather than every frame. incoming/ lives on exFAT, where directory
+    # listing is ~O(n) in total entries; re-listing the whole directory to pull just one
+    # stem at a time made every single frame pay the cost of scanning the *entire* backlog
+    # (tens of thousands of entries after an upload outage let one pile up), instead of
+    # that cost being paid once per refill. See the 2026-08-03 slow-pipeline incident.
+    #
+    # active_queue_idx starts at the oldest backlog and only ever moves forward, never
+    # back -- once a backlog's list_ready_stems() comes back empty it's done for good
+    # (nothing writes there anymore), so there's no reason to keep checking it once the
+    # next one takes over. Only the last queue (live) never advances further -- record.py
+    # keeps adding to it, so it's checked forever, same as the original single-queue loop.
+    active_queue_idx = 0
+    fullframe_backlog: list[str] = []
+    active_queue_started_unix = time.time()
+    active_queue_processed_count = 0
 
     while True:
+        maybe_send_daily_report()
+
         if frames_analysed_total % config.DISK_CHECK_EVERY_N_FRAMES == 0:
             free = queue_io.disk_free_bytes(config.QUEUE_ROOT)
-            if free < config.MIN_FREE_BYTES:
-                print(f"Low disk space ({free / 1e9:.2f} GB free), pausing analysis...")
+            if free < config.ANALYSE_MIN_FREE_BYTES:
+                print(f"Critically low disk space ({free / 1e9:.2f} GB free), pausing analysis...")
                 write_heartbeat()
                 time.sleep(5)
                 continue
 
-        stems = queue_io.list_ready_stems(config.QUE_FULLFRAMES)
-        if not stems:
+        if not fullframe_backlog:
+            fullframe_backlog = queue_io.list_ready_stems(fullframe_queues[active_queue_idx][0])
+            while not fullframe_backlog and active_queue_idx < len(fullframe_queues) - 1:
+                finished_label = fullframe_queues[active_queue_idx][1]
+                active_queue_idx += 1
+                next_label = fullframe_queues[active_queue_idx][1]
+                print(f"{finished_label} drained -- switching to the {next_label} queue.")
+                fullframe_backlog = queue_io.list_ready_stems(fullframe_queues[active_queue_idx][0])
+                active_queue_started_unix = time.time()
+                active_queue_processed_count = 0
+
+        # After fullframe_backlog is freshly populated above, never before -- calling this
+        # any earlier (e.g. right at loop top) would see fullframe_backlog's stale/initial
+        # state and could misjudge the backlog as empty for one iteration right at startup
+        # (a real bug caught during testing: it flickered into live mode for a single frame
+        # before self-correcting). Keep it ahead of the sleep/continue below, though, so
+        # mode still updates promptly even on ticks where the queue is (genuinely) empty.
+        update_system_mode()
+
+        if not fullframe_backlog:
             time.sleep(0.5)
             continue
 
-        stem = stems[0]
+        queue_root = fullframe_queues[active_queue_idx][0]
+        stem = fullframe_backlog.pop(0)
         t_claim_start = time.perf_counter()
-        claimed = queue_io.claim(config.QUE_FULLFRAMES, stem, ".tiff")
+        claimed = queue_io.claim(queue_root, stem, ".tiff")
         if claimed is None:
             continue
         image_path, json_path = claimed
         claim_duration = time.perf_counter() - t_claim_start
 
+        # NOTE: read_frame_ahead() is called synchronously here, not via _read_executor,
+        # as of 2026-08-10 -- the background-prefetch version was tried and reverted the
+        # same day. The assumption behind it (record's disk read could overlap for free
+        # with process_frame's compute) turned out wrong in practice: process_frame's
+        # own "send" stage is *also* disk I/O (crop writes), on the same sdb1 filesystem
+        # the backlog reads come from, so the background read thread and the main
+        # thread's writes ended up contending for the same exFAT lock concurrently --
+        # measured 3-4x *slower* (record times of 8-10s vs the previous ~1.2s) than the
+        # plain sequential version below. Left read_frame_ahead()/process_frame() split
+        # as two functions (harmless, arguably cleaner) but call them back-to-back on the
+        # main thread like the original single-function version did.
         try:
-            process_frame(image_path, json_path, claim_duration)
-            queue_io.ack_delete(config.QUE_FULLFRAMES, stem, ".tiff")
+            read_result = read_frame_ahead(image_path, json_path)
+            process_frame(stem, read_result, claim_duration)
+            queue_io.ack_delete(queue_root, stem, ".tiff")
             frames_analysed_total += 1
+            active_queue_processed_count += 1
         except Exception as exc:
             print(f"Failed to process {stem}: {exc}")
-            queue_io.fail_item(config.QUE_FULLFRAMES, stem, ".tiff", str(exc))
+            queue_io.fail_item(queue_root, stem, ".tiff", str(exc))
 
         if frames_analysed_total % config.CUDA_CACHE_CLEANUP_EVERY_N_FRAMES == 0:
             gc.collect()

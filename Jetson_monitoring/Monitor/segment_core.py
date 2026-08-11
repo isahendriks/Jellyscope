@@ -177,9 +177,12 @@ def find_candidates(prob_map_small, peak_threshold, secondary_threshold, upscale
             crop_x1 = image_size_px
             crop_x0 = max(0, crop_x1 - crop_size)
 
+        mean_val = float(prob_map_small[region_small_points[:, 0], region_small_points[:, 1]].mean())
+
         candidates.append({
             "region_size_points": len(region_small_points),
             "peak_val": float(peak_val),
+            "mean_val": mean_val,
             "crop_coords": (crop_y0, crop_x0, crop_y1, crop_x1),
         })
 

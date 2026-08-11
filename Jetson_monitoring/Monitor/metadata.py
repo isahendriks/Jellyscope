@@ -37,6 +37,7 @@ import transfer
 import metro_m0
 import strobe
 import leak_alert
+import pipeline_alert
 
 METADATA_OUTBOX = config.PIPELINE_DIR / "metadata_outbox"
 ENVIRONMENTAL_OUTBOX = config.PIPELINE_DIR / "environmental_outbox"
@@ -312,6 +313,7 @@ while True:
         new_device_sample = collect_sample(latest_m0_reading, gpu_percent_mean, gpu_percent_max)
         samples.append(new_device_sample)
         leak_alert.check_for_leak(new_device_sample)
+        pipeline_alert.check_pipeline_health(new_device_sample)
         gpu_percent_window = []
         last_device_sample_time = now
 

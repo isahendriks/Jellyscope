@@ -64,6 +64,30 @@ _SSH_OPTS = ["-o", "BatchMode=yes", "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT_
              "-o", "StrictHostKeyChecking=accept-new",
              "-o", "ControlMaster=auto", "-o", f"ControlPath={_CONTROL_PATH}", "-o", "ControlPersist=600"]
 
+# 2026-08-11 investigation: REMOTE_HOST is relayed through Tailscale's Amsterdam DERP
+# (direct connection not established -- see netcheck's MappingVariesByDestIP), and
+# measured throughput over that path was ~1.65KB/s. A fixed UPLOAD_TIMEOUT_S=60 races
+# that speed and reliably loses on anything but a tiny batch -- scp isn't resumable
+# (see this module's docstring), so a killed-at-timeout batch discards whatever partial
+# progress it made and retries the whole thing from scratch. estimate_timeout() scales
+# the actual subprocess timeout up to whatever the most recently measured speed says a
+# batch this size genuinely needs, instead of always racing a guess.
+TIMEOUT_SAFETY_FACTOR = 3.0  # headroom over the naive bytes/speed estimate (link speed
+# on a field connection is noisy, not constant)
+MAX_TIMEOUT_S = 600  # upper bound so one very slow/degenerate batch can't block send.py's
+# loop (and the training-frame uploads interleaved with it) indefinitely
+
+
+def estimate_timeout(total_bytes: int | None, default_timeout_s: int) -> int:
+    """Never returns less than default_timeout_s (the caller's own floor) -- only scales
+    upward, and only once at least one transfer has actually succeeded (_last_speed_bps
+    starts at None, so a fresh process falls back to default_timeout_s until it has a
+    real measurement to work from)."""
+    if total_bytes is None or _last_speed_bps is None or _last_speed_bps <= 0:
+        return default_timeout_s
+    estimated_s = (total_bytes / _last_speed_bps) * TIMEOUT_SAFETY_FACTOR
+    return int(min(MAX_TIMEOUT_S, max(default_timeout_s, estimated_s)))
+
 
 def ensure_remote_dir(remote_subdir: str, timeout_s: int = SSH_CONNECT_TIMEOUT_S + 5) -> None:
     """Best-effort remote `mkdir` over SSH -- ignores failure, since "already
@@ -96,14 +120,25 @@ def scp_upload(local_paths: list[str], remote_subdir: str, timeout_s: int = UPLO
         total_bytes = sum(Path(p).stat().st_size for p in local_paths)
     except OSError:
         total_bytes = None
+    effective_timeout = estimate_timeout(total_bytes, timeout_s)
+    if effective_timeout > timeout_s:
+        print(f"[transfer] scaling timeout for {remote_subdir} batch to {effective_timeout}s "
+              f"(last measured speed {_last_speed_bps:.0f} B/s)")
     t_start = time.perf_counter()
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s + 30)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=effective_timeout + 30)
         ok = result.returncode == 0
         if not ok:
             print(f"[transfer] scp failed (exit {result.returncode}): {result.stderr.strip()[:500]}")
     except subprocess.TimeoutExpired:
+        # Previously silent -- a batch that hangs rather than cleanly failing (e.g. the
+        # relayed, non-direct Tailscale link to REMOTE_HOST stalling mid-transfer) used to
+        # produce zero log output, which from the outside looked identical to send.py just
+        # not having anything to do. See the 2026-07-31 incident.
         ok = False
+        size_txt = f"{total_bytes / 1e6:.1f}MB" if total_bytes is not None else "unknown size"
+        print(f"[transfer] scp timed out after {effective_timeout + 30}s uploading {len(local_paths)} "
+              f"file(s) ({size_txt}) to {remote_subdir}")
     elapsed_s = time.perf_counter() - t_start
 
     _last_attempt_unix = time.time()
@@ -119,12 +154,15 @@ def scp_upload(local_paths: list[str], remote_subdir: str, timeout_s: int = UPLO
 
 
 def upload_with_retry(local_paths: list[str], remote_subdir: str,
-                       max_retries: int = 6, base_delay: float = 2.0, max_delay: float = 120.0) -> bool:
+                       max_retries: int = 6, base_delay: float = 2.0, max_delay: float = 120.0,
+                       timeout_s: int = UPLOAD_TIMEOUT_S) -> bool:
     """Exponential backoff with jitter. Returns True on eventual success, False if
     all in-cycle retries are exhausted (caller decides whether to leave items
-    queued for the next polling cycle, per the queue's crash-safe contract)."""
+    queued for the next polling cycle, per the queue's crash-safe contract).
+    timeout_s defaults to UPLOAD_TIMEOUT_S but is overridable per call -- e.g.
+    send.py's much larger training-frame uploads use a longer one."""
     for attempt in range(max_retries):
-        if scp_upload(local_paths, remote_subdir):
+        if scp_upload(local_paths, remote_subdir, timeout_s=timeout_s):
             return True
         if attempt < max_retries - 1:
             delay = min(max_delay, base_delay * (2 ** attempt)) * (0.8 + 0.4 * random.random())
