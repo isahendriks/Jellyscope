@@ -303,6 +303,16 @@ BACKLOG_MODE_EXIT_THRESHOLD = 100  # total pending fullframes below this -> live
 # livestream.py's own downscale-before-draw convention (see update_live_frame()).
 LIVESTREAM_DISP_SCALE = 10
 CROP_BOX_COLOR = (0, 255, 0)  # green, BGR (cv2 convention)
+
+# 2026-08-12: analyse.py overwrites this same path with the same already-downscaled
+# (LIVESTREAM_DISP_SCALE) + boxed JPEG it builds for /latest_frame.jpg on every
+# live-mode frame; send.py watches it and uploads it to server-lab (also always
+# overwriting the same remote filename) whenever it changes -- for the future public
+# livestream site, so it has a near-live preview frame without needing anything
+# resembling a real video stream. Not a queue -- there's deliberately no history here,
+# only the single most recent frame ever matters, same "always current" idea as
+# /latest_frame.jpg itself, just also pushed off-device.
+LIVE_FRAME_PATH = PIPELINE_DIR / "live_frame_outbox" / "live_frame.jpg"
 RECENT_CROPS_COUNT = 40  # how many of the most recent confidently-labeled crops (same
 # CONFIDENCE_THRESHOLD gate as the main frame's box labels, plus RECENT_CROPS_MIN_PEAK_VAL
 # below) to keep in the live-stream window's thumbnail strip

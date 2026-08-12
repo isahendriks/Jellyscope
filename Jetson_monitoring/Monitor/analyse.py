@@ -26,6 +26,7 @@ models/segmentation.py's build_scorer()/detect_scorer_type().
 
 import gc
 import json
+import os
 import threading
 import time
 from collections import deque
@@ -64,6 +65,7 @@ queue_io.ensure_queue_dirs(config.QUE_FULLFRAMES)
 queue_io.ensure_queue_dirs(config.QUE_CROPS)
 queue_io.ensure_queue_dirs(config.QUE_TRAINING_FRAMES)
 config.HEARTBEAT_DIR.mkdir(parents=True, exist_ok=True)
+config.LIVE_FRAME_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 print("Loading segmentation engines (encoder/decoder always INT8; scorer is INT8 or FP32 Mahalanobis, auto-detected)...")
 encoder_engine, decoder_engine, scorer_engine, scorer_threshold, seg_grid_size, seg_image_size = load_segmentation_engines(
@@ -195,8 +197,18 @@ def update_live_frame(enhanced, results) -> None:
 
     ok, encoded = cv2.imencode(".jpg", display)
     if ok:
+        jpeg_bytes = encoded.tobytes()
         with latest_frame_lock:
-            latest_frame_jpeg = encoded.tobytes()
+            latest_frame_jpeg = jpeg_bytes
+
+        # Same bytes already built above, just also written to disk for send.py to
+        # pick up and push to server-lab -- see config.LIVE_FRAME_PATH's comment.
+        # Atomic write (temp file + os.replace), same pattern queue_io.py uses
+        # elsewhere -- send.py polls this path independently and shouldn't ever be
+        # able to read a half-written file mid-write.
+        tmp_path = config.LIVE_FRAME_PATH.with_suffix(".jpg.tmp")
+        tmp_path.write_bytes(jpeg_bytes)
+        os.replace(tmp_path, config.LIVE_FRAME_PATH)
 
 
 def update_recent_crops_strip(results) -> None:
