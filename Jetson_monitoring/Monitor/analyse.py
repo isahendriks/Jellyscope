@@ -557,17 +557,25 @@ if config.ENABLE_LIVE_STREAM:
             "Last recorded: ${fmtTime(d.last_recorded_unix)} (${fmtAge(age(d.last_recorded_unix))})\\n"
             "Last analysed: ${fmtTime(d.last_analysed_unix)} (${fmtAge(age(d.last_analysed_unix))})\\n"
             "Crops in last image: ${d.last_analysed_crops}  Crops in last 24h: ${d.crops_last_24h}\\n"
-            "Fully live in: ${d.camera_live_catching_up===true?fmtEta(d.camera_live_eta_hours):"
-            "d.camera_live_catching_up===false?`NOT catching up (record ${fmt(d.record_rate_per_hour,'/hr')} "
-            "vs analyse ${fmt(d.analyse_rate_per_hour,'/hr')})`:'estimating...'}\\n"
             "Sampling: every ${d.frame_skip} frame(s)</div>`+"
-            "section('BACKLOG',(d.backlog_stages||[]).map(s=>"
+            # BACKLOG only rendered while there's actually one to report -- once
+            # system_mode is 'live' there's nothing left to catch up on, so the whole
+            # section (including "Fully live in", which only makes sense as a countdown
+            # while still catching up) disappears rather than sitting there showing a
+            # stale/meaningless "done" state.
+            "(d.system_mode==='live'?'':section('BACKLOG',["
+            "`Fully live in: ${d.camera_live_catching_up===true?fmtEta(d.camera_live_eta_hours):"
+            "d.camera_live_catching_up===false?`NOT catching up (record ${fmt(d.record_rate_per_hour,'/hr')} "
+            "vs analyse ${fmt(d.analyse_rate_per_hour,'/hr')})`:'estimating...'}`,"
+            "...(d.backlog_stages||[]).map(s=>"
             "`${s.label}: ${s.status==='done'?'done':s.status==='pending'?'pending':"
             "'active, '+s.remaining.toLocaleString()+' remaining'"
-            "+(s.rate_per_hour?' -- '+s.rate_per_hour.toFixed(0)+'/hr, ETA '+fmtEta(s.eta_hours):'')}`"
-            "))+"
+            "+(s.rate_per_hour?' -- '+s.rate_per_hour.toFixed(0)+'/hr, ETA '+fmtEta(s.eta_hours):'')}`)"
+            "]))+"
             "section('QUEUE',["
             "`Avg processing time: ${fmt(d.avg_processing_time_s,' s')}`,"
+            "`Crops queue: ${(d.que_crops_depth||0).toLocaleString()}  "
+            "Full frames queue: ${(d.que_fullframes_depth||0).toLocaleString()}`,"
             "])+"
             "section('LEAK DETECTION',["
             "`Leak: ${d.leak_detected===true?'!!! DETECTED !!!':d.leak_detected===false?'OK':'N/A'}`,"
@@ -595,7 +603,9 @@ if config.ENABLE_LIVE_STREAM:
             "`Status: ${!d.send_alive?'PROCESS DOWN':(d.consecutive_upload_failures>0?"
             "`FAILING (${d.consecutive_upload_failures}x)`:'OK')}`,"
             "`Last successful upload: ${fmtAge(d.last_success_age_s)}  "
-            "Speed: ${fmtSpeed(d.upload_speed_bps)}`,"
+            "Last upload speed: ${fmtSpeed(d.upload_speed_bps)}`,"
+            "`Link speed: ${fmtSpeed(d.link_speed_bps)} "
+            "(probed ${fmtAge(d.link_speed_probed_age_s)})`,"
             "],!d.send_alive?'#ff4d4d':null);"
             # Only a positive leak reading turns the whole box red -- temperature
             # readings are flagged in place per-value (tempColor/vsMax above) and a
@@ -690,12 +700,29 @@ if config.ENABLE_LIVE_STREAM:
             "disk_root": disk.get(str(config.ROOT_DISK_PATH)),
             "disk_ssd1": disk.get(str(config.EXTERNAL_SSD_PATHS[0])),
             "disk_ssd2": disk.get(str(config.EXTERNAL_SSD_PATHS[1])),
+            # Already computed by metadata.py every METADATA_SAMPLE_INTERVAL_S and read
+            # here from its live snapshot -- NOT a fresh queue_io.queue_depth() call on
+            # every /status poll (this endpoint's polled once/sec by the live-stream
+            # page's setInterval; que_crops has held tens of thousands of files during
+            # backlog incidents, and re-listing that every second is exactly the
+            # anti-pattern send.py's own crop_backlog caching was built to avoid -- see
+            # its module-level comment on the 2026-08-03 incident).
+            "que_crops_depth": live.get("que_crops_depth"),
+            "que_fullframes_depth": live.get("que_fullframes_depth"),
             "send_alive": (send_age_s is not None and send_age_s < config.HEARTBEAT_STALE_S),
             "send_age_s": send_age_s,
             "upload_speed_bps": send_hb.get("last_speed_bps"),
             "last_upload_ok": send_hb.get("last_attempt_ok"),
             "consecutive_upload_failures": send_hb.get("consecutive_failures"),
             "last_success_age_s": (time.time() - last_success_unix) if last_success_unix else None,
+            # Fixed-size probe (transfer.py's probe_link_speed), NOT derived from real
+            # crop/json uploads -- upload_speed_bps above goes misleadingly low once real
+            # batches shrink to a handful of KB (queue caught up to real-time) and scp's
+            # fixed per-call overhead dominates the timing. This is a trustworthy "how
+            # fast is the link actually" reading independent of current queue depth.
+            "link_speed_bps": send_hb.get("link_speed_bps"),
+            "link_speed_probed_age_s": ((time.time() - send_hb["link_speed_probed_unix"])
+                                         if send_hb.get("link_speed_probed_unix") else None),
         })
 
     @flask_app.route("/latest_frame.jpg")

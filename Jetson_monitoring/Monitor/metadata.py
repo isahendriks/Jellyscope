@@ -244,6 +244,8 @@ def write_live_snapshot(device_sample: dict | None, env_sample: dict | None) -> 
             "ds18b20_temp_c": device_sample["ds18b20_temp_c"],
             "leak_detected": device_sample["leak_detected"],
             "disk_free_gb_by_path": device_sample["disk_free_gb_by_path"],
+            "que_fullframes_depth": device_sample["que_fullframes_depth"],
+            "que_crops_depth": device_sample["que_crops_depth"],
         })
     if env_sample is not None:
         snapshot.update({

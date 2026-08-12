@@ -24,8 +24,11 @@ before delete", not any transport-level flag -- so failures here are always
 handled the same way regardless of transport.
 """
 
+import os
 import random
+import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -38,8 +41,29 @@ from config import REMOTE_HOST, REMOTE_BASE, SSH_CONNECT_TIMEOUT_S, UPLOAD_TIMEO
 _last_attempt_unix: float | None = None
 _last_attempt_ok: bool | None = None
 _last_success_unix: float | None = None
-_last_speed_bps: float | None = None  # bytes/sec of the most recent successful batch
+_last_speed_bps: float | None = None  # bytes/sec of the most recent successful batch --
+# NOT a reliable link-speed estimate by itself (see probe_link_speed() below): once
+# real crop batches shrink to a handful of KB (queue caught up to real-time), scp/ssh's
+# fixed per-call overhead dominates this number and makes it look far slower than the
+# link actually is. Kept as-is because it's still useful for its own purpose -- "how did
+# the most recent real upload go" -- just not for "how fast is the link."
 _consecutive_failures = 0
+
+# 2026-08-12: real crop/json uploads can't be trusted as a link-speed estimate once the
+# queue's caught up to real-time -- a manual 5MB scp measured ~28Mbps on a link where
+# _last_speed_bps above was reading ~1.2KB/s purely from per-call overhead on tiny
+# batches. probe_link_speed() uploads a fixed-size payload on its own schedule
+# (send.py's LINK_SPEED_PROBE_INTERVAL_S), large enough that overhead is a small
+# fraction of the total time, and keeps its own separate stats so it never gets
+# confused with (or corrupts) _last_speed_bps above.
+LINK_SPEED_PROBE_BYTES = 2_000_000  # 2MB -- big enough to swamp per-call overhead,
+# small enough not to matter against a real field data plan
+LINK_SPEED_PROBE_REMOTE_SUBDIR = "_link_speed_probe"
+LINK_SPEED_PROBE_REMOTE_NAME = "probe.bin"  # fixed name, overwritten every probe --
+# deliberately not timestamped, so this never accumulates junk on server-lab
+_link_speed_bps: float | None = None
+_link_speed_probed_unix: float | None = None
+_link_speed_probe_ok: bool | None = None
 
 
 def get_transfer_stats() -> dict:
@@ -49,6 +73,9 @@ def get_transfer_stats() -> dict:
         "last_success_unix": _last_success_unix,
         "last_speed_bps": _last_speed_bps,
         "consecutive_failures": _consecutive_failures,
+        "link_speed_bps": _link_speed_bps,
+        "link_speed_probed_unix": _link_speed_probed_unix,
+        "link_speed_probe_ok": _link_speed_probe_ok,
     }
 
 # ControlMaster/ControlPath/ControlPersist -- every ssh/scp call below used to open a brand
@@ -151,6 +178,51 @@ def scp_upload(local_paths: list[str], remote_subdir: str, timeout_s: int = UPLO
     else:
         _consecutive_failures += 1
     return ok
+
+
+def probe_link_speed(timeout_s: int = UPLOAD_TIMEOUT_S) -> float | None:
+    """Times a fixed-size random-payload upload to a scratch path on REMOTE_HOST,
+    independently of scp_upload()/real crop batches -- see LINK_SPEED_PROBE_BYTES above
+    for why. Deliberately a standalone implementation rather than calling scp_upload()
+    with some "don't record stats" flag: keeping it fully separate means there's no way
+    for a probe to ever end up mixed into _last_speed_bps (the real-upload stat) by a
+    future refactor forgetting to pass that flag.
+
+    Returns the newly measured speed, or None if the probe itself failed to run (e.g.
+    disk full) -- a failed *upload* still updates _link_speed_bps to None via the
+    ok-gated assignment below, since a failed probe genuinely doesn't tell us the link
+    speed, but a failed local write (no bytes ever sent) leaves the previous reading in
+    place rather than blanking out otherwise-good data over an unrelated local hiccup."""
+    global _link_speed_bps, _link_speed_probed_unix, _link_speed_probe_ok
+    tmp_dir = tempfile.mkdtemp(prefix="jellyscope_linkspeed_")
+    local_path = Path(tmp_dir) / LINK_SPEED_PROBE_REMOTE_NAME
+    try:
+        local_path.write_bytes(os.urandom(LINK_SPEED_PROBE_BYTES))
+    except OSError:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return _link_speed_bps
+
+    ensure_remote_dir(LINK_SPEED_PROBE_REMOTE_SUBDIR, timeout_s=min(timeout_s, SSH_CONNECT_TIMEOUT_S + 5))
+    remote_dest = f"{REMOTE_HOST}:{REMOTE_BASE}/{LINK_SPEED_PROBE_REMOTE_SUBDIR}/"
+    cmd = ["scp", *_SSH_OPTS, str(local_path), remote_dest]
+    t_start = time.perf_counter()
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s + 30)
+        ok = result.returncode == 0
+        if not ok:
+            print(f"[transfer] link-speed probe scp failed (exit {result.returncode}): "
+                  f"{result.stderr.strip()[:500]}")
+    except subprocess.TimeoutExpired:
+        ok = False
+        print(f"[transfer] link-speed probe timed out after {timeout_s + 30}s")
+    elapsed_s = time.perf_counter() - t_start
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    _link_speed_probed_unix = time.time()
+    _link_speed_probe_ok = ok
+    if ok and elapsed_s > 0:
+        _link_speed_bps = LINK_SPEED_PROBE_BYTES / elapsed_s
+    return _link_speed_bps
 
 
 def upload_with_retry(local_paths: list[str], remote_subdir: str,

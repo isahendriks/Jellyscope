@@ -25,6 +25,10 @@ MIN_BATCH_SIZE = 1
 # a real per-cycle backlog like que_crops sees.
 TRAINING_FRAME_BATCH_SIZE = 5
 POLL_INTERVAL_S = 2
+LINK_SPEED_PROBE_INTERVAL_S = 5 * 60  # see transfer.py's probe_link_speed -- runs on its
+# own schedule regardless of real upload activity, so the live-stream has a trustworthy
+# speed reading even while que_crops sits empty and real batches are too small to time
+# accurately
 
 crops_sent_total = 0
 crops_archived_oversized_total = 0
@@ -198,7 +202,19 @@ training_backlog: list[str] = []
 # for the matching per-call timeout scaling.
 crop_batch_size = BATCH_SIZE
 
+last_link_speed_probe_unix = 0.0  # 0, not time.time(), so the very first loop iteration
+# probes immediately rather than leaving the live-stream's link-speed reading blank for
+# a full LINK_SPEED_PROBE_INTERVAL_S after every restart
+
 while True:
+    if time.time() - last_link_speed_probe_unix >= LINK_SPEED_PROBE_INTERVAL_S:
+        # Ahead of the idle check below on purpose -- an empty queue (real-time,
+        # caught-up operation) is exactly when real uploads are too small to time
+        # accurately, so this needs to keep running through idle cycles, not just
+        # whenever there happens to be a crop batch to piggyback on.
+        transfer.probe_link_speed()
+        last_link_speed_probe_unix = time.time()
+
     if not crop_backlog:
         crop_backlog = queue_io.list_ready_stems(config.QUE_CROPS)
     if not training_backlog:
