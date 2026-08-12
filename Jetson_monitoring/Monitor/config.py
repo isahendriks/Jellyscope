@@ -304,15 +304,24 @@ BACKLOG_MODE_EXIT_THRESHOLD = 100  # total pending fullframes below this -> live
 LIVESTREAM_DISP_SCALE = 10
 CROP_BOX_COLOR = (0, 255, 0)  # green, BGR (cv2 convention)
 
-# 2026-08-12: analyse.py overwrites this same path with the same already-downscaled
-# (LIVESTREAM_DISP_SCALE) + boxed JPEG it builds for /latest_frame.jpg on every
-# live-mode frame; send.py watches it and uploads it to server-lab (also always
-# overwriting the same remote filename) whenever it changes -- for the future public
-# livestream site, so it has a near-live preview frame without needing anything
-# resembling a real video stream. Not a queue -- there's deliberately no history here,
-# only the single most recent frame ever matters, same "always current" idea as
-# /latest_frame.jpg itself, just also pushed off-device.
+# 2026-08-12: analyse.py overwrites this path on every live-mode frame with a
+# downscaled (LIVESTREAM_DISP_SCALE) JPEG -- deliberately *without* crop boxes/labels
+# drawn on it (unlike /latest_frame.jpg's local dashboard copy, see update_live_frame())
+# -- so the future public livestream site's own frontend has full control over how
+# crops are rendered, instead of inheriting this pipeline's box color/label styling
+# baked into the pixels. The matching crop/label data goes out separately as JSON, see
+# LIVE_FRAME_JSON_PATH below. send.py watches this file's mtime and uploads both to
+# server-lab together (always overwriting the same remote filenames) whenever it
+# changes. Not a queue -- there's deliberately no history here, only the single most
+# recent frame ever matters, same "always current" idea as /latest_frame.jpg itself,
+# just also pushed off-device.
 LIVE_FRAME_PATH = PIPELINE_DIR / "live_frame_outbox" / "live_frame.jpg"
+# Crop boxes/labels matching LIVE_FRAME_PATH's frame, in that same JPEG's pixel
+# coordinates (i.e. already scaled by LIVESTREAM_DISP_SCALE, not full-res). Written
+# *before* LIVE_FRAME_PATH on every frame (see update_live_frame()) so that by the
+# time send.py notices the JPEG's mtime change -- its only upload trigger -- this
+# file is already there with matching data to go along with it.
+LIVE_FRAME_JSON_PATH = PIPELINE_DIR / "live_frame_outbox" / "live_frame.json"
 RECENT_CROPS_COUNT = 40  # how many of the most recent confidently-labeled crops (same
 # CONFIDENCE_THRESHOLD gate as the main frame's box labels, plus RECENT_CROPS_MIN_PEAK_VAL
 # below) to keep in the live-stream window's thumbnail strip

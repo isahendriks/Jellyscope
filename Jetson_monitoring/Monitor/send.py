@@ -206,10 +206,11 @@ last_link_speed_probe_unix = 0.0  # 0, not time.time(), so the very first loop i
 # probes immediately rather than leaving the live-stream's link-speed reading blank for
 # a full LINK_SPEED_PROBE_INTERVAL_S after every restart
 
-last_live_frame_mtime = None  # analyse.py overwrites config.LIVE_FRAME_PATH on every
-# live-mode frame (see that config comment) -- tracked here (not a queue_io queue, see
-# config.LIVE_FRAME_PATH's own comment for why) purely so an unchanged frame isn't
-# re-uploaded every single 2s poll when analyse.py hasn't produced a new one yet.
+last_live_frame_mtime = None  # analyse.py overwrites config.LIVE_FRAME_PATH (and its
+# JSON sidecar, config.LIVE_FRAME_JSON_PATH) on every live-mode frame (see that config
+# comment) -- tracked here (not a queue_io queue, see config.LIVE_FRAME_PATH's own
+# comment for why) purely so an unchanged frame isn't re-uploaded every single 2s poll
+# when analyse.py hasn't produced a new one yet.
 
 while True:
     # Not gated behind crop_backlog/training_backlog like the two loops below --
@@ -218,13 +219,19 @@ while True:
     if config.LIVE_FRAME_PATH.exists():
         live_frame_mtime = config.LIVE_FRAME_PATH.stat().st_mtime
         if live_frame_mtime != last_live_frame_mtime:
+            # JPEG's mtime is the sole trigger (analyse.py always writes the JSON
+            # sidecar first, see config.LIVE_FRAME_JSON_PATH's comment), but both
+            # files go up together so server-lab never has one without the other.
             # One-shot, not upload_with_retry -- a failed/slow attempt here just
             # means this particular frame never made it; the next one (already on
             # its way from analyse.py) supersedes it either way, so retrying a
-            # stale frame isn't worth spending time on. Fixed local filename in ->
-            # fixed remote filename out, so this always overwrites the same file on
+            # stale frame isn't worth spending time on. Fixed local filenames in ->
+            # fixed remote filenames out, so this always overwrites the same files on
             # server-lab rather than accumulating one per frame.
-            if transfer.scp_upload([str(config.LIVE_FRAME_PATH)], "live_frame"):
+            live_frame_paths = [str(config.LIVE_FRAME_PATH)]
+            if config.LIVE_FRAME_JSON_PATH.exists():
+                live_frame_paths.append(str(config.LIVE_FRAME_JSON_PATH))
+            if transfer.scp_upload(live_frame_paths, "live_frame"):
                 last_live_frame_mtime = live_frame_mtime
 
     if time.time() - last_link_speed_probe_unix >= LINK_SPEED_PROBE_INTERVAL_S:

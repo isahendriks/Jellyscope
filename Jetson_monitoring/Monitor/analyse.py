@@ -177,16 +177,29 @@ latest_crops_strip_jpeg = None
 
 
 def update_live_frame(enhanced, results) -> None:
-    """Draws a green box around each accepted crop (+ its label once confidence
-    clears config.CONFIDENCE_THRESHOLD) onto a downscaled copy of the post-PREPROCESS
-    frame, and publishes it for the live-stream endpoint below. Downscale
-    happens *before* drawing, not after -- boxes/text drawn at full 4512px res
-    then shrunk 10x would be illegible."""
+    """Builds two different renderings of the same downscaled post-PREPROCESS frame:
+
+    1. A boxed copy (green box per accepted crop, + its label once confidence clears
+       config.CONFIDENCE_THRESHOLD) published for this process's own /latest_frame.jpg
+       -- the local, password-protected LAN dashboard, where baking the boxes into the
+       pixels is fine since nothing downstream needs to re-render them.
+    2. A *clean* copy -- no boxes, no text -- written to config.LIVE_FRAME_PATH for
+       send.py to push to server-lab, alongside a JSON sidecar (config.LIVE_FRAME_JSON_PATH)
+       carrying each crop's box + label/confidence in that same image's pixel coordinates.
+       Kept undrawn so the future public livestream site's frontend can decide for itself
+       how (or whether) to render crops, instead of inheriting this pipeline's styling
+       baked permanently into the JPEG -- see config.LIVE_FRAME_PATH's comment.
+
+    Downscale happens *before* either is used, not after -- boxes/text drawn at full
+    4512px res then shrunk 10x would be illegible, and it keeps both renderings'
+    coordinates in the same scaled space as the JSON sidecar below."""
     global latest_frame_jpeg
     scale = config.LIVESTREAM_DISP_SCALE / 100
     small = cv2.resize(enhanced, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-    display = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
+    clean = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
 
+    crops_json = []
+    display = clean.copy()
     for _crop_stem, _encoded_bytes, sidecar in results:
         x0, y0 = int(sidecar["crop_x0"] * scale), int(sidecar["crop_y0"] * scale)
         x1, y1 = int(sidecar["crop_x1"] * scale), int(sidecar["crop_y1"] * scale)
@@ -194,21 +207,39 @@ def update_live_frame(enhanced, results) -> None:
         if sidecar["class_confidence"] is not None and sidecar["class_confidence"] >= config.CONFIDENCE_THRESHOLD:
             cv2.putText(display, sidecar["class_label"], (x0, max(10, y0 - 4)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, config.CROP_BOX_COLOR, 1, cv2.LINE_AA)
+        crops_json.append({
+            "crop_x0": x0, "crop_y0": y0, "crop_x1": x1, "crop_y1": y1,
+            "class_label": sidecar["class_label"],
+            "class_confidence": sidecar["class_confidence"],
+        })
 
     ok, encoded = cv2.imencode(".jpg", display)
     if ok:
-        jpeg_bytes = encoded.tobytes()
         with latest_frame_lock:
-            latest_frame_jpeg = jpeg_bytes
+            latest_frame_jpeg = encoded.tobytes()
 
-        # Same bytes already built above, just also written to disk for send.py to
-        # pick up and push to server-lab -- see config.LIVE_FRAME_PATH's comment.
+    ok, encoded_clean = cv2.imencode(".jpg", clean)
+    if ok:
+        # JSON written before the JPEG on purpose -- send.py's only upload trigger is
+        # LIVE_FRAME_PATH's mtime, so by the time it notices a change the sidecar
+        # describing that same frame must already be sitting next to it. See
+        # config.LIVE_FRAME_JSON_PATH's comment.
+        frame_json = {
+            "frame_timestamp_unix": time.time(),
+            "image_width": clean.shape[1],
+            "image_height": clean.shape[0],
+            "crops": crops_json,
+        }
+        json_tmp_path = config.LIVE_FRAME_JSON_PATH.with_suffix(".json.tmp")
+        json_tmp_path.write_text(json.dumps(frame_json, indent=2))
+        os.replace(json_tmp_path, config.LIVE_FRAME_JSON_PATH)
+
         # Atomic write (temp file + os.replace), same pattern queue_io.py uses
         # elsewhere -- send.py polls this path independently and shouldn't ever be
         # able to read a half-written file mid-write.
-        tmp_path = config.LIVE_FRAME_PATH.with_suffix(".jpg.tmp")
-        tmp_path.write_bytes(jpeg_bytes)
-        os.replace(tmp_path, config.LIVE_FRAME_PATH)
+        jpg_tmp_path = config.LIVE_FRAME_PATH.with_suffix(".jpg.tmp")
+        jpg_tmp_path.write_bytes(encoded_clean.tobytes())
+        os.replace(jpg_tmp_path, config.LIVE_FRAME_PATH)
 
 
 def update_recent_crops_strip(results) -> None:
