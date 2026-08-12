@@ -49,3 +49,6 @@ data/
 # Secrets (webhook URLs, API keys, etc.) -- see webhook_secrets_example.py for the
 # template. Named webhook_secrets.py, not secrets.py -- see that file's docstring.
 Jetson_monitoring/Monitor/webhook_secrets.py
+
+# Dashboard Basic Auth password -- see dashboard_secrets_example.py for the template.
+Jetson_monitoring/Monitor/dashboard_secrets.py

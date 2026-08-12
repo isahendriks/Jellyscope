@@ -397,229 +397,47 @@ def estimate_camera_live_eta(record_hb: dict) -> dict:
 
 
 if config.ENABLE_LIVE_STREAM:
-    from flask import Flask, Response, jsonify
+    import secrets
+    from pathlib import Path
 
-    flask_app = Flask(__name__)
+    from flask import Flask, Response, jsonify, request
+
+    from dashboard_secrets import DASHBOARD_PASSWORD
+
+    flask_app = Flask(
+        __name__,
+        # frontend_private/ is a sibling of Monitor/ under Jetson_monitoring/. Flask
+        # serves it as plain static files -- no templating, no execution of anything in
+        # that folder -- so editing its HTML/CSS/JS can never affect anything below this
+        # line. static_url_path="" serves files at e.g. /style.css directly, not nested
+        # under /static/style.css.
+        static_folder=str(Path(__file__).resolve().parent.parent / "frontend_private"),
+        static_url_path="",
+    )
+
+    @flask_app.before_request
+    def _require_password():
+        # HTTP Basic Auth, checked before every request this app serves -- the page
+        # itself, its static JS/CSS, and every data/image endpoint below. Real access
+        # control has to live here (server-side): anything written in frontend_private/'s
+        # JS is fully visible/editable by whoever's browser it runs in, so a
+        # frontend-only password check would be purely cosmetic and bypassable by calling
+        # an endpoint directly. compare_digest is timing-safe -- a plain `==` leaks how
+        # many leading characters matched via response time. Any username is accepted;
+        # only the password is checked.
+        auth = request.authorization
+        if not auth or not secrets.compare_digest(auth.password or "", DASHBOARD_PASSWORD):
+            return Response(
+                "Authentication required", 401,
+                {"WWW-Authenticate": 'Basic realm="Jellyscope dashboard"'},
+            )
 
     @flask_app.route("/")
     def _stream_index():
-        # Video image + crops-thumbnail panel, and the JS that polls/renders them --
-        # entirely skipped in backlog mode (2026-08-10, see update_system_mode() /
-        # config.py's BACKLOG_MODE_ENTER_THRESHOLD) to save the per-frame render cost
-        # while draining the fullframe backlogs, so the page just shows a plain note
-        # instead of a permanently-broken image, and doesn't poll two endpoints that
-        # would 404 forever. The METADATA status panel below is unaffected either way --
-        # /status keeps reporting everything (temps, disk, connection, last-recorded/
-        # analysed timers, backlog progress) regardless of mode.
-        if system_mode == "live":
-            video_html = (
-                # width/height (not max-width/max-height) so a small source image -- e.g. at a low
-                # LIVESTREAM_DISP_SCALE, chosen for faster transmit/decode -- gets scaled UP to fill
-                # the viewport instead of rendering at its tiny native pixel size. min(100vw,100vh)
-                # instead of object-fit:contain -- the source frame is always square (IMAGE_SIZE_PX x
-                # IMAGE_SIZE_PX, downscaled with equal fx/fy in update_live_frame), so sizing both
-                # width/height to the smaller viewport dimension reproduces contain's letterboxing
-                # exactly, but as the img element's own box -- not a transparent box around it -- so
-                # the border below hugs the visible video, not empty space out to the viewport edge.
-                # position:fixed;bottom:0;right:0 replaces object-position for the same bottom-right pin.
-                '<img id="videoFrame" style="position:fixed;bottom:0;right:0;'
-                'width:min(100vw,100vh);height:min(100vw,100vh);display:block;'
-                'border:2px solid #00ff00;box-sizing:border-box">'
-                '<div style="position:fixed;top:16px;right:16px;padding:4px 10px;'
-                'font-size:11px;font-weight:bold;letter-spacing:0.6px;color:#fff;'
-                'background:rgba(0,0,0,0.6);border:1px solid #00ff00;border-radius:4px;'
-                'font-family:-apple-system,Menlo,Consolas,monospace">LIVESTREAM</div>'
-            )
-            crops_panel_html = (
-                # Crops panel (border + header) is always visible, even before any labeled crop
-                # exists yet -- only the <img> itself and the placeholder text toggle, so it's
-                # always clear from the page whether the feature is present vs. genuinely has
-                # nothing to show yet (CLASSIFY=False, or no crop has cleared CONFIDENCE_THRESHOLD).
-                # Same background as the metadata panel below it, so the two read as one group.
-                '<div style="padding:8px;border:2px solid #00ff00;border-radius:6px;'
-                'background:rgba(10,10,10,0.88);box-shadow:0 4px 18px rgba(0,0,0,0.45)">'
-                '<div style="font-size:11px;font-weight:bold;letter-spacing:0.6px;color:#fff;'
-                f'font-family:-apple-system,Menlo,Consolas,monospace;margin-bottom:6px">LAST {config.RECENT_CROPS_COUNT} CROPS</div>'
-                '<img id="cropsStrip" style="display:none;max-width:100%;border-radius:3px">'
-                '<span id="cropsPlaceholder" style="display:block;font-size:11px;color:#aaa;'
-                'font-family:-apple-system,Menlo,Consolas,monospace">Waiting for labeled crops...</span>'
-                "</div>"
-            )
-            video_js = (
-                # Polls a single always-fresh frame instead of holding open a multipart MJPEG
-                # stream -- see /latest_frame.jpg's comment for why: a persistent stream can only
-                # fall further behind if the browser/network ever briefly lags the production
-                # rate, since it must display every buffered frame in order before reaching "now".
-                # A fresh request each tick always gets whatever's current, nothing accumulates.
-                "function updateFrame(){"
-                "document.getElementById('videoFrame').src='/latest_frame.jpg?t='+Date.now();"
-                "}"
-                "updateFrame();setInterval(updateFrame,400);"
-                # Polled slower than the main frame (1s vs 400ms) -- labeled crops accumulate
-                # far slower than raw frames, so there's nothing to gain from a faster poll here.
-                "const cropsStripImg=document.getElementById('cropsStrip');"
-                "const cropsPlaceholder=document.getElementById('cropsPlaceholder');"
-                "cropsStripImg.onload=function(){"
-                "cropsStripImg.style.display='block';cropsPlaceholder.style.display='none';"
-                "};"
-                "cropsStripImg.onerror=function(){"
-                "cropsStripImg.style.display='none';cropsPlaceholder.style.display='block';"
-                "};"
-                "function updateCropsStrip(){"
-                "cropsStripImg.src='/latest_crops_strip.jpg?t='+Date.now();"
-                "}"
-                "updateCropsStrip();setInterval(updateCropsStrip,1000);"
-            )
-        else:
-            video_html = ""
-            crops_panel_html = (
-                '<div style="padding:8px 12px;border:2px solid #00ff00;border-radius:6px;'
-                'background:rgba(10,10,10,0.88);box-shadow:0 4px 18px rgba(0,0,0,0.45);'
-                'font-size:11px;color:#aaa;font-family:-apple-system,Menlo,Consolas,monospace">'
-                "Video + crops feed off (backlog mode) -- draining fullframe backlogs.</div>"
-            )
-            video_js = ""
-
-        return (
-            '<html><head><title>Jellyscope Livestream</title></head>'
-            '<body style="margin:0;background:#000;min-height:100vh;overflow:auto">'
-            + video_html +
-            # Single fixed top-left column, in normal document flow (not each child
-            # individually position:fixed like the old status/logtail pair was) -- crops
-            # stacks above metadata here, and neither can ever overlap or need a
-            # JS-computed offset to avoid each other, unlike the old logtail box that
-            # measured status's rendered height on every /status poll to place itself.
-            '<div style="position:fixed;top:16px;left:16px;max-width:calc(100vw - 32px);'
-            'display:flex;flex-direction:column;gap:10px">'
-            + crops_panel_html +
-            "<div>"
-            '<div style="font-size:11px;font-weight:bold;letter-spacing:0.6px;color:#fff;'
-            'font-family:-apple-system,Menlo,Consolas,monospace;margin-bottom:6px">METADATA</div>'
-            # <div>, not <pre> -- a multi-column layout needs a block container it can
-            # split into columns; individual lines below still get pre's whitespace
-            # preservation (double-space field separators, explicit \n line breaks) via
-            # white-space:pre-wrap instead, which additionally (unlike plain pre) wraps a
-            # too-long line within its column rather than overflowing it horizontally.
-            '<div id="status" style="margin:0;padding:16px 20px;font-size:15px;line-height:1.6;'
-            'color:#fff;background:rgba(10,10,10,0.88);border:2px solid #00ff00;border-radius:10px;'
-            'white-space:pre-wrap;font-family:-apple-system,Menlo,Consolas,monospace;'
-            'column-count:3;column-gap:26px;'
-            'box-shadow:0 4px 18px rgba(0,0,0,0.45)"></div>'
-            "</div>"
-            "</div>"
-            "<script>"
-            + video_js +
-            "async function updateStatus(){"
-            "try{"
-            "const d=await (await fetch('/status')).json();"
-            "const fmt=(v,u)=>(v===null||v===undefined)?'N/A':v.toFixed(1)+u;"
-            "const overMax=(v,m)=>v!==null&&v!==undefined&&m!==null&&m!==undefined&&v>=m;"
-            "const nearMax=(v,m)=>v!==null&&v!==undefined&&m!==null&&m!==undefined&&v>=0.9*m;"
-            "const flag=(v,m)=>overMax(v,m)?' [DANGER]':nearMax(v,m)?' [WARN]':'';"
-            "const colorize=(text,color)=>color?`<span style=\"color:${color}\">${text}</span>`:text;"
-            "const tempColor=(v,m)=>overMax(v,m)?'#ff4d4d':nearMax(v,m)?'#ffa64d':null;"
-            "const vsMax=(v,m,u)=>colorize(`${fmt(v,u)} / max ${fmt(m,u)}${flag(v,m)}`,tempColor(v,m));"
-            "const hdr=(label)=>`<b style=\"font-size:17px;letter-spacing:0.4px\">${label}</b>\\n`;"
-            "const fmtSpeed=(bps)=>{"
-            "if(bps===null||bps===undefined)return'N/A';"
-            "if(bps>=1e6)return(bps/1e6).toFixed(2)+' MB/s';"
-            "if(bps>=1e3)return(bps/1e3).toFixed(1)+' KB/s';"
-            "return bps.toFixed(0)+' B/s';"
-            "};"
-            "const fmtAge=(s)=>{"
-            "if(s===null||s===undefined)return'N/A';"
-            "if(s<120)return s.toFixed(0)+'s ago';"
-            "if(s<7200)return(s/60).toFixed(1)+'m ago';"
-            "if(s<172800)return(s/3600).toFixed(1)+'h ago';"
-            "return(s/86400).toFixed(1)+'d ago';"
-            "};"
-            "const fmtTime=(u)=>(u===null||u===undefined)?'N/A':new Date(u*1000).toLocaleTimeString();"
-            "const age=(u)=>(u===null||u===undefined)?null:(Date.now()/1000)-u;"
-            "const fmtEta=(h)=>{"
-            "if(h===null||h===undefined)return'N/A';"
-            "if(h<48)return h.toFixed(1)+'h';"
-            "return(h/24).toFixed(1)+'d';"
-            "};"
-            # Each section is its own break-inside:avoid block, so the column layout
-            # below only ever breaks *between* sections, never through the middle of
-            # one -- margin-bottom (not the old blank "\n \n" line) provides the gap
-            # between sections stacked in the same column. Optional `color` tints the
-            # whole section (header + lines) -- used for CONNECTION when send.py is
-            # down, so only that section goes red instead of the whole box.
-            "const section=(title,lines,color)=>`<div style=\"break-inside:avoid;"
-            "-webkit-column-break-inside:avoid;margin-bottom:10px${color?`;color:${color}`:''}\">`+"
-            "hdr(title)+lines.join('\\n')+`</div>`;"
-            "document.getElementById('status').innerHTML="
-            "`<div style=\"break-inside:avoid;-webkit-column-break-inside:avoid;margin-bottom:10px\">"
-            "<b style=\"font-size:18px\">${d.time}</b>\\n"
-            "Mode: ${colorize(d.system_mode==='live'?'LIVE':'BACKLOG',d.system_mode==='live'?null:'#ffa64d')}"
-            " (${(d.total_backlog||0).toLocaleString()} pending)\\n"
-            "Last recorded: ${fmtTime(d.last_recorded_unix)} (${fmtAge(age(d.last_recorded_unix))})\\n"
-            "Last analysed: ${fmtTime(d.last_analysed_unix)} (${fmtAge(age(d.last_analysed_unix))})\\n"
-            "Crops in last image: ${d.last_analysed_crops}  Crops in last 24h: ${d.crops_last_24h}\\n"
-            "Sampling: every ${d.frame_skip} frame(s)</div>`+"
-            # BACKLOG only rendered while there's actually one to report -- once
-            # system_mode is 'live' there's nothing left to catch up on, so the whole
-            # section (including "Fully live in", which only makes sense as a countdown
-            # while still catching up) disappears rather than sitting there showing a
-            # stale/meaningless "done" state.
-            "(d.system_mode==='live'?'':section('BACKLOG',["
-            "`Fully live in: ${d.camera_live_catching_up===true?fmtEta(d.camera_live_eta_hours):"
-            "d.camera_live_catching_up===false?`NOT catching up (record ${fmt(d.record_rate_per_hour,'/hr')} "
-            "vs analyse ${fmt(d.analyse_rate_per_hour,'/hr')})`:'estimating...'}`,"
-            "...(d.backlog_stages||[]).map(s=>"
-            "`${s.label}: ${s.status==='done'?'done':s.status==='pending'?'pending':"
-            "'active, '+s.remaining.toLocaleString()+' remaining'"
-            "+(s.rate_per_hour?' -- '+s.rate_per_hour.toFixed(0)+'/hr, ETA '+fmtEta(s.eta_hours):'')}`)"
-            "]))+"
-            "section('QUEUE',["
-            "`Avg processing time: ${fmt(d.avg_processing_time_s,' s')}`,"
-            "`Crops queue: ${(d.que_crops_depth||0).toLocaleString()}  "
-            "Full frames queue: ${(d.que_fullframes_depth||0).toLocaleString()}`,"
-            "])+"
-            "section('LEAK DETECTION',["
-            "`Leak: ${d.leak_detected===true?'!!! DETECTED !!!':d.leak_detected===false?'OK':'N/A'}`,"
-            "`Enclosure humidity: ${fmt(d.bme280_humidity_pct,'%')}  "
-            "Dew point: ${fmt(d.dew_point_c,' C')}`,"
-            "])+"
-            "section('ENVIRONMENTAL',["
-            "`Bar3XT pressure: ${fmt(d.bar3xt_pressure_mbar,' mbar')}  "
-            "depth: ${fmt(d.bar3xt_depth_m,' m')}`,"
-            "`Bar3XT temp: ${fmt(d.bar3xt_temp_c,' C')}  "
-            "DS18B20 temp: ${fmt(d.ds18b20_temp_c,' C')}`,"
-            "])+"
-            "section('DEVICE',["
-            "`Enclosure pressure: ${fmt(d.bme280_pressure_mbar,' mbar')}`,"
-            "`Enclosure temp (BME280): ${fmt(d.bme280_temp_c,' C')}`,"
-            "`Camera: ${vsMax(d.camera_temp_c,d.camera_max_temp_c,' C')}`,"
-            "`Strobe converter: ${vsMax(d.strobe_converter_temp_c,d.strobe_max_temp_c,' C')}`,"
-            "`Strobe driver: ${vsMax(d.strobe_driver_temp_c,d.strobe_max_temp_c,' C')}`,"
-            "`Jetson: ${vsMax(d.jetson_temp_c_mean,d.jetson_max_temp_c,' C')}`,"
-            "`CPU: ${fmt(d.cpu_percent,'%')}  GPU: ${fmt(d.gpu_percent_mean,'%')} (max ${fmt(d.gpu_percent_max,'%')})`,"
-            "`Disk free: device: ${fmt(d.disk_root,' GB')}  "
-            "ssd1: ${fmt(d.disk_ssd1,' GB')}  ssd2: ${fmt(d.disk_ssd2,' GB')}`,"
-            "])+"
-            "section('CONNECTION',["
-            "`Status: ${!d.send_alive?'PROCESS DOWN':(d.consecutive_upload_failures>0?"
-            "`FAILING (${d.consecutive_upload_failures}x)`:'OK')}`,"
-            "`Last successful upload: ${fmtAge(d.last_success_age_s)}  "
-            "Last upload speed: ${fmtSpeed(d.upload_speed_bps)}`,"
-            "`Link speed: ${fmtSpeed(d.link_speed_bps)} "
-            "(probed ${fmtAge(d.link_speed_probed_age_s)})`,"
-            "],!d.send_alive?'#ff4d4d':null);"
-            # Only a positive leak reading turns the whole box red -- temperature
-            # readings are flagged in place per-value (tempColor/vsMax above) and a
-            # down send.py only tints the CONNECTION section (color arg above), so
-            # one bad reading doesn't drown out everything else on the page.
-            "const danger=d.leak_detected===true;"
-            "document.getElementById('status').style.background="
-            "danger?'rgba(192,57,43,0.85)':'rgba(10,10,10,0.88)';"
-            "}catch(e){}"
-            "}"
-            "updateStatus();setInterval(updateStatus,1000);"
-            "</script>"
-            "</body></html>"
-        )
+        # The dashboard itself now lives entirely in frontend_private/ (HTML/CSS/JS) --
+        # this just hands over the page; frontend_private/README.md explains how it gets
+        # its data from /status and the two image endpoints below.
+        return flask_app.send_static_file("index.html")
 
     @flask_app.route("/status")
     def _stream_status():

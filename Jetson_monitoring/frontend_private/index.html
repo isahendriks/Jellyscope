@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<!--
+  Jellyscope private dashboard -- the page skeleton only.
+
+  This file just says WHAT is on the page and WHERE (structure). It does not contain
+  any of the actual numbers/temperatures/etc -- those get filled in by status.js and
+  media.js after the page loads, by asking the Python backend (analyse.py) for the
+  latest data. See README.md in this folder for the full explanation of how the
+  pieces fit together, and status.js for where each <section> below gets its content.
+
+  Every element below that JS needs to find and update has a stable `id` -- that's
+  the connection between this file and status.js/media.js. If you rename an id here,
+  update the matching `getElementById(...)` call in the JS too, or that piece of the
+  page will silently stop updating.
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Jellyscope Livestream</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- The current camera frame, refreshed a few times a second by media.js.
+       Hidden automatically (see status.js) while the pipeline is in "backlog" mode,
+       since there's nothing live to show then. -->
+  <img id="videoFrame" alt="Live camera frame">
+  <div id="livestreamBadge">LIVESTREAM</div>
+
+  <!-- Everything else lives in this one column, pinned to the top-left. -->
+  <div id="topLeftColumn">
+
+    <!-- Thumbnail strip of the most recently identified crops (jellyfish sightings). -->
+    <div id="cropsPanel" class="panel">
+      <div class="panel-title">LAST CROPS</div>
+      <img id="cropsStrip" alt="Recent labeled crops">
+      <span id="cropsPlaceholder">Waiting for labeled crops...</span>
+    </div>
+
+    <!-- The main status box: seven sections, each an empty container today.
+         status.js fills each one's innerHTML once a second from /status's JSON.
+         Turned red (see style.css's #statusBox.leak class) if a leak is detected --
+         that's the one condition serious enough to make the whole box demand
+         attention, rather than just the one relevant section. -->
+    <div id="statusBox" class="panel">
+      <div class="panel-title">METADATA</div>
+      <section id="header"></section>
+      <section id="backlog"></section>
+      <section id="queue"></section>
+      <section id="leak"></section>
+      <section id="environmental"></section>
+      <section id="device"></section>
+      <section id="connection"></section>
+    </div>
+
+  </div>
+
+  <!-- media.js first: it's the simpler file (just image polling, no fetch/JSON) --
+       a good place to start reading if you're new to this codebase.
+       status.js second: it depends on nothing from media.js, load order here doesn't
+       matter functionally, but this keeps "simple file first" as the reading order. -->
+  <script src="media.js"></script>
+  <script src="status.js"></script>
+</body>
+</html>

@@ -1,0 +1,162 @@
+/*
+  Jellyscope private dashboard styles.
+
+  Organized top-to-bottom in the order below -- if you're looking for something
+  specific, jump to its section rather than reading the whole file:
+    1. RESET & THEME     -- page-wide defaults (dark background, font, etc.)
+    2. LAYOUT             -- where things sit on screen (video, columns, badge)
+    3. PANEL CHROME       -- the shared "box" look used by both panels
+    4. STATUS COLORS      -- warning/danger colors, applied by status.js via classList
+*/
+
+/* ===== 1. RESET & THEME ===== */
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  overflow: auto;
+  background: #000;
+  color: #fff;
+  /* One shared font for the whole page -- a monospace stack keeps numbers
+     (temperatures, queue depths, etc.) neatly aligned. */
+  font-family: -apple-system, Menlo, Consolas, monospace;
+}
+
+/* Section content is built as plain text with "\n" line breaks in status.js
+   (see e.g. renderDevice()) rather than separate HTML elements per line --
+   pre-wrap makes those newlines actually show up as line breaks, and still wraps
+   a too-long line instead of overflowing its column sideways. */
+#statusBox {
+  white-space: pre-wrap;
+  line-height: 1.6;
+  font-size: 15px;
+}
+
+.section-title {
+  display: block;
+  font-size: 18px;
+  font-weight: bold;
+  letter-spacing: 0.4px;
+  margin-bottom: 2px;
+}
+
+/* ===== 2. LAYOUT ===== */
+
+/* width/height (not max-width/max-height) so a small source image -- the backend
+   sends it downscaled for faster transmit/decode -- gets scaled UP to fill the
+   space instead of rendering at its tiny native pixel size. min(100vw,100vh) makes
+   it fill the smaller of the two viewport dimensions, reproducing "contain"-style
+   letterboxing but as the image's own box (so the green border below hugs the
+   visible video, not empty space out to the screen edge). */
+#videoFrame {
+  position: fixed;
+  bottom: 0;
+  right: 0;
+  width: min(100vw, 100vh);
+  height: min(100vw, 100vh);
+  display: block;
+  box-sizing: border-box;
+  border: 2px solid #00ff00;
+}
+
+#livestreamBadge {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: bold;
+  letter-spacing: 0.6px;
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid #00ff00;
+  border-radius: 4px;
+}
+
+/* One column, in normal document flow (not each panel individually
+   position:fixed) -- the crops panel and status box stack top-to-bottom here and
+   can never overlap or need JS to measure/place one relative to the other. */
+#topLeftColumn {
+  position: fixed;
+  top: 16px;
+  left: 16px;
+  max-width: calc(100vw - 32px);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+#cropsStrip {
+  display: none; /* shown by media.js once an image actually loads -- see its onload/onerror */
+  max-width: 100%;
+  border-radius: 3px;
+}
+
+#cropsPlaceholder {
+  display: block;
+  font-size: 11px;
+  color: #aaa;
+}
+
+/* Three-column layout for the many small stat lines in #statusBox -- a plain CSS
+   multi-column flow (like a newspaper), not flexbox/grid. break-inside:avoid on
+   each <section> (below) stops a section from being split awkwardly across two
+   columns; without it, the browser would happily cut a section in half wherever
+   the column boundary happens to fall. */
+#statusBox {
+  column-count: 3;
+  column-gap: 26px;
+}
+
+#statusBox section {
+  break-inside: avoid;
+  -webkit-column-break-inside: avoid; /* older Safari needs the prefixed version too */
+  margin-bottom: 10px;
+}
+
+/* ===== 3. PANEL CHROME ===== */
+
+/* Both #cropsPanel and #statusBox share this "box" look -- one class, not
+   duplicated rules, so changing the panel style only ever needs editing here. */
+.panel {
+  padding: 8px 12px;
+  border: 2px solid #00ff00;
+  border-radius: 6px;
+  background: rgba(10, 10, 10, 0.88);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.45);
+}
+
+.panel-title {
+  font-size: 11px;
+  font-weight: bold;
+  letter-spacing: 0.6px;
+  margin-bottom: 6px;
+}
+
+/* A leak is the one condition serious enough to make the whole box demand
+   attention, not just a single value or section -- status.js toggles this class
+   on #statusBox rather than every other warning, which are flagged in place
+   instead (see STATUS COLORS below). */
+#statusBox.leak {
+  background: rgba(192, 57, 43, 0.85);
+}
+
+/* CONNECTION section gets the same red tint, but on its own, when send.py (the
+   upload stage) looks down -- status.js toggles this on the #connection section
+   specifically, not the whole box, so one stage being down doesn't drown out
+   everything else on the page. */
+#connection.down {
+  color: #ff4d4d;
+}
+
+/* ===== 4. STATUS COLORS ===== */
+/* Applied by status.js (see vsMax()) when a reading crosses a threshold from
+   /status -- e.g. camera_temp_c approaching camera_max_temp_c. Change a color
+   here, not in status.js -- this is the one place these colors are defined. */
+
+.status-warn {
+  color: #ffa64d; /* reading is at/above 90% of its max -- worth watching */
+}
+
+.status-danger {
+  color: #ff4d4d; /* reading is at or over its max */
+}

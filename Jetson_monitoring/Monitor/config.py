@@ -170,7 +170,7 @@ SEGMENTATION_SCORER_THRESHOLD_OVERRIDE = 0.95  # reset by update_segmentation_mo
 # Off as of 2026-08-10 to speed backlog draining -- crops go out unlabeled until this is
 # flipped back on; nothing needs reprocessing to relabel them later since re-running
 # CLASSIFY only needs the already-uploaded crop images, not the original full frames.
-CLASSIFY = False
+CLASSIFY = True
 
 # Migrated (standardized) checkpoint -- see models/migrate_checkpoint.py. Point this
 # at the *_migrated.pth output, not the original raw state_dict, once you've run it.
