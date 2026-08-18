@@ -38,8 +38,8 @@ import fiftyone as fo
 # mapped drive letter ("Z:\\Jellyscope\\crops") or a UNC path
 # ("\\\\server\\share\\Jellyscope\\crops"). Use raw strings (r"...") either way.
 
-CROPS_DIR = r"R:\LU24A1037-Jellyscope\Jellyscope\Monitoring data\Kristineberg_260725_ongoing\crops"
-METADATA_DIR = r"R:\LU24A1037-Jellyscope\Jellyscope\Monitoring data\Kristineberg_260725_ongoing\crop_metadata"
+CROPS_DIR = r"\\uw.lu.se\research\LU24A1037-Jellyscope\Jellyscope\Monitoring data\Kristineberg_260725_ongoing\crops"
+METADATA_DIR = r"\\uw.lu.se\research\LU24A1037-Jellyscope\Jellyscope\Monitoring data\Kristineberg_260725_ongoing\crop_metadata"
 
 DATASET_NAME = "jellyscope_crops"
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
@@ -48,9 +48,6 @@ IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
 # existing persistent dataset (faster on repeat runs, keeps any labels
 # you've already added in the App).
 RESET_DATASET = False
-
-# ------------------------------------------------------------------------
-
 
 def build_dataset() -> fo.Dataset:
     if fo.dataset_exists(DATASET_NAME):
@@ -120,5 +117,7 @@ if __name__ == "__main__":
     # Handy default view: newest date first
     dataset = dataset.sort_by("date", reverse=True)
 
-    session = fo.launch_app(dataset)
+    # address="0.0.0.0" so the app is reachable from other devices on the
+    # Tailscale network, not just this machine (default only binds localhost).
+    session = fo.launch_app(dataset, address="0.0.0.0", port=5151)
     session.wait()  # keep the script alive while you browse/label
