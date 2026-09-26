@@ -73,11 +73,31 @@ function vsMax(value, max, unit) {
   return colorize(text, statusClass(value, max));
 }
 
+function fmtBytes(bytes) {
+  if (bytes === null || bytes === undefined) return "N/A";
+  if (bytes >= 1e9) return (bytes / 1e9).toFixed(2) + " GB";
+  if (bytes >= 1e6) return (bytes / 1e6).toFixed(1) + " MB";
+  return bytes.toFixed(0) + " B";
+}
+
 function fmtSpeed(bytesPerSec) {
   if (bytesPerSec === null || bytesPerSec === undefined) return "N/A";
   if (bytesPerSec >= 1e6) return (bytesPerSec / 1e6).toFixed(2) + " MB/s";
   if (bytesPerSec >= 1e3) return (bytesPerSec / 1e3).toFixed(1) + " KB/s";
   return bytesPerSec.toFixed(0) + " B/s";
+}
+
+// "How much of the measured link capacity the last upload actually used" --
+// upload_speed_bps / link_speed_bps, as a percentage. Reuses statusClass()'s
+// existing 90%/100%-of-max coloring (see STATUS COLORS in style.css) by treating
+// the ratio's own 0-100% range as "value" against a fixed "max" of 100, the same
+// trick vsMax() below uses for a real value-vs-hardware-max reading -- orange
+// once the upload is eating most of the link, red once it's at or over what
+// link_speed_bps itself measured (a real possibility: that's a point-in-time
+// probe, not a hard ceiling -- see analyse.py's link_speed_bps comment).
+function occupiedBandwidthPct(d) {
+  if (!d.upload_speed_bps || !d.link_speed_bps) return null;
+  return (d.upload_speed_bps / d.link_speed_bps) * 100;
 }
 
 // Turns "seconds ago" into whichever unit reads best -- nobody wants to read
@@ -108,11 +128,22 @@ function fmtEta(hours) {
   return (hours / 24).toFixed(1) + "d";
 }
 
-// Every section (except the untitled header) starts with a bold title line, then
-// its stat lines joined with "\n" -- style.css's white-space:pre-wrap on
-// #statusBox is what turns those "\n"s into real line breaks on screen.
-function sectionHtml(title, lines) {
-  return `<span class="section-title">${title}</span>\n` + lines.join("\n");
+// One label:value pair, as its own row -- never two parameters sharing a line.
+// Rendered as two plain <span>s, not text -- style.css lays out #statusBox as a
+// single shared CSS grid (two columns: label, value) across every section, and
+// both this and its section/row wrapper elements use display:contents so these
+// spans become that grid's actual items. That's what lines every label and
+// every value up into the same two columns everywhere, not just within one
+// section -- a plain monospace-padding approach can't do that once labels vary
+// as widely in length as "CPU" vs "Enclosure temp (BME280)".
+function statRow(label, value) {
+  return `<div class="stat-row"><span class="stat-label">${label}</span><span class="stat-value">${value}</span></div>`;
+}
+
+// Every section starts with a bold title (spanning both grid columns -- see
+// style.css), then one statRow() per parameter.
+function sectionHtml(title, rows) {
+  return `<span class="section-title">${title}</span>` + rows.join("");
 }
 
 // ===== SECTION RENDERERS =====
@@ -125,12 +156,13 @@ function renderHeader(d) {
   const modeText = d.system_mode === "live" ? "LIVE" : "BACKLOG";
   const mode = colorize(modeText, d.system_mode === "live" ? null : "status-warn");
   return (
-    `<span class="section-title">${d.time}</span>\n` +
-    `Mode: ${mode} (${(d.total_backlog || 0).toLocaleString()} pending)\n` +
-    `Last recorded: ${fmtTime(d.last_recorded_unix)} (${fmtAge(age(d.last_recorded_unix))})\n` +
-    `Last analysed: ${fmtTime(d.last_analysed_unix)} (${fmtAge(age(d.last_analysed_unix))})\n` +
-    `Crops in last image: ${d.last_analysed_crops}  Crops in last 24h: ${d.crops_last_24h}\n` +
-    `Sampling: every ${d.frame_skip} frame(s)`
+    `<span class="section-title">${d.time}</span>` +
+    statRow("Mode", `${mode} (${(d.total_backlog || 0).toLocaleString()} pending)`) +
+    statRow("Last recorded", `${fmtTime(d.last_recorded_unix)} (${fmtAge(age(d.last_recorded_unix))})`) +
+    statRow("Last analysed", `${fmtTime(d.last_analysed_unix)} (${fmtAge(age(d.last_analysed_unix))})`) +
+    statRow("Crops in last image", d.last_analysed_crops) +
+    statRow("Crops in last 24h", d.crops_last_24h) +
+    statRow("Sampling", `every ${d.frame_skip} frame(s)`)
   );
 }
 
@@ -144,58 +176,89 @@ function renderBacklog(d) {
       ? `NOT catching up (record ${fmt(d.record_rate_per_hour, "/hr")} vs analyse ${fmt(d.analyse_rate_per_hour, "/hr")})`
       : "estimating...";
 
-  // .map() below builds one line of text per backlog stage -- "for each stage in
-  // the list, turn it into a line of text" is exactly what .map() means; the
-  // result is a new array of strings, same length as backlog_stages.
-  const stageLines = (d.backlog_stages || []).map((stage) => {
-    if (stage.status === "done") return `${stage.label}: done`;
-    if (stage.status === "pending") return `${stage.label}: pending`;
-    let text = `${stage.label}: active, ${stage.remaining.toLocaleString()} remaining`;
+  // .map() below builds one row per backlog stage -- "for each stage in the
+  // list, turn it into a statRow()" is exactly what .map() means; the result is
+  // a new array of row strings, same length as backlog_stages.
+  const stageRows = (d.backlog_stages || []).map((stage) => {
+    if (stage.status === "done") return statRow(stage.label, "done");
+    if (stage.status === "pending") return statRow(stage.label, "pending");
+    let text = `active, ${stage.remaining.toLocaleString()} remaining`;
     if (stage.rate_per_hour) {
       text += ` -- ${stage.rate_per_hour.toFixed(0)}/hr, ETA ${fmtEta(stage.eta_hours)}`;
     }
-    return text;
+    return statRow(stage.label, text);
   });
 
-  // `...stageLines` "spreads" that array's items in as individual entries of this
+  // `...stageRows` "spreads" that array's items in as individual entries of this
   // outer array, instead of nesting one array inside another.
-  return sectionHtml("BACKLOG", [`Fully live in: ${fullyLiveIn}`, ...stageLines]);
+  return sectionHtml("BACKLOG", [statRow("Fully live in", fullyLiveIn), ...stageRows]);
+}
+
+// Only ever shown while backlog_drain.py (a standalone maintenance script, not one of
+// supervisor.sh's four stages) has ever written a progress file -- see
+// analyse.py's read_backlog_drain_status(). Stays visible after done: true so a
+// finished drain's final tally doesn't just vanish next poll; updateStatus() below is
+// what hides this section entirely when d.backlog_drain is null (no drain has run).
+function renderManualDrain(d) {
+  const b = d.backlog_drain;
+  const pct = b.total_initial ? (((b.sent + b.archived_oversized + b.failed) / b.total_initial) * 100) : 0;
+  const progressText = b.done
+    ? `done -- ${b.sent.toLocaleString()} sent`
+    : `${pct.toFixed(1)}% -- ${b.rate_per_hour ? b.rate_per_hour.toFixed(0) + "/hr, ETA " + fmtEta(b.eta_hours) : "estimating..."}`;
+  return sectionHtml("MANUAL BACKLOG DRAIN", [
+    statRow("Source", b.queue_root),
+    statRow("Progress", `${progressText} (${b.remaining.toLocaleString()} remaining)`),
+    statRow("Sent / archived / failed",
+            `${b.sent.toLocaleString()} / ${b.archived_oversized.toLocaleString()} / ${b.failed.toLocaleString()}`),
+    statRow("Last update", fmtAge(age(b.updated_unix))),
+  ]);
 }
 
 function renderQueue(d) {
   return sectionHtml("QUEUE", [
-    `Avg processing time: ${fmt(d.avg_processing_time_s, " s")}`,
-    `Crops queue: ${(d.que_crops_depth || 0).toLocaleString()}  ` +
-      `Full frames queue: ${(d.que_fullframes_depth || 0).toLocaleString()}`,
+    statRow("Avg processing time", fmt(d.avg_processing_time_s, " s")),
+    statRow("Crops queue", (d.que_crops_depth || 0).toLocaleString()),
+    statRow("Full frames queue", (d.que_fullframes_depth || 0).toLocaleString()),
+    // Crops too big to upload (see config.MAX_CROP_UPLOAD_BYTES) get archived locally
+    // instead of sent -- this is what to check when uploads look stalled but nothing's
+    // actually wrong: something large (an obstruction, a false-positive whole-frame
+    // detection) is in frame, and it's being handled, not stuck.
+    statRow("Oversized crops archived", (d.crops_archived_oversized_total || 0).toLocaleString()),
+    statRow("Oversized crops disk use", fmtBytes(d.oversized_crops_dir_bytes)),
   ]);
 }
 
 function renderLeak(d) {
   const leakText = d.leak_detected === true ? "!!! DETECTED !!!" : d.leak_detected === false ? "OK" : "N/A";
   return sectionHtml("LEAK DETECTION", [
-    `Leak: ${leakText}`,
-    `Enclosure humidity: ${fmt(d.bme280_humidity_pct, "%")}  Dew point: ${fmt(d.dew_point_c, " C")}`,
+    statRow("Leak", leakText),
+    statRow("Enclosure humidity", fmt(d.bme280_humidity_pct, "%")),
+    statRow("Dew point", fmt(d.dew_point_c, " C")),
   ]);
 }
 
 function renderEnvironmental(d) {
   return sectionHtml("ENVIRONMENTAL", [
-    `Bar3XT pressure: ${fmt(d.bar3xt_pressure_mbar, " mbar")}  depth: ${fmt(d.bar3xt_depth_m, " m")}`,
-    `Bar3XT temp: ${fmt(d.bar3xt_temp_c, " C")}  DS18B20 temp: ${fmt(d.ds18b20_temp_c, " C")}`,
+    statRow("Bar3XT pressure", fmt(d.bar3xt_pressure_mbar, " mbar")),
+    statRow("Bar3XT depth", fmt(d.bar3xt_depth_m, " m")),
+    statRow("Bar3XT temp", fmt(d.bar3xt_temp_c, " C")),
+    statRow("DS18B20 temp", fmt(d.ds18b20_temp_c, " C")),
   ]);
 }
 
 function renderDevice(d) {
   return sectionHtml("DEVICE", [
-    `Enclosure pressure: ${fmt(d.bme280_pressure_mbar, " mbar")}`,
-    `Enclosure temp (BME280): ${fmt(d.bme280_temp_c, " C")}`,
-    `Camera: ${vsMax(d.camera_temp_c, d.camera_max_temp_c, " C")}`,
-    `Strobe converter: ${vsMax(d.strobe_converter_temp_c, d.strobe_max_temp_c, " C")}`,
-    `Strobe driver: ${vsMax(d.strobe_driver_temp_c, d.strobe_max_temp_c, " C")}`,
-    `Jetson: ${vsMax(d.jetson_temp_c_mean, d.jetson_max_temp_c, " C")}`,
-    `CPU: ${fmt(d.cpu_percent, "%")}  GPU: ${fmt(d.gpu_percent_mean, "%")} (max ${fmt(d.gpu_percent_max, "%")})`,
-    `Disk free: device: ${fmt(d.disk_root, " GB")}  ` +
-      `ssd1: ${fmt(d.disk_ssd1, " GB")}  ssd2: ${fmt(d.disk_ssd2, " GB")}`,
+    statRow("Enclosure pressure", fmt(d.bme280_pressure_mbar, " mbar")),
+    statRow("Enclosure temp (BME280)", fmt(d.bme280_temp_c, " C")),
+    statRow("Camera", vsMax(d.camera_temp_c, d.camera_max_temp_c, " C")),
+    statRow("Strobe converter", vsMax(d.strobe_converter_temp_c, d.strobe_max_temp_c, " C")),
+    statRow("Strobe driver", vsMax(d.strobe_driver_temp_c, d.strobe_max_temp_c, " C")),
+    statRow("Jetson", vsMax(d.jetson_temp_c_mean, d.jetson_max_temp_c, " C")),
+    statRow("CPU", fmt(d.cpu_percent, "%")),
+    statRow("GPU", `${fmt(d.gpu_percent_mean, "%")} (max ${fmt(d.gpu_percent_max, "%")})`),
+    statRow("Disk free (device)", fmt(d.disk_root, " GB")),
+    statRow("Disk free (ssd1)", fmt(d.disk_ssd1, " GB")),
+    statRow("Disk free (ssd2)", fmt(d.disk_ssd2, " GB")),
   ]);
 }
 
@@ -205,10 +268,15 @@ function renderConnection(d) {
     : d.consecutive_upload_failures > 0
     ? `FAILING (${d.consecutive_upload_failures}x)`
     : "OK";
+  const bwPct = occupiedBandwidthPct(d);
+  const bwText = bwPct === null ? "N/A" : colorize(bwPct.toFixed(0) + "%", statusClass(bwPct, 100));
   return sectionHtml("CONNECTION", [
-    `Status: ${statusText}`,
-    `Last successful upload: ${fmtAge(d.last_success_age_s)}  Last upload speed: ${fmtSpeed(d.upload_speed_bps)}`,
-    `Link speed: ${fmtSpeed(d.link_speed_bps)} (probed ${fmtAge(d.link_speed_probed_age_s)})`,
+    statRow("Status", statusText),
+    statRow("Last successful upload", fmtAge(d.last_success_age_s)),
+    statRow("Last upload speed", fmtSpeed(d.upload_speed_bps)),
+    statRow("Link speed", fmtSpeed(d.link_speed_bps)),
+    statRow("Occupied bandwidth", bwText),
+    statRow("Link speed probed", fmtAge(d.link_speed_probed_age_s)),
   ]);
 }
 
@@ -235,6 +303,14 @@ async function updateStatus() {
       backlogSection.innerHTML = renderBacklog(d);
     }
 
+    const manualDrainSection = document.getElementById("manualDrain");
+    if (d.backlog_drain) {
+      manualDrainSection.style.display = "";
+      manualDrainSection.innerHTML = renderManualDrain(d);
+    } else {
+      manualDrainSection.style.display = "none";
+    }
+
     document.getElementById("queue").innerHTML = renderQueue(d);
     document.getElementById("leak").innerHTML = renderLeak(d);
     document.getElementById("environmental").innerHTML = renderEnvironmental(d);
@@ -246,13 +322,31 @@ async function updateStatus() {
     document.getElementById("statusBox").classList.toggle("leak", d.leak_detected === true);
     document.getElementById("connection").classList.toggle("down", !d.send_alive);
 
-    // The video frame and crops strip only get produced by the backend in live
-    // mode (see analyse.py) -- hide them in backlog mode rather than leaving a
-    // permanently-broken image on screen.
+    // The whole right-hand pane (tab bar + image, whichever tab's active) only
+    // gets produced by the backend in live mode (see analyse.py) -- hide it in
+    // backlog mode rather than leaving a permanently-broken image on screen.
     const isLive = d.system_mode === "live";
-    document.getElementById("videoFrame").style.display = isLive ? "block" : "none";
-    document.getElementById("livestreamBadge").style.display = isLive ? "block" : "none";
-    document.getElementById("cropsPanel").style.display = isLive ? "block" : "none";
+    document.getElementById("videoPane").style.display = isLive ? "block" : "none";
+
+    // Within that pane, the three background-model tabs specifically only produce
+    // real images when analyse.py's config.BG_SUB_ENABLED is True -- hide just those
+    // tab buttons (not the whole pane; "Livestream"/"Crops" work in live mode
+    // regardless). `d.bg_sub_enabled` is `undefined` (falsy) against an older
+    // backend that predates this field too, which correctly falls back to "hidden"
+    // rather than guessing.
+    document.querySelectorAll(".bgModelTab").forEach(function (tab) {
+      tab.style.display = d.bg_sub_enabled ? "" : "none";
+    });
+    // If the active tab is one of the three just hidden above, fall back to
+    // "Livestream" by simulating a click on it -- reuses media.js's own
+    // selectLiveView() via its normal click handler instead of duplicating that
+    // logic here.
+    if (!d.bg_sub_enabled) {
+      const activeTab = document.querySelector(".liveTab.active");
+      if (activeTab && activeTab.classList.contains("bgModelTab")) {
+        document.querySelector('.liveTab[data-view="livestream"]').click();
+      }
+    }
   } catch (err) {
     // fetch() or JSON parsing can fail momentarily (e.g. the backend restarting)
     // -- just skip this tick silently and try again in a second, rather than

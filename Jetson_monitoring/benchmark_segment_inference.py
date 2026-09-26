@@ -30,6 +30,7 @@ print(f"Using device: {device}")
 seg_model, scorer, scorer_threshold, seg_grid_size, seg_image_size = seg_models.load_segmentation_models(
     config.SEGMENTATION_AE_MODEL_PATH, config.SEGMENTATION_SCORER_MODEL_PATH,
     config.SEGMENTATION_ENCODER_TYPE, device,
+    positional_embeddings_used=config.POSITIONAL_EMBEDDINGS_USED,
 )
 
 TILES_PER_IMAGE = 1280  # 5 offsets x 16x16 grid, matches analyse.py's actual load

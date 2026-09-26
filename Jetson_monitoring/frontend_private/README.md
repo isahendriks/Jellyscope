@@ -77,12 +77,16 @@ it's just a number of seconds, no color logic needed.
 Walkthrough:
 1. Open `status.js`, find `renderConnection(d)` (that's the CONNECTION section --
    `send_age_s` is about the send.py process, so that's the right section).
-2. Add a new line to the array it returns, e.g.:
+2. Add a new `statRow(label, value)` call to the array it returns, e.g.:
    ```js
-   `Heartbeat age: ${fmtAge(d.send_age_s)}`,
+   statRow("Heartbeat age", fmtAge(d.send_age_s)),
    ```
+   Always `statRow(...)`, never a plain template-literal string -- every
+   parameter gets its own row, and `statRow()` is what makes that row's label
+   and value line up with every other section's, via the shared CSS grid on
+   `#statusBox` (see `style.css`'s LAYOUT section).
 3. Save, refresh the dashboard. You should see it appear in the CONNECTION
-   section.
+   section, its label aligned with everything else in the panel.
 
 That's the whole loop this codebase uses everywhere: find the field in the JSON,
-find the right renderer function, add one line with a `fmt*` helper, refresh.
+find the right renderer function, add one `statRow(...)` call, refresh.

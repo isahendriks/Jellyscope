@@ -106,8 +106,22 @@ if [[ ! -d "${CAL_FOLDER}/obs" && ! -d "${CAL_FOLDER}/no_obs" ]]; then
   echo "Copy the calibration images there first (or pass --calibration-folder)." >&2
   exit 1
 fi
-n_obs=$(find "${CAL_FOLDER}/obs" -iname '*.png' 2>/dev/null | wc -l)
-n_no_obs=$(find "${CAL_FOLDER}/no_obs" -iname '*.png' 2>/dev/null | wc -l)
+# Guarded on the directory actually existing, not just piped through 2>/dev/null --
+# find on a genuinely missing path exits nonzero, and with pipefail set that kills the
+# whole script right here (silently, since the error text itself is the part sent to
+# /dev/null) even though the check just above deliberately allows only one of obs/
+# no_obs to exist. `if` (not `[[ ]] &&`) on purpose -- a standalone `test && cmd` whose
+# test comes back false is itself a nonzero-exit-status statement, which set -e treats
+# exactly the same way; wrapping it in `if` is what actually makes "condition false" a
+# non-fatal outcome.
+n_obs=0
+if [[ -d "${CAL_FOLDER}/obs" ]]; then
+  n_obs=$(find "${CAL_FOLDER}/obs" -iname '*.png' | wc -l)
+fi
+n_no_obs=0
+if [[ -d "${CAL_FOLDER}/no_obs" ]]; then
+  n_no_obs=$(find "${CAL_FOLDER}/no_obs" -iname '*.png' | wc -l)
+fi
 echo "Calibration images under ${CAL_FOLDER}: ${n_obs} obs, ${n_no_obs} no_obs"
 if [[ "${n_obs}" -eq 0 && "${n_no_obs}" -eq 0 ]]; then
   echo "ERROR: no .png images found under ${CAL_FOLDER}/{obs,no_obs}" >&2

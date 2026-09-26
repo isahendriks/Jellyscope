@@ -1,0 +1,27 @@
+[Unit]
+Description=Jellyscope monitoring pipeline supervisor (record/analyse/send/metadata/tegrastats)
+# local-fs.target + RequiresMountsFor, not network-online.target: QUEUE_ROOT
+# (config.py) lives on /mnt/sda1, which must be mounted before record.py etc.
+# can run, but there's deliberately no dependency on actual internet
+# connectivity -- send.py already retries/backs off and leaves data queued on
+# disk when the server is unreachable (see send.py's module docstring), so the
+# pipeline should come up and start recording/analysing locally even if the
+# network is down or never comes up at all after a power loss.
+After=local-fs.target
+RequiresMountsFor=/mnt/sda1
+
+[Service]
+Type=simple
+User=jellyfish
+Group=jellyfish
+WorkingDirectory=/home/jellyfish/Github/Jellyscope/Jetson_monitoring/Monitor
+ExecStart=/home/jellyfish/Github/Jellyscope/Jetson_monitoring/Monitor/supervisor.sh
+# supervisor.sh's own run_loop already restarts each stage (record/analyse/
+# send/metadata/tegrastats) independently on crash; this Restart=always is
+# only a second-level safety net in case supervisor.sh itself dies (e.g. the
+# whole process group OOM-killed), not for individual stage restarts.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

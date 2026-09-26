@@ -1,0 +1,15 @@
+[Unit]
+Description=Jellyscope Tailscale connectivity watchdog
+Documentation=https://tailscale.com/kb/1233/tailscale-linux
+Wants=network-online.target tailscaled.service
+After=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /home/jellyfish/Github/Jellyscope/Jetson_monitoring/Monitor/tailscale_watchdog.sh
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target

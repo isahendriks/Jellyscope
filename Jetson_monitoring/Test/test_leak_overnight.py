@@ -151,6 +151,14 @@ INTERNAL_TEMP_FIELD = "b"           # "b" = BME280's own temperature - co-locate
 INTERNAL_TEMP_SANE_RANGE_C = (-10.0, 60.0)   # samples outside this are discarded before use
                                     # (covers DS18B20 error sentinels / garbled serial lines;
                                     # BME280 shouldn't hit these, but cheap insurance)
+INTERNAL_PRESSURE_SANE_RANGE_HPA = (300.0, 1100.0)   # CHECK THIS for your setup - from the
+                                    # deepest vacuum your pump can pull up to a bit above
+                                    # sea-level ambient. Samples outside this are discarded
+                                    # (an occasional garbled serial line otherwise injects a
+                                    # raw single-sample spike straight into the raw plot and
+                                    # the leak-rate fit, since nothing else validates it)
+EXTERNAL_PRESSURE_SANE_RANGE_HPA = (800.0, 1100.0)   # CHECK THIS for your site - same purpose
+                                    # as above, for the Bar3XT ambient reading
 STREAM_PORT = 8081                  # browse http://<this-host>:8081/ (or SSH -L 8081:localhost:8081)
 LOG_DIR = Path(__file__).resolve().parent / "leak_test_logs"
 
@@ -186,6 +194,16 @@ def dew_point_c(rh_pct, t_c):
     e_hpa = np.maximum((rh_pct / 100.0) * saturation_vapor_pressure_hpa(t_c), 1e-6)
     ln_term = np.log(e_hpa / 6.112)
     return (243.12 * ln_term) / (17.62 - ln_term)
+
+
+def sane_sample_mask(p_int_pa, p_ext_pa):
+    """True where a sample's pressures fall within the configured sane ranges -
+    used to drop garbled serial lines (e.g. a dropped/corrupted digit) before
+    they hit the raw plot or the leak-rate fit."""
+    p_int_lo, p_int_hi = (v * 100.0 for v in INTERNAL_PRESSURE_SANE_RANGE_HPA)
+    p_ext_lo, p_ext_hi = (v * 100.0 for v in EXTERNAL_PRESSURE_SANE_RANGE_HPA)
+    return ((p_int_pa >= p_int_lo) & (p_int_pa <= p_int_hi) &
+            (p_ext_pa >= p_ext_lo) & (p_ext_pa <= p_ext_hi))
 
 
 #%% ---------------- Shared data store (written by serial thread) ----
@@ -287,7 +305,8 @@ def compute_leak_rate():
                   if t >= test_start_t + SETTLE_TIME_S and not np.isnan(temp)]
 
     temp_lo, temp_hi = INTERNAL_TEMP_SANE_RANGE_C
-    pts = [pt for pt in candidates if temp_lo <= pt[2] <= temp_hi]
+    pts = [pt for pt in candidates
+           if temp_lo <= pt[2] <= temp_hi and sane_sample_mask(pt[1], pt[3])]
     n_rejected_temp = len(candidates) - len(pts)
 
     if len(pts) < 5:
@@ -443,10 +462,19 @@ def plot_png():
 
     if snapshot:
         t_arr = np.array([s[0] for s in snapshot])
-        p_int_hpa = np.array([s[1] for s in snapshot]) / 100.0
-        p_ext_hpa = np.array([s[2] for s in snapshot]) / 100.0
+        p_int_pa = np.array([s[1] for s in snapshot])
+        p_ext_pa = np.array([s[2] for s in snapshot])
         temp_arr = np.array([s[3] for s in snapshot])
         hum_arr = np.array([s[4] for s in snapshot])
+
+        # drop garbled serial lines (single-sample pressure spikes) before plotting -
+        # same sane-range check used to guard the leak-rate fit, see sane_sample_mask()
+        sane = sane_sample_mask(p_int_pa, p_ext_pa)
+        t_arr, temp_arr, hum_arr = t_arr[sane], temp_arr[sane], hum_arr[sane]
+        p_int_hpa = p_int_pa[sane] / 100.0
+        p_ext_hpa = p_ext_pa[sane] / 100.0
+
+    if snapshot and len(t_arr) > 0:
         t_hr = (t_arr - t_arr[0]) / 3600.0   # hours since first sample
 
         # -------- Pressure panel --------

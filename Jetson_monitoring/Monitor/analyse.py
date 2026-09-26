@@ -38,6 +38,7 @@ import torch
 import config
 import queue_io
 import gpu_preprocess
+import background_model
 import segment_core
 import leak_alert  # send_slack_alert only -- generic webhook helper, not leak-specific despite the module name
 from models.segmentation_trt import load_segmentation_engines
@@ -164,9 +165,37 @@ daily_report_date = time.strftime("%Y-%m-%d", time.localtime())
 
 last_training_frame_unix = 0.0  # 0 (not time.time()) so the very first frame after a
 # fresh start samples immediately instead of waiting a full TRAINING_FRAME_INTERVAL_S
+training_collection_count = 0
+
+
+def load_training_collection_count() -> int:
+    if config.TRAINING_COLLECTION_TARGET <= 0:
+        return 0
+    try:
+        state = json.loads(config.TRAINING_COLLECTION_STATE_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return 0
+    if state.get("target") != config.TRAINING_COLLECTION_TARGET:
+        return 0
+    return min(int(state.get("queued_count", 0)), config.TRAINING_COLLECTION_TARGET)
+
+
+def save_training_collection_count() -> None:
+    state_path = config.TRAINING_COLLECTION_STATE_PATH
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = state_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps({
+        "target": config.TRAINING_COLLECTION_TARGET,
+        "queued_count": training_collection_count,
+    }))
+    os.replace(tmp_path, state_path)
+
+
+training_collection_count = load_training_collection_count()
 
 latest_frame_lock = threading.Lock()
 latest_frame_jpeg = None
+latest_raw_frame_jpeg = None
 
 # Most-recent confidently-labeled crops (oldest evicted automatically past
 # RECENT_CROPS_COUNT) plus the rendered thumbnail-strip JPEG built from them --
@@ -175,8 +204,19 @@ recent_crops_lock = threading.Lock()
 recent_labeled_crops = deque(maxlen=config.RECENT_CROPS_COUNT)
 latest_crops_strip_jpeg = None
 
+# Biofouling background-model debug thumbnails (original frame / EMA background
+# estimate / background-subtracted frame) -- same lock/publish idiom as
+# latest_frame_jpeg above, just three small (10%-scale) JPEGs instead of one, for
+# visually confirming background_model.py's EMA subtraction is doing something sane
+# rather than only inferring it from downstream crop counts. Only populated when
+# config.BG_SUB_ENABLED is True -- see update_bg_debug_thumbnails().
+bg_debug_lock = threading.Lock()
+bg_debug_original_jpeg = None
+bg_debug_background_jpeg = None
+bg_debug_subtracted_jpeg = None
 
-def update_live_frame(enhanced, results) -> None:
+
+def update_live_frame(enhanced, results, raw_frame) -> None:
     """Builds two different renderings of the same downscaled post-PREPROCESS frame:
 
     1. A boxed copy (green box per accepted crop, + its label once confidence clears
@@ -193,13 +233,22 @@ def update_live_frame(enhanced, results) -> None:
     Downscale happens *before* either is used, not after -- boxes/text drawn at full
     4512px res then shrunk 10x would be illegible, and it keeps both renderings'
     coordinates in the same scaled space as the JSON sidecar below."""
-    global latest_frame_jpeg
+    global latest_frame_jpeg, latest_raw_frame_jpeg
     scale = config.LIVESTREAM_DISP_SCALE / 100
     small = cv2.resize(enhanced, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
     clean = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
 
     crops_json = []
     display = clean.copy()
+    # Frame border -- baked into the pixels here (not a CSS border on the dashboard's
+    # <img> element) specifically so it hugs the image's own true bounds. A CSS
+    # border on the element box doesn't: object-fit:contain can letterbox the actual
+    # visible pixels well inside that box on a differently-shaped viewport, leaving
+    # the CSS border sitting out at the full element edges -- around the letterbox
+    # bars too, reading as a frame around the whole pane rather than around the
+    # picture. Not drawn on `clean` -- send.py's remote upload deliberately stays
+    # undecorated, see this function's own docstring above.
+    cv2.rectangle(display, (0, 0), (display.shape[1] - 1, display.shape[0] - 1), config.CROP_BOX_COLOR, 2)
     for _crop_stem, _encoded_bytes, sidecar in results:
         x0, y0 = int(sidecar["crop_x0"] * scale), int(sidecar["crop_y0"] * scale)
         x1, y1 = int(sidecar["crop_x1"] * scale), int(sidecar["crop_y1"] * scale)
@@ -213,12 +262,21 @@ def update_live_frame(enhanced, results) -> None:
             "class_confidence": sidecar["class_confidence"],
         })
 
-    ok, encoded = cv2.imencode(".jpg", display)
+    jpeg_params = [cv2.IMWRITE_JPEG_QUALITY, config.LIVESTREAM_JPEG_QUALITY]
+    raw_u8 = np.clip(raw_frame.astype(np.float32) / config.HDR_MAX * 255, 0, 255).astype(np.uint8)
+    raw_small = cv2.resize(raw_u8, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    raw_bgr = cv2.cvtColor(raw_small, cv2.COLOR_GRAY2BGR)
+    ok, encoded_raw = cv2.imencode(".jpg", raw_bgr, jpeg_params)
+    if ok:
+        with latest_frame_lock:
+            latest_raw_frame_jpeg = encoded_raw.tobytes()
+
+    ok, encoded = cv2.imencode(".jpg", display, jpeg_params)
     if ok:
         with latest_frame_lock:
             latest_frame_jpeg = encoded.tobytes()
 
-    ok, encoded_clean = cv2.imencode(".jpg", clean)
+    ok, encoded_clean = cv2.imencode(".jpg", clean, jpeg_params)
     if ok:
         # JSON written before the JPEG on purpose -- send.py's only upload trigger is
         # LIVE_FRAME_PATH's mtime, so by the time it notices a change the sidecar
@@ -242,69 +300,155 @@ def update_live_frame(enhanced, results) -> None:
         os.replace(jpg_tmp_path, config.LIVE_FRAME_PATH)
 
 
+BG_DEBUG_THUMBNAIL_SCALE = 0.10  # 10%, matching the spec's "thumbnail" definition --
+# deliberately independent of LIVESTREAM_DISP_SCALE (also currently 10%) since these
+# debug views exist to eyeball background_model.py in isolation, not to match the
+# main video pane's sizing.
+
+
+def _bg_debug_linear_to_u8(img_f32: np.ndarray, max_val: float) -> np.ndarray:
+    """Plain linear compression to 8-bit (value/max_val*255, clipped) -- for the
+    original frame and the EMA background estimate, both still in the sensor's native
+    raw range (0..config.HDR_MAX, the same reference gpu_preprocess_frame's own
+    x = img / hdr_max uses). A *fixed* reference range, not each frame's own min/max,
+    so brightness stays visually comparable frame to frame and between the two."""
+    scaled = img_f32 / max_val
+    return np.clip(scaled * 255, 0, 255).astype(np.uint8)
+
+
+# Fixed (not per-frame-adaptive) display-only reference max for the "raw -
+# background" debug view. A 1st/99th-percentile contrast stretch was tried first
+# and looked misleadingly bright/noisy: once subtraction is working, this frame is
+# near-0 almost everywhere by design (frame≈background), so its own 1st/99th
+# percentile range is dominated by a few counts of sensor noise -- stretching THAT
+# tiny range to fill 0-255 blows ordinary noise up to full contrast on every single
+# frame, whether or not anything real is actually present. A fixed reference max
+# avoids that: real detections (well above the noise floor) still show clearly,
+# background noise stays dim, and brightness is comparable frame to frame instead
+# of auto-renormalizing around whatever that frame's own noise happened to be. Not
+# a rigorously measured value -- adjust if real detections still look too dim/bright.
+BG_DEBUG_SUBTRACTED_DISPLAY_MAX = config.HDR_MAX / 8
+
+
+def _bg_debug_encode_thumbnail(u8: np.ndarray) -> bytes | None:
+    small = cv2.resize(u8, (0, 0), fx=BG_DEBUG_THUMBNAIL_SCALE, fy=BG_DEBUG_THUMBNAIL_SCALE,
+                        interpolation=cv2.INTER_AREA)
+    # Grayscale -> BGR so the border below can actually be green, not just another
+    # grey level -- same conversion _render_recent_crop_tile() does for its own
+    # per-tile border. Baked into the pixels rather than a CSS border on the
+    # dashboard's <img> element for the same reason update_live_frame()'s frame
+    # border is: a CSS border sits at the element's full box edges, not the actual
+    # visible image bounds once object-fit:contain has letterboxed it.
+    small_bgr = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
+    cv2.rectangle(small_bgr, (0, 0), (small_bgr.shape[1] - 1, small_bgr.shape[0] - 1), config.CROP_BOX_COLOR, 2)
+    ok, encoded = cv2.imencode(".jpg", small_bgr)
+    return encoded.tobytes() if ok else None
+
+
+def update_bg_debug_thumbnails(original_frame, corrected_frame) -> None:
+    """Publishes three downscaled/JPEG-compressed debug views of the EMA biofouling
+    model -- the raw frame, the current background estimate, and the background-
+    subtracted frame -- so the correction can be eyeballed on the live dashboard
+    instead of only inferred from downstream crop counts. Only called when
+    config.BG_SUB_ENABLED is True (see process_frame()); background_model.get_background()
+    is read here rather than threaded through as a parameter since it's this process's
+    one persistent buffer, same as `enhanced`/results are read directly elsewhere in
+    this file."""
+    global bg_debug_original_jpeg, bg_debug_background_jpeg, bg_debug_subtracted_jpeg
+    bg_frame = background_model.get_background()
+    if bg_frame is None:
+        return
+    original_jpeg = _bg_debug_encode_thumbnail(_bg_debug_linear_to_u8(original_frame.astype(np.float32), config.HDR_MAX))
+    background_jpeg = _bg_debug_encode_thumbnail(_bg_debug_linear_to_u8(bg_frame, config.HDR_MAX))
+    subtracted_jpeg = _bg_debug_encode_thumbnail(
+        _bg_debug_linear_to_u8(corrected_frame.astype(np.float32), BG_DEBUG_SUBTRACTED_DISPLAY_MAX))
+    with bg_debug_lock:
+        if original_jpeg is not None:
+            bg_debug_original_jpeg = original_jpeg
+        if background_jpeg is not None:
+            bg_debug_background_jpeg = background_jpeg
+        if subtracted_jpeg is not None:
+            bg_debug_subtracted_jpeg = subtracted_jpeg
+
+
+def _render_recent_crop_tile(encoded_bytes: bytes, class_label, source_timestamp_unix) -> np.ndarray:
+    """Renders one recent_labeled_crops entry into its tile -- the crop image, boxed
+    in the same green used for the main frame's crop boxes (config.CROP_BOX_COLOR),
+    with its class label and observation time (source_timestamp_unix -- when the
+    frame was actually captured, not when this tile happens to be rendered) captioned
+    in a black band underneath -- centered, white-on-black so it stays legible
+    regardless of how bright/dark the crop itself is (green-on-crop, tried first,
+    washed out on brighter crops). The time line uses a dimmer grey than the label,
+    a secondary detail rather than competing with it. Called once per crop, when
+    it's appended in update_recent_crops_strip() below -- not once per tile per
+    frame -- since a crop's own pixels/label/time never change after that."""
+    thumb_px = config.RECENT_CROPS_THUMB_PX
+    caption_px = config.RECENT_CROPS_CAPTION_PX
+    tile_h = thumb_px + caption_px
+
+    crop_image = cv2.imdecode(np.frombuffer(encoded_bytes, np.uint8), cv2.IMREAD_UNCHANGED)
+    body = cv2.resize(crop_image, (thumb_px, thumb_px), interpolation=cv2.INTER_AREA)
+    body = cv2.cvtColor(body, cv2.COLOR_GRAY2BGR)
+
+    tile = np.zeros((tile_h, thumb_px, 3), dtype=np.uint8)
+    tile[:thumb_px, :] = body
+    cv2.rectangle(tile, (0, 0), (thumb_px - 1, thumb_px - 1), config.CROP_BOX_COLOR, 1)
+
+    label_text = class_label or "?"
+    (text_w, _text_h), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+    text_x = max(2, (thumb_px - text_w) // 2)
+    cv2.putText(tile, label_text, (text_x, thumb_px + 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+
+    time_text = time.strftime("%H:%M:%S", time.localtime(source_timestamp_unix))
+    (time_w, _time_h), _ = cv2.getTextSize(time_text, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
+    time_x = max(2, (thumb_px - time_w) // 2)
+    cv2.putText(tile, time_text, (time_x, thumb_px + caption_px - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (170, 170, 170), 1, cv2.LINE_AA)
+    return tile
+
+
 def update_recent_crops_strip(results) -> None:
-    """Appends this frame's confidently-labeled crops (same CONFIDENCE_THRESHOLD
-    gate as the box labels drawn in update_live_frame above) to recent_labeled_crops,
-    then re-renders the whole deque into a single side-by-side thumbnail-strip JPEG
-    for the live-stream window. Decodes crop_image back out of results' already-encoded
-    PNG bytes rather than re-slicing `enhanced`, so this has no dependency on the
-    full-resolution frame surviving past this call."""
+    """Appends every crop from this frame (unfiltered -- no confidence/peak-value
+    gate, unlike the box labels drawn in update_live_frame above) to
+    recent_labeled_crops, then re-lays-out the whole deque's already-rendered tiles
+    into a single side-by-side thumbnail-strip JPEG for the live-stream window.
+
+    Stores each entry as its rendered tile (not raw PNG bytes) -- _render_recent_crop_tile()
+    (imdecode/resize/cvtColor/rectangle/puttext) runs once per crop, when it's
+    appended, not once per tile on every single frame it remains in the deque. With
+    the confidence/peak-value gate removed (every crop now qualifies), the deque
+    fills to RECENT_CROPS_COUNT within seconds and stays there -- redoing that
+    per-tile work for all of them, every frame, measured at several seconds/frame on
+    the Jetson, enough to fall behind the live camera's frame rate. Re-laying-out
+    already-rendered tiles (padding + hstack/vstack) stays cheap regardless of how
+    full the deque is."""
     global latest_crops_strip_jpeg
     with recent_crops_lock:
         for _crop_stem, encoded_bytes, sidecar in results:
-            if (sidecar["class_confidence"] is not None
-                    and sidecar["class_confidence"] >= config.CONFIDENCE_THRESHOLD
-                    and sidecar["peak_val"] > config.RECENT_CROPS_MIN_PEAK_VAL):
-                recent_labeled_crops.append((encoded_bytes, sidecar["class_label"]))
+            recent_labeled_crops.append(
+                _render_recent_crop_tile(encoded_bytes, sidecar["class_label"], sidecar["source_timestamp_unix"]))
 
         if not recent_labeled_crops:
             return
 
-        # Each tile: the crop image, boxed in the same green used for the main frame's
-        # crop boxes (config.CROP_BOX_COLOR), with its class label captioned in a black
-        # band underneath -- centered, white-on-black so it stays legible regardless of
-        # how bright/dark the crop itself is (green-on-crop, tried first, washed out on
-        # brighter crops). Tiles are separated by a gap column/row, not butted edge-to-edge,
-        # so each one's border reads as its own box rather than one continuous grid line.
         thumb_px = config.RECENT_CROPS_THUMB_PX
         caption_px = config.RECENT_CROPS_CAPTION_PX
         gap_px = 6
         tile_h = thumb_px + caption_px
-        tiles = []
-        for encoded_bytes, class_label in recent_labeled_crops:
-            crop_image = cv2.imdecode(np.frombuffer(encoded_bytes, np.uint8), cv2.IMREAD_UNCHANGED)
-            body = cv2.resize(crop_image, (thumb_px, thumb_px), interpolation=cv2.INTER_AREA)
-            body = cv2.cvtColor(body, cv2.COLOR_GRAY2BGR)
+        tiles = list(recent_labeled_crops)
 
-            tile = np.zeros((tile_h, thumb_px, 3), dtype=np.uint8)
-            tile[:thumb_px, :] = body
-            cv2.rectangle(tile, (0, 0), (thumb_px - 1, thumb_px - 1), config.CROP_BOX_COLOR, 1)
-
-            label_text = class_label or "?"
-            (text_w, _text_h), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
-            text_x = max(2, (thumb_px - text_w) // 2)
-            cv2.putText(tile, label_text, (text_x, thumb_px + caption_px - 7),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
-            tiles.append(tile)
-
-        # Wraps into a grid up to RECENT_CROPS_COLUMNS wide instead of one ever-widening
-        # row -- at RECENT_CROPS_COUNT=40 a single row would be ~4000px wide, well past
-        # the browser viewport, forcing the page to scroll/clip it. Padded with blank
-        # tiles up to a full last row so every row hstacks to the same width (a ragged
-        # last row would fail vstack's shape check, not just look uneven).
-        #
-        # Deque rarely holds a clean multiple of RECENT_CROPS_COLUMNS (it fills up
-        # gradually, and RECENT_CROPS_MIN_PEAK_VAL makes qualifying crops sparse), so
-        # always using exactly RECENT_CROPS_COLUMNS columns would routinely leave a
-        # chunk of the last row visibly blank. Instead pick, from a small window of
-        # column counts near RECENT_CROPS_COLUMNS, whichever leaves the least padding --
-        # ties broken toward more columns, to keep the grid wide rather than tall. Never
-        # narrower than 4 columns even if that means accepting some padding -- a tall
-        # 1-2 column strip is a worse look than a partly-blank last row.
+        # Wraps into a grid exactly RECENT_CROPS_COLUMNS wide (capped by how many
+        # tiles actually exist yet, so a near-empty deque doesn't pad out to a full
+        # row of blanks) -- the frontend's Crops tab scrolls vertically to reach
+        # whatever's below the fold (see style.css's #liveViewContainer.scrollable),
+        # so unlike the old fixed-height panel this used to render into, there's no
+        # need to hunt for a column count that minimizes a partly-blank last row.
+        # Padded with blank tiles up to a full last row so every row hstacks to the
+        # same width (a ragged last row would fail vstack's shape check, not just
+        # look uneven).
         n_tiles = len(tiles)
-        max_cols = min(config.RECENT_CROPS_COLUMNS, n_tiles)
-        min_cols = min(max_cols, 4)
-        n_cols = min(range(min_cols, max_cols + 1), key=lambda c: ((-n_tiles) % c, -c))
+        n_cols = min(config.RECENT_CROPS_COLUMNS, n_tiles)
         blank_tile = np.zeros((tile_h, thumb_px, 3), dtype=np.uint8)
         tiles += [blank_tile] * (-len(tiles) % n_cols)
 
@@ -340,6 +484,21 @@ def read_live_metadata() -> dict:
         return {}
 
 
+def read_backlog_drain_status() -> dict | None:
+    """Reads backlog_drain.py's progress snapshot, if that one-off maintenance script
+    is currently running (or has ever run) -- same plain-JSON pattern as the heartbeat
+    reads below, except backlog_drain.py isn't one of supervisor.sh's four stages, so
+    there's no liveness/staleness check here; the dashboard just shows whatever the
+    file last said, or hides the section entirely if it's never existed."""
+    path = config.HEARTBEAT_DIR / "backlog_drain.status.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def read_send_heartbeat() -> dict:
     """Reads send.py's own heartbeat.json directly -- no exclusive-ownership concern
     here (unlike the M0/strobe reads, which go through metadata.py), it's just a plain
@@ -367,7 +526,6 @@ def read_record_heartbeat() -> dict:
     except (OSError, json.JSONDecodeError):
         return {}
 
-
 def compute_stage_remaining() -> list[int]:
     """Current remaining count for each stage in fullframe_queues, in order -- 0 for
     stages already finished, fullframe_backlog's length for the active stage. As of
@@ -377,7 +535,6 @@ def compute_stage_remaining() -> list[int]:
     one stage in case a backlog stage is ever reintroduced. Shared by
     estimate_camera_live_eta() and the backlog/live mode switch below."""
     return [len(fullframe_backlog) if i == active_queue_idx else 0 for i in range(len(fullframe_queues))]
-
 
 def compute_total_backlog() -> int:
     return sum(compute_stage_remaining())
@@ -443,9 +600,15 @@ if config.ENABLE_LIVE_STREAM:
     import secrets
     from pathlib import Path
 
-    from flask import Flask, Response, jsonify, request
+    from flask import Flask, Response, jsonify, request, g
 
     from dashboard_secrets import DASHBOARD_PASSWORD
+
+    # Bounds how many requests this process will service concurrently -- see
+    # config.LIVESTREAM_MAX_CONCURRENT_REQUESTS's comment for why (a slow/remote
+    # viewer over the field link could otherwise pile up threads, each contending
+    # for the GIL against the real-time PREPROCESS/SEGMENT/CLASSIFY loop).
+    _concurrency_semaphore = threading.BoundedSemaphore(config.LIVESTREAM_MAX_CONCURRENT_REQUESTS)
 
     flask_app = Flask(
         __name__,
@@ -474,6 +637,27 @@ if config.ENABLE_LIVE_STREAM:
                 "Authentication required", 401,
                 {"WWW-Authenticate": 'Basic realm="Jellyscope dashboard"'},
             )
+
+    @flask_app.before_request
+    def _limit_concurrency():
+        # Runs after _require_password above (registered first -- an unauthenticated
+        # request shouldn't consume a concurrency slot). Non-blocking acquire: past
+        # LIVESTREAM_MAX_CONCURRENT_REQUESTS in flight, a new request gets a plain 503
+        # immediately instead of spawning yet another thread that just waits -- the
+        # dashboard's own JS re-polls every 400ms-1s regardless, so this costs nothing
+        # real. g.holds_concurrency_slot records whether *this* request actually
+        # acquired it, so teardown_request below only releases what it took.
+        if not _concurrency_semaphore.acquire(blocking=False):
+            return Response("Server busy, try again shortly", 503)
+        g.holds_concurrency_slot = True
+
+    @flask_app.teardown_request
+    def _release_concurrency(_exc):
+        # teardown_request fires after every request (including ones that raised),
+        # unlike after_request -- the reliable place to release this regardless of how
+        # the request ended.
+        if getattr(g, "holds_concurrency_slot", False):
+            _concurrency_semaphore.release()
 
     @flask_app.route("/")
     def _stream_index():
@@ -537,6 +721,7 @@ if config.ENABLE_LIVE_STREAM:
             "analyse_rate_per_hour": camera_live["analyse_rate_per_hour"],
             "record_rate_per_hour": camera_live["record_rate_per_hour"],
             "frame_skip": config.FRAME_SKIP,
+            "bg_sub_enabled": config.BG_SUB_ENABLED,
             "avg_processing_time_s": avg_processing_time_s,
             "bar3xt_pressure_mbar": live.get("bar3xt_pressure_mbar"),
             "bar3xt_depth_m": live.get("bar3xt_depth_m"),
@@ -570,6 +755,9 @@ if config.ENABLE_LIVE_STREAM:
             # its module-level comment on the 2026-08-03 incident).
             "que_crops_depth": live.get("que_crops_depth"),
             "que_fullframes_depth": live.get("que_fullframes_depth"),
+            "crops_archived_oversized_total": send_hb.get("crops_archived_oversized_total"),
+            "oversized_crops_dir_bytes": send_hb.get("oversized_crops_dir_bytes"),
+            "backlog_drain": read_backlog_drain_status(),
             "send_alive": (send_age_s is not None and send_age_s < config.HEARTBEAT_STALE_S),
             "send_age_s": send_age_s,
             "upload_speed_bps": send_hb.get("last_speed_bps"),
@@ -604,6 +792,16 @@ if config.ENABLE_LIVE_STREAM:
         resp.headers["Cache-Control"] = "no-store"
         return resp
 
+    @flask_app.route("/latest_raw_frame.jpg")
+    def _latest_raw_frame():
+        with latest_frame_lock:
+            frame = latest_raw_frame_jpeg
+        if frame is None:
+            return Response(status=404)
+        resp = Response(frame, mimetype="image/jpeg")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
     @flask_app.route("/latest_crops_strip.jpg")
     def _latest_crops_strip():
         # Same single-shot-fetch reasoning as /latest_frame.jpg above, and same
@@ -615,6 +813,31 @@ if config.ENABLE_LIVE_STREAM:
         resp = Response(frame, mimetype="image/jpeg")
         resp.headers["Cache-Control"] = "no-store"
         return resp
+
+    def _serve_bg_debug_jpeg(get_jpeg):
+        # Shared by the three routes below -- same single-shot-fetch/404-when-
+        # nothing-yet pattern as /latest_frame.jpg and /latest_crops_strip.jpg above,
+        # just factored out since there are three near-identical copies here instead
+        # of one or two.
+        with bg_debug_lock:
+            frame = get_jpeg()
+        if frame is None:
+            return Response(status=404)
+        resp = Response(frame, mimetype="image/jpeg")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @flask_app.route("/bg_debug_original.jpg")
+    def _bg_debug_original_route():
+        return _serve_bg_debug_jpeg(lambda: bg_debug_original_jpeg)
+
+    @flask_app.route("/bg_debug_background.jpg")
+    def _bg_debug_background_route():
+        return _serve_bg_debug_jpeg(lambda: bg_debug_background_jpeg)
+
+    @flask_app.route("/bg_debug_subtracted.jpg")
+    def _bg_debug_subtracted_route():
+        return _serve_bg_debug_jpeg(lambda: bg_debug_subtracted_jpeg)
 
     @flask_app.route("/stream")
     def _stream_feed():
@@ -668,9 +891,19 @@ def maybe_queue_training_frame(enhanced, image_name: str, source_frame_id, sourc
     per-crop que_crops path. Encoded as PNG (lossless, same as crops) rather than TIFF --
     smaller for the same pixels since `enhanced` is already 8-bit, not worth trading
     losslessness away over a per-30-minutes upload."""
-    global last_training_frame_unix
+    global last_training_frame_unix, training_collection_count
     now = time.time()
-    if now - last_training_frame_unix < config.TRAINING_FRAME_INTERVAL_S:
+    collection_active = (
+        config.TRAINING_COLLECTION_TARGET > 0
+        and training_collection_count < config.TRAINING_COLLECTION_TARGET
+    )
+    interval_s = (
+        config.TRAINING_COLLECTION_INTERVAL_S if collection_active
+        else config.TRAINING_FRAME_INTERVAL_S
+    )
+    if now - last_training_frame_unix < interval_s:
+        return
+    if config.TRAINING_COLLECTION_TARGET > 0 and not collection_active:
         return
     last_training_frame_unix = now
 
@@ -686,6 +919,9 @@ def maybe_queue_training_frame(enhanced, image_name: str, source_frame_id, sourc
         "upload_attempts": 0,
     }
     queue_io.write_item(config.QUE_TRAINING_FRAMES, image_name, encoded.tobytes(), ".png", sidecar)
+    if collection_active:
+        training_collection_count += 1
+        save_training_collection_count()
 
 
 def segment_and_classify(enhanced, image_name: str, source_frame_id=None, source_timestamp_unix=None) -> tuple[list, dict]:
@@ -702,6 +938,9 @@ def segment_and_classify(enhanced, image_name: str, source_frame_id=None, source
     if width != config.IMAGE_SIZE_PX or height != config.IMAGE_SIZE_PX:
         raise ValueError(f"{image_name} is {width}x{height}, expected {config.IMAGE_SIZE_PX}x{config.IMAGE_SIZE_PX} "
                           "(tile_size/upscale_factor are computed assuming this size)")
+
+    if not config.SEGMENT_ENABLED:
+        return [], {"segment": 0.0, "inference": 0.0}
 
     t_tiles_start = time.perf_counter()
 
@@ -886,6 +1125,17 @@ def process_frame(stem: str, read_result: dict, claim_duration: float = 0.0) -> 
     global last_analysed_unix, last_analysed_crops, crops_last_24h
     sidecar = read_result["sidecar"]
     image_gray = read_result["image_gray"]
+
+    # Biofouling background subtraction (background_model.py) -- runs on the raw
+    # frame, upstream of dark-frame correction/median blur/gamma/CLAHE below, since
+    # CLAHE's per-frame-adaptive contrast makes the same physical fouling dot map to
+    # different pixel values frame to frame, which only an upstream (pre-CLAHE)
+    # subtraction can correct for. config.BG_SUB_ENABLED is a field kill switch --
+    # False leaves image_gray (and the live-stream debug thumbnails) untouched.
+    original_frame = image_gray
+    if config.BG_SUB_ENABLED:
+        image_gray = background_model.update_and_subtract(image_gray, config.BG_EMA_ALPHA, config.HDR_MAX)
+
     # TEMP diagnostic breakdown (2026-08-10, investigating the record/send slowdown) --
     # sidecar_time/imread_time split out of record_time below; remove once resolved.
     sidecar_time = read_result["sidecar_time"]
@@ -919,8 +1169,10 @@ def process_frame(stem: str, read_result: dict, claim_duration: float = 0.0) -> 
 
     t_stream_start = time.perf_counter()
     if config.ENABLE_LIVE_STREAM and system_mode == "live":
-        update_live_frame(enhanced, results)
+        update_live_frame(enhanced, results, original_frame)
         update_recent_crops_strip(results)
+        if config.BG_SUB_ENABLED:
+            update_bg_debug_thumbnails(original_frame, image_gray)
     t_stream_end = time.perf_counter()
 
     t_send_start = time.perf_counter()
@@ -960,7 +1212,7 @@ def process_frame(stem: str, read_result: dict, claim_duration: float = 0.0) -> 
           f"send={send_time:.3f}s[{write_times_str}] stream={stream_time:.3f}s "
           f"total={total_time:.3f}s crops={len(results)}")
 
-    del image_gray, enhanced, results, sidecar
+    del image_gray, original_frame, enhanced, results, sidecar
 
 
 ### ==========================
@@ -986,6 +1238,15 @@ if __name__ == "__main__":
         # to drop routine "GET ... 200" per-request access-log noise.
         from werkzeug.serving import WSGIRequestHandler
         WSGIRequestHandler.log_request = lambda self, *args, **kwargs: None
+
+        # Per-connection socket timeout (read AND write) -- see
+        # config.LIVESTREAM_REQUEST_TIMEOUT_S's comment. Without this, a client that's
+        # slow to read the response (e.g. viewing over the same slow field link send.py
+        # uploads over) can leave its handling thread blocked in socket.send()
+        # indefinitely; Werkzeug already treats socket.timeout as a clean dropped
+        # connection (WSGIRequestHandler.connection_dropped), not a crash, so this just
+        # gives it a timeout to actually raise.
+        WSGIRequestHandler.timeout = config.LIVESTREAM_REQUEST_TIMEOUT_S
 
         threading.Thread(
             target=lambda: flask_app.run(

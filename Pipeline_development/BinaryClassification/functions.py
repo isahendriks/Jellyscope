@@ -13,10 +13,17 @@ import pandas as pd
 # Encoder 
 class Encoder(nn.Module):
     """Regular encoder with continuous positional features"""
-    def __init__(self, latent_dims=2, image_size=128, hidden_channels=32, grid_size=16):
+    def __init__(self, latent_dims=2, image_size=128, hidden_channels=32, grid_size=16,
+                 positional_embeddings_used=True):
         super().__init__()
         self.image_size = image_size
         self.grid_size = grid_size
+        # False for checkpoints trained with positional embeddings zeroed out (e.g.
+        # Kristineberg_260814) -- forward() still runs the fusion layers (pos_fc1/
+        # fusion_fc1/fusion_fc2) so the latent projection's input shape matches what
+        # the checkpoint was trained with, it just feeds them a zero embedding instead
+        # of self.pos_embedding(pos_features)'s real output.
+        self.positional_embeddings_used = positional_embeddings_used
 
         self.conv = nn.Sequential(
             nn.Conv2d(1, hidden_channels, kernel_size=3, stride=2, padding=1),
@@ -62,8 +69,12 @@ class Encoder(nn.Module):
         h = torch.flatten(h, start_dim=1)
 
         if row is not None and col is not None:
-            pos_features = compute_position_features(row, col, self.grid_size, x.device)
-            pos_emb = self.pos_embedding(pos_features)
+            if self.positional_embeddings_used:
+                pos_features = compute_position_features(row, col, self.grid_size, x.device)
+                pos_emb = self.pos_embedding(pos_features)
+            else:
+                pos_emb = torch.zeros(x.shape[0], self.pos_embedding.mlp[-2].out_features,
+                                       device=x.device, dtype=h.dtype)
 
             pos_processed = self.pos_fc1(pos_emb)
             pos_processed = self.pos_bn1(pos_processed)
@@ -87,12 +98,16 @@ class Encoder(nn.Module):
 ### Variational Encoder for segmentation, with multi-level positional embeddings 
 class VariationalEncoder(nn.Module):
     """Variational Encoder with continuous positional features"""
-    def __init__(self, latent_dims=2, image_size=128, hidden_channels=32, grid_size=16):
+    def __init__(self, latent_dims=2, image_size=128, hidden_channels=32, grid_size=16,
+                 positional_embeddings_used=True):
         super().__init__()
         self.image_size = image_size
         self.kl = torch.tensor(0.0)
         self.grid_size = grid_size
-        
+        # See Encoder.__init__'s matching comment -- False for checkpoints trained with
+        # positional embeddings zeroed out (e.g. Kristineberg_260814).
+        self.positional_embeddings_used = positional_embeddings_used
+
         # Convolutional encoder
         self.conv = nn.Sequential(
             nn.Conv2d(1, hidden_channels, kernel_size=3, stride=2, padding=1),
@@ -139,9 +154,13 @@ class VariationalEncoder(nn.Module):
         h = torch.flatten(h, start_dim=1)
 
         if row is not None and col is not None:
-            pos_features = compute_position_features(row, col, self.grid_size, x.device)
-            pos_emb = self.pos_embedding(pos_features)
-            
+            if self.positional_embeddings_used:
+                pos_features = compute_position_features(row, col, self.grid_size, x.device)
+                pos_emb = self.pos_embedding(pos_features)
+            else:
+                pos_emb = torch.zeros(x.shape[0], self.pos_embedding.mlp[-2].out_features,
+                                       device=x.device, dtype=h.dtype)
+
             # LEVEL 1: Process position embeddings through FC
             pos_processed = self.pos_fc1(pos_emb)
             pos_processed = self.pos_bn1(pos_processed)
@@ -181,11 +200,15 @@ class VariationalEncoder(nn.Module):
     def encode_params(self, x, row=None, col=None):
         h = self.conv(x)
         h = torch.flatten(h, start_dim=1)
-        
+
         if row is not None and col is not None:
-            pos_features = compute_position_features(row, col, self.grid_size, x.device)
-            pos_emb = self.pos_embedding(pos_features)
-            
+            if self.positional_embeddings_used:
+                pos_features = compute_position_features(row, col, self.grid_size, x.device)
+                pos_emb = self.pos_embedding(pos_features)
+            else:
+                pos_emb = torch.zeros(x.shape[0], self.pos_embedding.mlp[-2].out_features,
+                                       device=x.device, dtype=h.dtype)
+
             # LEVEL 1: Process position embeddings through FC
             pos_processed = self.pos_fc1(pos_emb)
             pos_processed = self.pos_bn1(pos_processed)
@@ -246,13 +269,15 @@ class Decoder(nn.Module):
 
 ### Autoencoder that combines the Encoder and Decoder
 class Autoencoder(nn.Module):
-    def __init__(self, latent_dims, image_size=128, hidden_channels=32, grid_size=16):
+    def __init__(self, latent_dims, image_size=128, hidden_channels=32, grid_size=16,
+                 positional_embeddings_used=True):
         super().__init__()
         self.encoder = Encoder(
             latent_dims=latent_dims,
             image_size=image_size,
             hidden_channels=hidden_channels,
-            grid_size=grid_size
+            grid_size=grid_size,
+            positional_embeddings_used=positional_embeddings_used,
         )
 
         self.decoder = Decoder(
@@ -274,9 +299,11 @@ class Autoencoder(nn.Module):
     
 ### Variational Autoencoder that combines the VariationalEncoder and Decoder
 class VariationalAutoencoder(nn.Module):
-    def __init__(self, latent_dims, image_size=128, hidden_channels=32, grid_size=16):
+    def __init__(self, latent_dims, image_size=128, hidden_channels=32, grid_size=16,
+                 positional_embeddings_used=True):
         super().__init__()
-        self.encoder = VariationalEncoder(latent_dims, image_size, hidden_channels, grid_size)
+        self.encoder = VariationalEncoder(latent_dims, image_size, hidden_channels, grid_size,
+                                           positional_embeddings_used=positional_embeddings_used)
         self.decoder = Decoder(
             latent_dims,
             feat_shape=self.encoder.feat_shape,

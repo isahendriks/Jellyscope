@@ -71,6 +71,7 @@ print("Loading segmentation models (AE + scorer)...")
 seg_model, scorer, scorer_threshold, seg_grid_size, seg_image_size = seg_models.load_segmentation_models(
     config.SEGMENTATION_AE_MODEL_PATH, config.SEGMENTATION_SCORER_MODEL_PATH,
     config.SEGMENTATION_ENCODER_TYPE, device,
+    positional_embeddings_used=config.POSITIONAL_EMBEDDINGS_USED,
 )
 seg_model.eval()
 scorer.eval()

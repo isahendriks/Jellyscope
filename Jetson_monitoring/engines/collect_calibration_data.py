@@ -86,6 +86,7 @@ print("Loading FP32 AE + scorer (the correct calibration reference -- calibratin
 seg_model_fp32, scorer_fp32, scorer_threshold, seg_grid_size, seg_image_size = seg_models.load_segmentation_models(
     config.SEGMENTATION_AE_MODEL_PATH, config.SEGMENTATION_SCORER_MODEL_PATH,
     config.SEGMENTATION_ENCODER_TYPE, device,
+    positional_embeddings_used=config.POSITIONAL_EMBEDDINGS_USED,
 )
 seg_model_fp32.eval()
 

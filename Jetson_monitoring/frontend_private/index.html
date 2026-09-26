@@ -1,17 +1,7 @@
 <!DOCTYPE html>
 <!--
-  Jellyscope private dashboard -- the page skeleton only.
+  Jellyscope private dashboard
 
-  This file just says WHAT is on the page and WHERE (structure). It does not contain
-  any of the actual numbers/temperatures/etc -- those get filled in by status.js and
-  media.js after the page loads, by asking the Python backend (analyse.py) for the
-  latest data. See README.md in this folder for the full explanation of how the
-  pieces fit together, and status.js for where each <section> below gets its content.
-
-  Every element below that JS needs to find and update has a stable `id` -- that's
-  the connection between this file and status.js/media.js. If you rename an id here,
-  update the matching `getElementById(...)` call in the JS too, or that piece of the
-  page will silently stop updating.
 -->
 <html lang="en">
 <head>
@@ -21,21 +11,45 @@
 </head>
 <body>
 
-  <!-- The current camera frame, refreshed a few times a second by media.js.
-       Hidden automatically (see status.js) while the pipeline is in "backlog" mode,
-       since there's nothing live to show then. -->
-  <img id="videoFrame" alt="Live camera frame">
-  <div id="livestreamBadge">LIVESTREAM</div>
-
-  <!-- Everything else lives in this one column, pinned to the top-left. -->
-  <div id="topLeftColumn">
-
-    <!-- Thumbnail strip of the most recently identified crops (jellyfish sightings). -->
-    <div id="cropsPanel" class="panel">
-      <div class="panel-title">LAST CROPS</div>
-      <img id="cropsStrip" alt="Recent labeled crops">
-      <span id="cropsPlaceholder">Waiting for labeled crops...</span>
+  <!-- Right-hand pane: every camera-derived view, one at a time, switched via the
+       tab bar -- "Preprocessed" (the fully-processed, boxed/labeled frame, post
+       dark-frame/median-blur/gamma/CLAHE -- the "official" output SEGMENT actually
+       runs on), the biofouling EMA background-subtraction debug views
+       (background_model.py -- "Raw"/"Background"/"Raw - Background": the raw
+       pre-PREPROCESS camera frame, the learned background estimate, and raw minus
+       background -- all still pre-CLAHE, none of them boxed), and "Crops" (just the
+       individual detection thumbnails, tiled). Scaled to fill whatever space the
+       sidebar (below) leaves it -- see style.css's LAYOUT section for why this is a
+       real grid column instead of a full-screen background with the sidebar
+       floating on top of it, which is what let the two overlap before. Whole pane
+       hidden (see status.js) while the pipeline is in "backlog" mode, since there's
+       nothing live to show then. The three background-model tabs
+       (data-view="original"/"background"/"subtracted") are further hidden
+       individually when config.BG_SUB_ENABLED is False on the backend, since those
+       endpoints don't produce anything in that case; "Preprocessed"/"Crops" always
+       work in live mode regardless. Only the active tab's image is actually polled
+       by media.js -- see its comment for why. -->
+  <div id="videoPane">
+    <div id="liveTabs">
+      <button class="liveTab active" data-view="livestream">Preprocessed</button>
+      <button class="liveTab" data-view="raw">Raw camera</button>
+      <button class="liveTab bgModelTab" data-view="background">Background</button>
+      <button class="liveTab bgModelTab" data-view="subtracted">Raw - Background</button>
+      <button class="liveTab" data-view="crops">Crops</button>
     </div>
+    <!-- Wraps the image so #livestreamBadge (below) can anchor to the image area
+         specifically -- anchoring it to #videoPane itself instead would overlap
+         #liveTabs above, since both would then be positioned from the same
+         top-right corner. -->
+    <div id="liveViewContainer">
+      <img id="liveViewImage" alt="Live view">
+      <span id="liveViewPlaceholder">Waiting for data...</span>
+      <div id="livestreamBadge">LIVESTREAM</div>
+    </div>
+  </div>
+
+  <!-- Left-hand pane: just the status box, in its own scrollable column. -->
+  <div id="topLeftColumn">
 
     <!-- The main status box: seven sections, each an empty container today.
          status.js fills each one's innerHTML once a second from /status's JSON.
@@ -46,6 +60,7 @@
       <div class="panel-title">METADATA</div>
       <section id="header"></section>
       <section id="backlog"></section>
+      <section id="manualDrain"></section>
       <section id="queue"></section>
       <section id="leak"></section>
       <section id="environmental"></section>
@@ -61,5 +76,34 @@
        matter functionally, but this keeps "simple file first" as the reading order. -->
   <script src="media.js"></script>
   <script src="status.js"></script>
+  <script>
+  // TEMP debug: bypass fetch('/status') (headless test quirk) with fake data so
+  // rendering/alignment can be checked visually. Remove before shipping.
+  setTimeout(function() {
+    var d = {
+      time: "14:32:10", system_mode: "live", total_backlog: 0,
+      last_recorded_unix: Date.now()/1000 - 4, last_analysed_unix: Date.now()/1000 - 4,
+      last_analysed_crops: 1, crops_last_24h: 3667, frame_skip: 2,
+      avg_processing_time_s: 1.0, que_crops_depth: 3, que_fullframes_depth: 0,
+      leak_detected: false, bme280_humidity_pct: 41.65, dew_point_c: 14.5,
+      bar3xt_pressure_mbar: 1011.6, bar3xt_depth_m: 1.0, bar3xt_temp_c: 17.5, ds18b20_temp_c: 22.9,
+      bme280_pressure_mbar: 1029.5, bme280_temp_c: 26.1,
+      camera_temp_c: 49.5, camera_max_temp_c: 65.0,
+      strobe_converter_temp_c: 37.4, strobe_driver_temp_c: 26.1, strobe_max_temp_c: 90.0,
+      jetson_temp_c_mean: 49.8, jetson_max_temp_c: 99.0,
+      cpu_percent: 15.65, gpu_percent_mean: 30.48, gpu_percent_max: 99.85,
+      disk_root: 3.18, disk_ssd1: 232.6,
+      send_alive: true, consecutive_upload_failures: 0,
+      last_success_age_s: 4, upload_speed_bps: 1900,
+      link_speed_bps: 500600, link_speed_probed_age_s: 87,
+    };
+    document.getElementById("header").innerHTML = renderHeader(d);
+    document.getElementById("queue").innerHTML = renderQueue(d);
+    document.getElementById("leak").innerHTML = renderLeak(d);
+    document.getElementById("environmental").innerHTML = renderEnvironmental(d);
+    document.getElementById("device").innerHTML = renderDevice(d);
+    document.getElementById("connection").innerHTML = renderConnection(d);
+  }, 500);
+  </script>
 </body>
 </html>

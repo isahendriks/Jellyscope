@@ -116,6 +116,18 @@ INTERNAL_TEMP_SANE_RANGE_C = (-10.0, 60.0)   # samples outside this are discarde
                                     # and any other garbled serial line - any of these would
                                     # otherwise blow up the T_ref/T(t) correction and wreck
                                     # both the fitted slope and the plot's y-scale.
+INTERNAL_PRESSURE_SANE_RANGE_HPA = (300.0, 1100.0)   # CHECK THIS for your setup - from
+                                    # the deepest vacuum your pump can pull up to a bit above
+                                    # sea-level ambient. Samples outside this are discarded
+                                    # before the leak-rate fit, same reasoning as the temp
+                                    # range above: an occasional garbled serial line (dropped/
+                                    # corrupted digit) otherwise injects a raw single-sample
+                                    # outlier straight into the temp-corrected trace and fit,
+                                    # since nothing else validates the pressure fields.
+EXTERNAL_PRESSURE_SANE_RANGE_HPA = (800.0, 1100.0)   # CHECK THIS for your site - the
+                                    # Bar3XT ambient reading should stay close to local
+                                    # sea-level-adjusted atmospheric pressure; same purpose
+                                    # as above, since it also feeds the deficit/fit.
 STREAM_PORT = 8081                 # browse to http://<this-host>:8081/ (or SSH -L 8081:localhost:8081)
 
 serial_port = config.METRO_M0_SERIAL_PORT
@@ -233,12 +245,17 @@ def compute_leak_rate():
                   if t >= test_start_t + SETTLE_TIME_S and not np.isnan(temp)]
 
     temp_lo, temp_hi = INTERNAL_TEMP_SANE_RANGE_C
-    pts = [pt for pt in candidates if temp_lo <= pt[2] <= temp_hi]
-    n_rejected_temp = len(candidates) - len(pts)
+    p_int_lo_pa, p_int_hi_pa = (v * 100.0 for v in INTERNAL_PRESSURE_SANE_RANGE_HPA)
+    p_ext_lo_pa, p_ext_hi_pa = (v * 100.0 for v in EXTERNAL_PRESSURE_SANE_RANGE_HPA)
+    pts = [pt for pt in candidates
+           if temp_lo <= pt[2] <= temp_hi
+           and p_int_lo_pa <= pt[1] <= p_int_hi_pa
+           and p_ext_lo_pa <= pt[3] <= p_ext_hi_pa]
+    n_rejected = len(candidates) - len(pts)
 
     if len(pts) < 5:
         return {"verdict": "COLLECTING", "n_points": len(pts),
-                "n_rejected_temp": n_rejected_temp}
+                "n_rejected": n_rejected}
 
     t_arr = np.array([p[0] for p in pts])
     p_arr = np.array([p[1] for p in pts])
@@ -290,7 +307,7 @@ def compute_leak_rate():
     return {
         "verdict": "PASS" if passed else "FAIL",
         "n_points": len(pts),
-        "n_rejected_temp": n_rejected_temp,
+        "n_rejected": n_rejected,
         "n_in_fit_window": int(fit_mask.sum()),
         "fit_kind": fit_kind,
         "test_duration_min": (t_arr[-1] - test_start_t) / 60.0,

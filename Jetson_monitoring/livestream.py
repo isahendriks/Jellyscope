@@ -24,8 +24,8 @@ image_type = "png"
 #SAVE_PATH = "/media/jellyfish/PortableSSD/Training_data/Luidia_sarsia"
 
 IMG_NAME_PREFIX = "img_"
-
-ENABLE_SAVE = True
+FRAME_SKIP_LOCAL = 3
+ENABLE_SAVE = False
 if ENABLE_SAVE:
     # Check if the save path exists, if not create it
     if not os.path.exists(SAVE_PATH):
@@ -277,7 +277,7 @@ try:
 
         time_counter += 1
 
-        if time_counter % config.FRAME_SKIP != 0:
+        if time_counter % FRAME_SKIP_LOCAL != 0:
             image.dispose()
             continue
 

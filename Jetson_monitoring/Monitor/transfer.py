@@ -131,15 +131,28 @@ def ensure_remote_dir(remote_subdir: str, timeout_s: int = SSH_CONNECT_TIMEOUT_S
         pass
 
 
-def scp_upload(local_paths: list[str], remote_subdir: str, timeout_s: int = UPLOAD_TIMEOUT_S) -> bool:
+def scp_upload(local_paths: list[str], remote_subdir: str, timeout_s: int = UPLOAD_TIMEOUT_S,
+                bandwidth_limit_kbps: int | None = None) -> bool:
     """Upload a batch of local files to REMOTE_HOST:REMOTE_BASE/remote_subdir/ over
-    SSH via scp. Returns True only if scp exits 0 (all files confirmed transferred)."""
+    SSH via scp. Returns True only if scp exits 0 (all files confirmed transferred).
+
+    bandwidth_limit_kbps caps this call's own share of the link via scp's -l (Kbit/s,
+    scp's own unit -- not KB/s). None (the default, used by send.py/metadata.py's
+    real-time uploads) leaves it unthrottled. Added for backlog_drain.py: that script's
+    batches share both the physical field link AND the multiplexed SSH ControlMaster
+    connection (_CONTROL_PATH above) with send.py's live uploads and anyone viewing the
+    dashboard over Tailscale, and its transfers are big/sustained enough to starve both
+    -- see the 2026-08-17 incident where a drain run collapsed send.py's own upload
+    speed to ~585 B/s and made the live-stream page unusable remotely. -l throttles this
+    scp process's own write rate onto the (possibly shared) channel, so it still applies
+    even when multiplexed."""
     global _last_attempt_unix, _last_attempt_ok, _last_success_unix, _last_speed_bps, _consecutive_failures
     if not local_paths:
         return True
     ensure_remote_dir(remote_subdir, timeout_s=min(timeout_s, SSH_CONNECT_TIMEOUT_S + 5))
     remote_dest = f"{REMOTE_HOST}:{REMOTE_BASE}/{remote_subdir}/"
-    cmd = ["scp", *_SSH_OPTS, *local_paths, remote_dest]
+    limit_opts = ["-l", str(bandwidth_limit_kbps)] if bandwidth_limit_kbps else []
+    cmd = ["scp", *_SSH_OPTS, *limit_opts, *local_paths, remote_dest]
     # Measured before the subprocess call -- a file could in principle be gone by the time
     # scp reads it (queue_io guarantees these are stable, but stat() failing shouldn't ever
     # take the whole upload down over a metrics side-channel), hence the try/except.
@@ -227,14 +240,16 @@ def probe_link_speed(timeout_s: int = UPLOAD_TIMEOUT_S) -> float | None:
 
 def upload_with_retry(local_paths: list[str], remote_subdir: str,
                        max_retries: int = 6, base_delay: float = 2.0, max_delay: float = 120.0,
-                       timeout_s: int = UPLOAD_TIMEOUT_S) -> bool:
+                       timeout_s: int = UPLOAD_TIMEOUT_S, bandwidth_limit_kbps: int | None = None) -> bool:
     """Exponential backoff with jitter. Returns True on eventual success, False if
     all in-cycle retries are exhausted (caller decides whether to leave items
     queued for the next polling cycle, per the queue's crash-safe contract).
     timeout_s defaults to UPLOAD_TIMEOUT_S but is overridable per call -- e.g.
-    send.py's much larger training-frame uploads use a longer one."""
+    send.py's much larger training-frame uploads use a longer one. bandwidth_limit_kbps
+    just threads through to scp_upload() -- see its docstring."""
     for attempt in range(max_retries):
-        if scp_upload(local_paths, remote_subdir, timeout_s=timeout_s):
+        if scp_upload(local_paths, remote_subdir, timeout_s=timeout_s,
+                       bandwidth_limit_kbps=bandwidth_limit_kbps):
             return True
         if attempt < max_retries - 1:
             delay = min(max_delay, base_delay * (2 ** attempt)) * (0.8 + 0.4 * random.random())

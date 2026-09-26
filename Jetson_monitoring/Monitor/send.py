@@ -6,6 +6,7 @@ crash-safety contract).
 """
 
 import json
+import os
 import shutil
 import time
 from pathlib import Path
@@ -34,6 +35,15 @@ crops_sent_total = 0
 crops_archived_oversized_total = 0
 training_frames_sent_total = 0
 
+# Running total of OVERSIZED_CROPS_DIR's size, tracked incrementally (archive_oversized()
+# adds each newly-moved file's size, prune_oversized_if_needed() subtracts what it
+# deletes) rather than re-listed from disk on every check -- that directory lives on the
+# same exFAT mount que_crops's incoming/ does, where a full listing scales with total
+# entries (tens of thousands here), the exact re-listing cost the 2026-08-03 incident
+# already taught this codebase to avoid (see crop_backlog's own module comment below).
+# Seeded once at startup via scan_oversized_crops_dir(), see bottom of file.
+_oversized_crops_dir_bytes = 0
+
 
 def write_heartbeat() -> None:
     now = time.time()
@@ -42,6 +52,7 @@ def write_heartbeat() -> None:
         "last_update_unix": now,  # what metadata.py's staleness check actually uses
         "crops_sent_total": crops_sent_total,
         "crops_archived_oversized_total": crops_archived_oversized_total,
+        "oversized_crops_dir_bytes": _oversized_crops_dir_bytes,
         "que_crops_failed": queue_io.failed_count(config.QUE_CROPS),
         "training_frames_sent_total": training_frames_sent_total,
         "que_training_frames_failed": queue_io.failed_count(config.QUE_TRAINING_FRAMES),
@@ -53,6 +64,60 @@ def write_heartbeat() -> None:
     tmp.replace(HEARTBEAT_PATH)
 
 
+def scan_oversized_crops_dir() -> int:
+    """Full listing of OVERSIZED_CROPS_DIR's current total size -- only ever called once
+    at startup and (rarely) from prune_oversized_if_needed() below, since everywhere else
+    that total is tracked incrementally rather than by re-listing this (large, exFAT)
+    directory -- see _oversized_crops_dir_bytes' module comment."""
+    total = 0
+    with os.scandir(config.OVERSIZED_CROPS_DIR) as it:
+        for entry in it:
+            if entry.is_file():
+                total += entry.stat().st_size
+    return total
+
+
+def prune_oversized_if_needed() -> None:
+    """Once OVERSIZED_CROPS_DIR's running total crosses OVERSIZED_CROPS_MAX_BYTES,
+    deletes the oldest archived crops (by file mtime -- archive_oversized()'s shutil.move
+    preserves the original crop's mtime, itself close to its capture time) down to
+    OVERSIZED_CROPS_PRUNE_TARGET_BYTES. Deletes each crop's .png and its .json sidecar as
+    they're encountered, not paired up first -- both share the same stat()-sortable mtime
+    (moved together, microseconds apart) so oldest-first order interleaves them close
+    enough that a partial run (e.g. hitting the target mid-pair) never leaves more than a
+    handful of orphaned sidecars behind, not worth the extra bookkeeping to prevent
+    entirely. See config.OVERSIZED_CROPS_MAX_BYTES's comment for why deleting the oldest
+    ones first is safe here."""
+    global _oversized_crops_dir_bytes
+    if _oversized_crops_dir_bytes <= config.OVERSIZED_CROPS_MAX_BYTES:
+        return
+
+    entries = []
+    with os.scandir(config.OVERSIZED_CROPS_DIR) as it:
+        for entry in it:
+            if entry.is_file():
+                st = entry.stat()
+                entries.append((st.st_mtime, entry.path, st.st_size))
+    entries.sort(key=lambda e: e[0])
+
+    to_free = _oversized_crops_dir_bytes - config.OVERSIZED_CROPS_PRUNE_TARGET_BYTES
+    freed = 0
+    deleted = 0
+    for _mtime, path, size in entries:
+        if freed >= to_free:
+            break
+        try:
+            os.remove(path)
+        except OSError:
+            continue
+        freed += size
+        deleted += 1
+    _oversized_crops_dir_bytes -= freed
+    print(f"[send] oversized_crops/ passed {config.OVERSIZED_CROPS_MAX_BYTES / 1e9:.0f}GB -- "
+          f"pruned {deleted} oldest file(s), freed {freed / 1e9:.2f}GB "
+          f"(now {_oversized_crops_dir_bytes / 1e9:.2f}GB)")
+
+
 def archive_oversized(claimed: list[tuple[str, Path, Path]]) -> list[tuple[str, Path, Path]]:
     """Splits an oversized crop (see config.MAX_CROP_UPLOAD_BYTES's docstring) out of a
     just-claimed batch and moves it straight to OVERSIZED_CROPS_DIR instead of letting it
@@ -60,8 +125,9 @@ def archive_oversized(claimed: list[tuple[str, Path, Path]]) -> list[tuple[str, 
     transfer inside UPLOAD_TIMEOUT_S, and since scp uploads a batch in one shot, that
     stalls every normal crop queued behind it too (que_crops is strict FIFO). Returns
     whatever's left of `claimed` for the normal upload path below."""
-    global crops_archived_oversized_total
+    global crops_archived_oversized_total, _oversized_crops_dir_bytes
     normal = []
+    archived_any = False
     for item in claimed:
         stem, image_path, json_path = item
         size = image_path.stat().st_size
@@ -71,9 +137,14 @@ def archive_oversized(claimed: list[tuple[str, Path, Path]]) -> list[tuple[str, 
         print(f"[send] {stem} is {size / 1e6:.1f}MB (over "
               f"{config.MAX_CROP_UPLOAD_BYTES / 1e6:.0f}MB) -- archiving to "
               f"{config.OVERSIZED_CROPS_DIR} instead of uploading")
+        json_size = json_path.stat().st_size
         shutil.move(str(image_path), str(config.OVERSIZED_CROPS_DIR / image_path.name))
         shutil.move(str(json_path), str(config.OVERSIZED_CROPS_DIR / json_path.name))
         crops_archived_oversized_total += 1
+        _oversized_crops_dir_bytes += size + json_size
+        archived_any = True
+    if archived_any:
+        prune_oversized_if_needed()
     return normal
 
 
@@ -168,6 +239,9 @@ queue_io.ensure_queue_dirs(config.QUE_CROPS)
 queue_io.ensure_queue_dirs(config.QUE_TRAINING_FRAMES)
 config.HEARTBEAT_DIR.mkdir(parents=True, exist_ok=True)
 config.OVERSIZED_CROPS_DIR.mkdir(parents=True, exist_ok=True)
+_oversized_crops_dir_bytes = scan_oversized_crops_dir()
+print(f"[send] oversized_crops/ currently {_oversized_crops_dir_bytes / 1e9:.2f}GB")
+prune_oversized_if_needed()
 
 if not transfer.preflight_check():
     print("Preflight SSH check failed -- send.py will keep retrying, but nothing "
@@ -250,8 +324,10 @@ while True:
         transfer.probe_link_speed()
         last_link_speed_probe_unix = time.time()
 
-    if not crop_backlog:
+    if config.CROP_UPLOAD_ENABLED and not crop_backlog:
         crop_backlog = queue_io.list_ready_stems(config.QUE_CROPS)
+    elif not config.CROP_UPLOAD_ENABLED:
+        crop_backlog = []
     if not training_backlog:
         training_backlog = queue_io.list_ready_stems(config.QUE_TRAINING_FRAMES)
 
@@ -264,7 +340,7 @@ while True:
         time.sleep(POLL_INTERVAL_S)
         continue
 
-    if crop_backlog:
+    if config.CROP_UPLOAD_ENABLED and crop_backlog:
         batch, crop_backlog = crop_backlog[:crop_batch_size], crop_backlog[crop_batch_size:]
         result = process_batch(batch)
         if result is True:
