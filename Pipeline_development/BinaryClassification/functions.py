@@ -978,7 +978,8 @@ class BackgroundTiles:
     training or a running background from live monitoring. Crops are cached per position.
     """
     def __init__(self, bkg_image, grid_size=16, image_size=128):
-        bkg_image = bkg_image.numpy() if isinstance(bkg_image, torch.Tensor) else np.asarray(bkg_image)
+        # .cpu(): torch.load(map_location=cuda) puts the checkpoint's bkg_image on the GPU
+        bkg_image = bkg_image.cpu().numpy() if isinstance(bkg_image, torch.Tensor) else np.asarray(bkg_image)
         if bkg_image.shape != (4512, 4512):
             raise ValueError(f"Expected a 4512x4512 grayscale background, got {bkg_image.shape}")
         self.bkg_image = bkg_image
