@@ -213,6 +213,14 @@ last_live_frame_mtime = None  # analyse.py overwrites config.LIVE_FRAME_PATH (an
 # when analyse.py hasn't produced a new one yet.
 
 while True:
+    if not config.ENABLE_UPLOADS:
+        # Uploads paused (config.ENABLE_UPLOADS) -- keep heartbeating so send.py
+        # doesn't look "down", but don't touch live-frame/crop/training-frame
+        # uploads at all; everything just queues up locally until re-enabled.
+        write_heartbeat()
+        time.sleep(POLL_INTERVAL_S)
+        continue
+
     # Not gated behind crop_backlog/training_backlog like the two loops below --
     # this needs to keep running through idle cycles too, same reasoning as the
     # link-speed probe just above.

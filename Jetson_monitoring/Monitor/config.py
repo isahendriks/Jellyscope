@@ -336,7 +336,10 @@ RECENT_CROPS_CAPTION_PX = 22  # height of the white-on-black class-label band un
 ### Remote server (Tailscale)
 ### ==========================
 REMOTE_HOST = "server-lab"
-REMOTE_BASE = "jellyscope_incoming"  # relative to the SSH user's home on the remote host
+REMOTE_BASE = "Faro_260925_ongoing"  # relative to the SSH user's home on the remote host --
+# named after the camera's current deployment (site_startdate_status); update this whenever
+# the camera moves to a new deployment location so uploads land in a folder matching where
+# the data actually came from, instead of mixing multiple deployments into one folder
 SSH_CONNECT_TIMEOUT_S = 10
 UPLOAD_TIMEOUT_S = 60
 TRAINING_FRAME_UPLOAD_TIMEOUT_S = 180  # full frames (4512x4512) are far bigger than crops --
@@ -344,6 +347,16 @@ TRAINING_FRAME_UPLOAD_TIMEOUT_S = 180  # full frames (4512x4512) are far bigger 
 # of these over a flaky 5G/Tailscale link before it genuinely finishes
 MAX_UPLOAD_RETRIES_PER_CYCLE = 6      # exponential-backoff attempts within one polling cycle
 MAX_UPLOAD_ATTEMPTS_TOTAL = 50        # escalate an item to failed/ past this many cycle-level attempts
+
+# Kill switch for send.py's uploads to server-lab (crops, training frames, live frame
+# preview) -- flip to False to pause all of it, e.g. while the deployment location is
+# unsettled or the remote folder is being renamed. Capture/segment/classify keep running
+# unaffected: crops and training frames just pile up in their local queues (que_crops,
+# que_training_frames) instead of being uploaded, and nothing is lost -- send.py drains
+# the backlog normally once this goes back to True. Does NOT affect metadata.py's own
+# device-health/environmental uploads or heartbeats, which keep going either way so the
+# device stays remotely monitorable.
+ENABLE_UPLOADS = True
 
 ### ==========================
 ### Heartbeats (metadata.py only ever reads these; each stage writes its own)
