@@ -36,7 +36,7 @@ from sklearn.covariance import LedoitWolf
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from functions import Autoencoder, VariationalAutoencoder, OneClassScorer, TwoClassScorer, image_pipeline_df, load_tiles_from_paths_fast, preprocess_tile, MahalanobisScorer
+from functions import Autoencoder, BackgroundTiles, deploy_checkpoint_to_jetson, VariationalAutoencoder, OneClassScorer, TwoClassScorer, image_pipeline_df, load_tiles_from_paths_fast, preprocess_tile, MahalanobisScorer
 
 print("="*70)
 print("Training Neural Network Scorer - Binary Mode (Both Classes)")
@@ -71,10 +71,10 @@ print(f"Using device:      {device}")
 #%% Configuration and Hyperparameters
 
 # Configuration
-ROOT_DIR_C = r"C:\Users\Admin\Documents\Jellyscope\Training data new\Binary_classifier"   
+ROOT_DIR_C = r"C:\Users\IsaH\Documents\Jellyscope\Training data new\Binary_classifier"   
 ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data new\Binary_classifier"
 
-monitoring_effort = "Kristineberg_260730"
+monitoring_effort = "Faro_260926"  # for titles and saved model names, e.g. "kristineberg_251128"
 grid_size = 16
 tile_size = int(4512/grid_size)
 image_size_vae = 128
@@ -108,14 +108,20 @@ if encoder == "VAE":
     encoder_model.to(device)
     encoder_model.eval()
 elif encoder == "AE":
-    encoder_model = Autoencoder(latent_dims=latent_dims, image_size=image_size, hidden_channels=hidden_channels, grid_size=grid_size)
+    encoder_model = Autoencoder(latent_dims=latent_dims, image_size=image_size, hidden_channels=hidden_channels, grid_size=grid_size,
+                                output_activation=checkpoint.get("output_activation", "sigmoid"))
     encoder_model.load_state_dict(checkpoint["model_state_dict"])
     encoder_model.to(device)
     encoder_model.eval()
 else:
     raise ValueError(f"Invalid encoder type: {encoder}. Must be 'vae' or 'ae'.")
 
-print(f"Loaded {encoder} model with latent_dim={latent_dims}, grid_size={grid_size}")
+# Residual AE checkpoints (train_AE.py) were trained on tile - background crop, and store the
+# background they used. Older checkpoints have no "residual" key and see raw tiles as before.
+residual = checkpoint.get("residual", False)
+bkg_tiles = BackgroundTiles(checkpoint["bkg_image"], grid_size=grid_size, image_size=image_size) if residual else None
+
+print(f"Loaded {encoder} model with latent_dim={latent_dims}, grid_size={grid_size}, residual={residual}")
 
 #%% Load training data
 tiles_path = os.path.join(ROOT_DIR_R, monitoring_effort, "train_scorer", f"tiles{grid_size}_offsets{len(offsets_normalized)}")
@@ -147,6 +153,12 @@ images_tensor, rows_tensor, cols_tensor, labels_tensor = cast(
     tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     image_pipeline_df(df_train_tiles, input_image_size_vae=image_size, include_labels=True),
 )
+
+# Subtract the background here, before augmentation: rotating/deforming a tile and then
+# subtracting an unrotated background would add a mismatch error to augmented obs tiles only.
+if bkg_tiles is not None:
+    print(f"Subtracting background from {len(images_tensor)} tiles (residual AE)...")
+    bkg_tiles.subtract_(images_tensor, rows_tensor, cols_tensor)
 
 #%% Create TensorDataset
 dataset = TensorDataset(images_tensor, rows_tensor, cols_tensor, labels_tensor)  # Convert to TensorDataset for DataLoader
@@ -1213,21 +1225,8 @@ else:
     raise ValueError(f"Invalid mode: {mode}. Cannot load model.")
 
 #%% Deploy scorer checkpoint to the Jetson
-JETSON_MODELS_DIR = "jellyfish@jellyscope:/home/jellyfish/Github/Jellyscope/Jetson_monitoring/models"
-# BatchMode=yes so a first-time host-key prompt or a password/passphrase request fails fast
-# instead of scp hanging forever waiting for input nothing will ever supply (matches
-# Jetson_monitoring/Monitor/transfer.py's own SSH options).
-SCP_SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"]
+# Copied as <scorer name>_<DEPLOY_TAG>.pth, so it never replaces a model the Jetson is running.
+# Use the same tag as the AE it was trained on (train_AE.py's DEPLOY_TAG).
+DEPLOY_TAG = "residual_v1"
 
-try:
-    scp_result = subprocess.run(
-        ["scp", *SCP_SSH_OPTS, scorer_model_name, JETSON_MODELS_DIR],
-        capture_output=True, text=True, timeout=120,
-    )
-    if scp_result.returncode == 0:
-        print(f"✓ Copied {Path(scorer_model_name).name} to {JETSON_MODELS_DIR}")
-    else:
-        print(f"scp failed (exit {scp_result.returncode}): {scp_result.stderr.strip()}")
-except subprocess.TimeoutExpired:
-    print("scp timed out after 120s -- check that SSH key auth to jellyfish@jellyscope works "
-          "non-interactively (test with: ssh -o BatchMode=yes jellyfish@jellyscope whoami)")
+deploy_checkpoint_to_jetson(scorer_model_name, tag=DEPLOY_TAG)

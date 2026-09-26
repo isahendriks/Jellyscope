@@ -8,7 +8,6 @@ import sys
 from time import time
 
 import cv2
-from matplotlib.pylab import copy 
 from copy import deepcopy
 import numpy as np
 
@@ -21,7 +20,7 @@ from tqdm.auto import tqdm
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from functions import Autoencoder, image_pipeline_df, load_tiles_from_paths_fast, preprocess_tile
+from functions import Autoencoder, BackgroundTiles, deploy_checkpoint_to_jetson, image_pipeline_df, load_tiles_from_paths_fast, preprocess_tile
 
 torch.manual_seed(0)
 plt.rcParams["figure.dpi"] = 200
@@ -56,7 +55,7 @@ print(f"Using device:      {device}")
 #%% Set parameters and paths
 
 ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data new\Binary_classifier"
-ROOT_DIR_C = r"C:\Users\Admin\Documents\Jellyscope\Training data\Binary_classifier"   
+ROOT_DIR_C = r"C:\Users\IsaH\Documents\Jellyscope\Training data new\Binary_classifier"   
 
 SAMPLE_IMAGE_IDX_TRAIN = 0 # Index of the sample image to plot process (0-based)
 
@@ -65,7 +64,7 @@ DEBUG = False
 N_DEBUG = 5000
 EPOCHS_DEBUG = 10
 
-monitoring_effort = "Kristineberg_260730"  # for titles and saved model names, e.g. "kristineberg_251128" 
+monitoring_effort = "Faro_260926"  # for titles and saved model names, e.g. "kristineberg_251128" 
 grid_size = 16  # number of tiles along one side (e.g. 6 means 6x6=36 tiles per image)
 offsets_normalized = [0.0, 0.2, 0.4, 0.6, 0.8]  # List of normalized offsets [0.0, 0.2, 0.4, 0.6, 0.8] creates crops at 0%, 20%, 40%, 60%, 80% offset; set to [] or [0.0] to disable offset cropping (single crop per tile)
 
@@ -74,8 +73,8 @@ image_size = 128
 latent_dims = 64
 hidden_channels = 32
 
-train_tiles_path = os.path.join(ROOT_DIR_R, monitoring_effort, "train_encoder", f"tiles{grid_size}_offsets{len(offsets_normalized)}", "no_obs")
-train_og_images_path = os.path.join(ROOT_DIR_R, monitoring_effort, "train_encoder", "OG_images", "no_obs")
+train_tiles_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train_encoder", f"tiles{grid_size}_offsets{len(offsets_normalized)}", "no_obs")
+train_og_images_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train_encoder", "OG_images")
 
 print(f"train_tiles_path: {train_tiles_path}")
 print(f"train_og_images_path: {train_og_images_path}")
@@ -99,7 +98,7 @@ model_output_path.parent.mkdir(parents=True, exist_ok=True)
 batch_size = 128
 learning_rate = 1e-4 * (batch_size / 64)  # scale learning rate with batch size
 epochs = 50
-warmup_epochs = 25  # Number of epochs to linearly increase learning rate (helps stabilize early training)
+warmup_epochs = 2  # Number of epochs to linearly increase learning rate (helps stabilize early training); early stopping only counts after this
 patience = 5  # Number of epochs to wait for improvement before early stopping
 
 if DEBUG:
@@ -146,6 +145,14 @@ df_train_tiles = load_tiles_from_paths_fast(train_tiles, include_labels=False, t
 
 print(f"Applying image pipeline to training tiles and creating dataset...")
 images_tensor, rows_tensor, cols_tensor = image_pipeline_df(df_train_tiles, input_image_size_vae=image_size)  # type: ignore # Create dataset with preprocessing pipeline applied to each tile
+
+# Residual AE: subtract the mean background at each tile's position, so the AE only has to
+# model what differs from the background ("predict the background" is then residual 0).
+# Brightness is kept, relative to the background. In place, to avoid a second copy of the tiles.
+print(f"Subtracting mean background from {len(images_tensor)} tiles...")
+bkg_tiles = BackgroundTiles(img_bkg, grid_size=grid_size, image_size=image_size)
+bkg_tiles.subtract_(images_tensor, rows_tensor, cols_tensor)
+print(f"Residual range: [{images_tensor.min().item():.3f}, {images_tensor.max().item():.3f}], mean {images_tensor.mean().item():.2e}")
 
 print(f"Dataset created: images tensor shape: {images_tensor.shape}, rows tensor shape: {rows_tensor.shape}, cols tensor shape: {cols_tensor.shape}")
 # Split into train and val sets 
@@ -269,9 +276,12 @@ N_ver = 3 #int(N_hor/2)
 
 plot_grid = (N_ver, N_hor)
 
+# Tiles are residuals (tile - background) now: symmetric scale, grey = background, white = brighter
+v_res = sample_images[:N_hor * N_ver].abs().max().item()
+
 fig, axs = plt.subplots(plot_grid[0], plot_grid[1], figsize=(plot_grid[1]*1.2, plot_grid[0]*1.2))
 for idx, ax in enumerate(axs.flatten()):
-    ax.imshow(sample_images[idx].squeeze(), cmap='gray', vmin=0, vmax=1)
+    ax.imshow(sample_images[idx].squeeze(), cmap='gray', vmin=-v_res, vmax=v_res)
     ax.axis('off')
 # plt.tight_layout()
 # plt.suptitle(f"Example Training Images from {'/'.join(train_og_images_path.split(os.sep)[-3:])}", fontsize=16, fontweight="bold")
@@ -287,7 +297,8 @@ model = Autoencoder(
         latent_dims = latent_dims,
         image_size = image_size,
         hidden_channels = hidden_channels,
-        grid_size = grid_size
+        grid_size = grid_size,
+        output_activation = "linear",  # residuals (tile - background) go negative, so no sigmoid
     ).to(device)
 
 opt = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -303,13 +314,12 @@ epoch_val_losses, step_val_losses = [], []
 best_val_loss = float("inf")
 patience_counter = 0
 
-model.train()
-
 n_batches = len(train_loader)
 start_time = time()
 
 for epoch in range(epochs):
     print(f"Epoch {epoch + 1}/{epochs}")
+    model.train()  # every epoch: the val pass below switches to eval mode
 
     # Learning rate warmup
     if epoch < warmup_epochs:
@@ -362,14 +372,15 @@ for epoch in range(epochs):
     avg_epoch_time = (time() - start_time) / (epoch + 1)
     expected_time_remaining = avg_epoch_time * (epochs - epoch - 1)
     
-    print(f"  loss={epoch_losses[-1]:.3f}, val_loss={epoch_val_losses[-1]:.3f}, average epoch time: {avg_epoch_time:.1f}s, expected time remaining: {int(expected_time_remaining // 60)}m {int(expected_time_remaining % 60)}s ")
+    print(f"  loss={epoch_losses[-1]:.3e}, val_loss={epoch_val_losses[-1]:.3e}, average epoch time: {avg_epoch_time:.1f}s, expected time remaining: {int(expected_time_remaining // 60)}m {int(expected_time_remaining % 60)}s ")
     
     # Add patience early stopping
     if val_loss < best_val_loss:
         best_val_loss = val_loss
-        # best_model_state = copy.deepcopy(model.state_dict())
+        best_model_state = deepcopy(model.state_dict())
+        best_epoch = epoch + 1
         patience_counter = 0
-    else:
+    elif epoch >= warmup_epochs:
         patience_counter += 1
         print(f"  No improvement in validation loss for {patience_counter} epoch(s)")
 
@@ -378,6 +389,10 @@ for epoch in range(epochs):
         break
     
 total_elapsed = time() - start_time
+
+# Keep the best epoch's weights, not the last epoch's
+model.load_state_dict(best_model_state)
+print(f"Restored best model from epoch {best_epoch} (val_loss={epoch_val_losses[best_epoch - 1]:.3e})")
 
 print(f"Training finished in {int(total_elapsed // 60)}m {int(total_elapsed % 60)}s")
 
@@ -399,6 +414,7 @@ plt.plot(epoch_indices, epoch_losses, label="Total loss")
 plt.plot(epoch_indices, epoch_val_losses, label="Validation loss", linestyle='--')
 
 plt.xlabel("Epoch")
+plt.yscale("log")
 plt.ylabel("Loss")
 plt.title("Training loss curves")
 plt.grid(alpha=0.3)
@@ -418,6 +434,13 @@ checkpoint = {
     "learning_rate": learning_rate,
     "epoch_losses": epoch_losses,
     "step_losses": step_losses,
+    "epoch_val_losses": epoch_val_losses,
+    "best_epoch": best_epoch,
+    # Residual AE: the model sees tile - background crop (BackgroundTiles), not the raw tile.
+    # Anything using this checkpoint must subtract a background the same way before encoding.
+    "output_activation": "linear",
+    "residual": True,
+    "bkg_image": torch.from_numpy(img_bkg),  # 4512x4512 uint8 mean background used in training
 }
 
 torch.save(checkpoint, model_output_path)
@@ -431,7 +454,8 @@ if model_output_path.exists():
         latent_dims=checkpoint["latent_dim"],
         image_size=checkpoint["image_size"],
         hidden_channels=checkpoint["hidden_channels"],
-        grid_size=checkpoint.get("grid_size", 16)
+        grid_size=checkpoint.get("grid_size", 16),
+        output_activation=checkpoint.get("output_activation", "sigmoid"),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     opt.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -439,6 +463,75 @@ if model_output_path.exists():
 else:
     print(f"Checkpoint not found at {model_output_path}. Please train the model first.")
 
+
+#%% Baseline check: AE reconstruction vs. mean background tile (img_bkg) at the same position
+# The AE works on residuals r = tile - background, so "predict the mean background" is r_hat = 0
+# and its error is simply mean(r^2). The AE should beat that clearly, otherwise it adds nothing
+# over plain background subtraction. Uses the val set so tiles are not ones the AE trained on.
+# Note: img_bkg is the mean over all training images (incl. the val tiles' source images),
+# so this baseline is slightly optimistic -- if the AE still wins, that's a meaningful result.
+model.eval()
+
+mse_ae, mse_bkg, mse_bkg_shift = [], [], []
+examples = []  # (residual, reconstructed residual, bkg) for plotting
+
+with torch.no_grad():
+    for r, rows, cols in tqdm(val_loader, desc="Baseline comparison"):
+        r_hat = model(r.to(device, non_blocking=True), row=rows.to(device), col=cols.to(device)).cpu()
+
+        mse_ae.append(((r - r_hat) ** 2).mean(dim=(1, 2, 3)))
+        mse_bkg.append((r ** 2).mean(dim=(1, 2, 3)))
+        # Brightness-matched baseline: background shifted to the tile's mean brightness
+        # (cheap stand-in for per-image illumination changes) = residual minus its own mean
+        mse_bkg_shift.append(((r - r.mean(dim=(1, 2, 3), keepdim=True)) ** 2).mean(dim=(1, 2, 3)))
+
+        if len(examples) < 8:
+            n = 8 - len(examples)
+            examples.extend(zip(r[:n], r_hat[:n], bkg_tiles(rows[:n], cols[:n])))
+
+mse_ae = torch.cat(mse_ae).numpy()
+mse_bkg = torch.cat(mse_bkg).numpy()
+mse_bkg_shift = torch.cat(mse_bkg_shift).numpy()
+
+print(f"Val tiles compared: {len(mse_ae)}")
+print(f"{'':28s}{'mean MSE':>12s}{'median MSE':>14s}")
+for name, m in [("AE reconstruction", mse_ae), ("Mean background", mse_bkg), ("Brightness-matched bkg", mse_bkg_shift)]:
+    print(f"{name:28s}{m.mean():12.6f}{np.median(m):14.6f}")
+print(f"AE beats mean background on       {100 * (mse_ae < mse_bkg).mean():.1f}% of tiles "
+      f"(median ratio bkg/AE = {np.median(mse_bkg / mse_ae):.2f}x)")
+print(f"AE beats brightness-matched bkg on {100 * (mse_ae < mse_bkg_shift).mean():.1f}% of tiles "
+      f"(median ratio bkg/AE = {np.median(mse_bkg_shift / mse_ae):.2f}x)")
+
+# Histogram of per-tile MSE (log x-axis, since values span orders of magnitude)
+all_mse = np.concatenate([mse_ae, mse_bkg, mse_bkg_shift])
+bins = np.logspace(np.log10(all_mse.min() + 1e-12), np.log10(all_mse.max()), 80)
+plt.figure(figsize=(8, 4))
+plt.hist(mse_ae, bins=bins, alpha=0.6, label="AE reconstruction")
+plt.hist(mse_bkg, bins=bins, alpha=0.6, label="Mean background")
+plt.hist(mse_bkg_shift, bins=bins, alpha=0.6, label="Brightness-matched bkg")
+plt.xscale("log")
+plt.xlabel("Per-tile MSE")
+plt.ylabel("Count")
+plt.title("Val tiles: AE vs. background baseline")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.show()
+
+# Example tiles, back in image space: input / AE reconstruction / mean background / error map.
+# Rows 1-3 share one grey scale stretched to the brightest input (tiles are too dark for 0..1);
+# the error map (r - r_hat)^2 is what segmentation scores on.
+v_img = max((r + bk).max().item() for r, _, bk in examples)
+v_err = max(((r - rh) ** 2).max().item() for r, rh, _ in examples)
+fig, axs = plt.subplots(4, len(examples), figsize=(len(examples) * 1.6, 4 * 1.7))
+for i, (r, rh, bk) in enumerate(examples):
+    panels = [(r + bk, "Input", v_img), (rh + bk, "AE", v_img), (bk, "Mean bkg", v_img), ((r - rh) ** 2, "Error", v_err)]
+    for j, (img, lbl, vmax) in enumerate(panels):
+        axs[j, i].imshow(img.squeeze(), cmap="gray" if lbl != "Error" else "magma", vmin=0, vmax=vmax)
+        axs[j, i].axis("off")
+        if i == 0:
+            axs[j, i].set_title(lbl, fontsize=9, loc="left")
+plt.tight_layout()
+plt.show()
 
 #%% Plot latent space for random subset oftraining tiles to see if it looks structured (e.g. if row/col info is encoded in specific dimensions, or if there are clusters)
 model.eval()
@@ -535,11 +628,8 @@ plt.show()
 
 #%% Feed in same image and see how latent representation changes with row/col position to see if model learned to use positional info
 
-# Use background image as input
-img_bkg_tensor = torch.from_numpy(img_bkg).unsqueeze(0).unsqueeze(0).float() / 255.0  # shape: (1, 1, H, W)
-
-empty_tile_result = preprocess_tile(img_bkg, image_size=image_size)
-empty_tile = empty_tile_result.unsqueeze(0).to(device)  # type: ignore # shape: (1, 1, H, W)
+# Use an empty tile as input: in residual space, "exactly the background" is all zeros
+empty_tile = torch.zeros(1, 1, image_size, image_size, device=device)  # shape: (1, 1, H, W)
 
 test_grid_size = 100
 
@@ -577,7 +667,7 @@ ax[0].set_xlabel("Column index (c)", fontsize=12)
 ax[0].set_ylabel("Row index (r)", fontsize=12)
 ax[0].set_title("Mean reconstructed value across row/col positions", fontsize=16)
 
-ax[1].imshow(img_bkg, cmap='gray', origin='upper')
+ax[1].imshow(img_bkg, cmap='gray', origin='upper', vmin=0, vmax=255)
 ax[1].axis('off')
 ax[1].set_title("Background Image", fontsize=16)
 
@@ -601,28 +691,11 @@ plt.tight_layout()
 plt.show()
 
 
-
-#%% Model summary
-
-print(f"Bby you are done stop running cells and relax a lil")
-
 #%% Deploy checkpoint to the Jetson
-JETSON_MODELS_DIR = "jellyfish@jellyscope:/home/jellyfish/Github/Jellyscope/Jetson_monitoring/models"
-# BatchMode=yes so a first-time host-key prompt or a password/passphrase request fails fast
-# instead of scp hanging forever waiting for input nothing will ever supply (matches
-# Jetson_monitoring/Monitor/transfer.py's own SSH options).
-SCP_SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"]
+# Copied as <model name>_<DEPLOY_TAG>.pth, so it never replaces a model the Jetson is running.
+# Use the same tag in train_DNN.py so the AE and its scorer are easy to pair up, then point
+# Jetson_monitoring/Monitor/config.py at the printed names.
+DEPLOY_TAG = "residual_v1"
 
-try:
-    scp_result = subprocess.run(
-        ["scp", *SCP_SSH_OPTS, str(model_output_path), JETSON_MODELS_DIR],
-        capture_output=True, text=True, timeout=120,
-    )
-    if scp_result.returncode == 0:
-        print(f"✓ Copied {model_output_path.name} to {JETSON_MODELS_DIR}")
-    else:
-        print(f"scp failed (exit {scp_result.returncode}): {scp_result.stderr.strip()}")
-except subprocess.TimeoutExpired:
-    print("scp timed out after 120s -- check that SSH key auth to jellyfish@jellyscope works "
-          "non-interactively (test with: ssh -o BatchMode=yes jellyfish@jellyscope whoami)")
+deploy_checkpoint_to_jetson(model_output_path, tag=DEPLOY_TAG)
 # %%

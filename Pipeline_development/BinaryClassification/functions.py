@@ -1,5 +1,6 @@
 
 import re
+import subprocess
 import cv2
 import numpy as np
 import torch
@@ -237,13 +238,19 @@ class VariationalEncoder(nn.Module):
         return compute_position_features(row, col, self.grid_size, device)
 
 class Decoder(nn.Module):
-    def __init__(self, latent_dims, feat_shape, image_size=128, hidden_channels=32):
+    def __init__(self, latent_dims, feat_shape, image_size=128, hidden_channels=32, output_activation="sigmoid"):
+        """output_activation: "sigmoid" for tiles in [0, 1], "linear" for background-subtracted
+        residuals (which go negative wherever a tile is darker than the background). Has no
+        parameters, so it doesn't change the state_dict and old checkpoints load either way."""
         super().__init__()
         self.image_size = image_size
         self.feat_shape = feat_shape  # (C, H, W)
         feat_dim = feat_shape[0] * feat_shape[1] * feat_shape[2]
 
         self.fc = nn.Linear(latent_dims, feat_dim)
+
+        if output_activation not in ("sigmoid", "linear"):
+            raise ValueError(f"output_activation must be 'sigmoid' or 'linear', got {output_activation!r}")
 
         c = feat_shape[0]
         self.deconv = nn.Sequential(
@@ -254,7 +261,7 @@ class Decoder(nn.Module):
             nn.ConvTranspose2d(hidden_channels * 2, hidden_channels, kernel_size=4, stride=2, padding=1),      # x8
             nn.ReLU(inplace=True),
             nn.ConvTranspose2d(hidden_channels, 1, kernel_size=4, stride=2, padding=1),             # x16
-            nn.Sigmoid(),
+            *([nn.Sigmoid()] if output_activation == "sigmoid" else []),
         )
 
     def forward(self, z):
@@ -270,7 +277,7 @@ class Decoder(nn.Module):
 ### Autoencoder that combines the Encoder and Decoder
 class Autoencoder(nn.Module):
     def __init__(self, latent_dims, image_size=128, hidden_channels=32, grid_size=16,
-                 positional_embeddings_used=True):
+                 positional_embeddings_used=True, output_activation="sigmoid"):
         super().__init__()
         self.encoder = Encoder(
             latent_dims=latent_dims,
@@ -285,6 +292,7 @@ class Autoencoder(nn.Module):
             feat_shape=self.encoder.feat_shape,
             image_size=image_size,
             hidden_channels=hidden_channels,
+            output_activation=output_activation,
         )
 
     def encode(self, x, row=None, col=None):
@@ -957,6 +965,98 @@ def preprocess_tile(tile, image_size=128):
     tile_resized = cv2.resize(tile, (image_size, image_size), interpolation=cv2.INTER_AREA)
     tile_tensor = torch.from_numpy(tile_resized).float().unsqueeze(0) / 255.0
     return tile_tensor
+
+class BackgroundTiles:
+    """Preprocessed crops of a full-frame background image, one per tile position.
+
+    Crops the background at the same window the tiling script cuts each tile from and runs
+    it through preprocess_tile, so `tile - bkg_tiles(rows, cols)` is the tile's residual from
+    the background. rows/cols may carry the grid offset as a fraction (3.2 = row 3 at the 20%
+    offset), as load_tiles_from_paths_fast/image_pipeline_df return them.
+
+    Takes any 4512x4512 frame, so the same class works with a fixed mean background from
+    training or a running background from live monitoring. Crops are cached per position.
+    """
+    def __init__(self, bkg_image, grid_size=16, image_size=128):
+        bkg_image = bkg_image.numpy() if isinstance(bkg_image, torch.Tensor) else np.asarray(bkg_image)
+        if bkg_image.shape != (4512, 4512):
+            raise ValueError(f"Expected a 4512x4512 grayscale background, got {bkg_image.shape}")
+        self.bkg_image = bkg_image
+        self.grid_size = grid_size
+        self.image_size = image_size
+        self.tile_size_px = 4512 // grid_size
+        self._cache = {}
+
+    def _crop(self, key):
+        if key not in self._cache:
+            r, c = int(np.floor(key[0])), int(np.floor(key[1]))
+            offset = round(key[0] - r, 2)  # the tiling script applies the same offset to rows and cols
+            offset_px = int(self.tile_size_px * offset)
+            y0 = r * self.tile_size_px + offset_px
+            x0 = c * self.tile_size_px + offset_px
+            crop = self.bkg_image[y0:y0 + self.tile_size_px, x0:x0 + self.tile_size_px]
+            self._cache[key] = preprocess_tile(crop, image_size=self.image_size)
+        return self._cache[key]
+
+    def __call__(self, rows, cols):
+        """Background crops for a batch of positions, shape (B, 1, image_size, image_size), on CPU."""
+        keys = [(round(float(r), 2), round(float(c), 2)) for r, c in zip(rows.tolist(), cols.tolist())]
+        return torch.stack([self._crop(k) for k in keys])
+
+    def subtract_(self, images, rows, cols, chunk_size=4096):
+        """In place: images -= background crop at each tile's position. Chunked, so it doesn't
+        need a second copy of a large tile tensor. Returns images."""
+        for start in range(0, len(images), chunk_size):
+            end = start + chunk_size
+            images[start:end] -= self(rows[start:end], cols[start:end]).to(images.device)
+        return images
+
+JETSON_HOST = "jellyfish@jellyscope"
+JETSON_MODELS_DIR = "/home/jellyfish/Github/Jellyscope/Jetson_monitoring/models"
+# BatchMode=yes so a first-time host-key prompt or a password/passphrase request fails fast
+# instead of ssh/scp hanging forever waiting for input nothing will ever supply (matches
+# Jetson_monitoring/Monitor/transfer.py's own SSH options).
+JETSON_SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"]
+
+def deploy_checkpoint_to_jetson(local_path, tag=None, overwrite=False):
+    """Copy a checkpoint into the Jetson's models/ folder as <stem>_<tag><suffix>.
+
+    Refuses to replace a file that already exists there unless overwrite=True, since the
+    Jetson may be running it. Returns the remote filename, or None if nothing was copied.
+    """
+    local_path = Path(local_path)
+    remote_name = f"{local_path.stem}_{tag}{local_path.suffix}" if tag else local_path.name
+    remote_path = f"{JETSON_MODELS_DIR}/{remote_name}"
+
+    try:
+        if not overwrite:
+            exists = subprocess.run(
+                ["ssh", *JETSON_SSH_OPTS, JETSON_HOST, f"test -e '{remote_path}'"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if exists.returncode == 0:
+                print(f"{remote_name} already exists on the Jetson -- not copied. "
+                      f"Use a different tag, or overwrite=True to replace it.")
+                return None
+            if exists.returncode != 1:
+                print(f"ssh failed (exit {exists.returncode}): {exists.stderr.strip()}")
+                return None
+
+        scp_result = subprocess.run(
+            ["scp", *JETSON_SSH_OPTS, str(local_path), f"{JETSON_HOST}:{remote_path}"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"ssh/scp to {JETSON_HOST} timed out -- check that SSH key auth works non-interactively "
+              f"(test with: ssh -o BatchMode=yes {JETSON_HOST} whoami)")
+        return None
+
+    if scp_result.returncode != 0:
+        print(f"scp failed (exit {scp_result.returncode}): {scp_result.stderr.strip()}")
+        return None
+
+    print(f"✓ Copied {local_path.name} to {JETSON_HOST}:{remote_path}")
+    return remote_name
 
 def split_image_into_tiles(image, grid_size):
     """
