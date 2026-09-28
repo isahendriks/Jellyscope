@@ -13,12 +13,16 @@ Before running this:
 """
 
 import os
+import re
 import subprocess
+import cv2
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as colors
 from pathlib import Path
@@ -27,7 +31,7 @@ import copy
 
 from typing import cast
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
-from sklearn.metrics import roc_curve, auc, confusion_matrix, ConfusionMatrixDisplay, precision_recall_curve, average_precision_score
+from sklearn.metrics import roc_curve, auc, confusion_matrix, ConfusionMatrixDisplay, precision_recall_curve, average_precision_score, roc_auc_score
 import sys
 
 # import PCA
@@ -74,7 +78,8 @@ print(f"Using device:      {device}")
 ROOT_DIR_C = r"C:\Users\IsaH\Documents\Jellyscope\Training data new\Binary_classifier"   
 ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data new\Binary_classifier"
 
-monitoring_effort = "Faro_260926"  # for titles and saved model names, e.g. "kristineberg_251128"
+# monitoring_effort = "Kristineberg_260814"
+monitoring_effort = "Faro_260928"  # for titles and saved model names, e.g. "kristineberg_251128"
 grid_size = 16
 tile_size = int(4512/grid_size)
 image_size_vae = 128
@@ -124,41 +129,89 @@ bkg_tiles = BackgroundTiles(checkpoint["bkg_image"], grid_size=grid_size, image_
 print(f"Loaded {encoder} model with latent_dim={latent_dims}, grid_size={grid_size}, residual={residual}")
 
 #%% Load training data
-tiles_path = os.path.join(ROOT_DIR_R, monitoring_effort, "train_scorer", f"tiles{grid_size}_offsets{len(offsets_normalized)}")
-tiles_path_obs = os.path.join(tiles_path, "obs")
-tiles_paths_obs = sorted(Path(tiles_path_obs).rglob("*.png"))
+# Also add the observation tiles (not the empty ones) from other monitoring efforts (other
+# sites/cameras), to get more observations than monitoring_effort has on its own.
+INCLUDE_OTHER = True
+OTHER_EFFORTS = ["Kristineberg_251128"]
 
-tiles_path_no_obs = os.path.join(tiles_path, "no_obs")
-tiles_paths_no_obs = sorted(Path(tiles_path_no_obs).rglob("*.png"))
+def effort_tiles_dir(effort):
+    return Path(ROOT_DIR_C, effort, "train_scorer", f"tiles{grid_size}_offsets{len(offsets_normalized)}_labelme")
 
-# Check that we have both observation and empty tiles
-# Find unique orginial images in the dataset by extracting the common prefix from tile filenames (remove _row_col.png suffix)
-tiles_path_obs_stems = [str(path.stem)[:24] for path in tiles_paths_obs]  # Remove _row_col.png suffix
-tiles_path_no_obs_stems = [str(path.stem)[:24] for path in tiles_paths_no_obs]  # Remove _row_col.png suffix
-tiles_paths_stems = tiles_path_obs_stems + tiles_path_no_obs_stems
-unique_og_imgs = set(tiles_paths_stems)
+def og_img_name(path):
+    """Original image a tile was cut from: the tile stem without its _r<row>_c<col>_o<offset> suffix."""
+    return re.sub(r"_r\d+_c\d+(_o\d+)?$", "", Path(path).stem)
 
-print(f"Loaded {len(unique_og_imgs)} original images")
-print(f"Found {len(tiles_paths_obs)} observation tiles and {len(tiles_paths_no_obs)} empty tiles for training.")
+tiles_paths_by_effort = {}
+for effort in [monitoring_effort] + (OTHER_EFFORTS if INCLUDE_OTHER else []):
+    tiles_dir = effort_tiles_dir(effort)
+    paths_obs = sorted((tiles_dir / "obs").rglob("*.png"))
+    paths_no_obs = sorted((tiles_dir / "no_obs").rglob("*.png")) if effort == monitoring_effort else []
+    n_og = len({og_img_name(p) for p in paths_obs + paths_no_obs})
+    print(f"{effort}: {len(paths_obs)} observation tiles and {len(paths_no_obs)} empty tiles from {n_og} original images")
+    tiles_paths_by_effort[effort] = paths_obs + paths_no_obs
 
-tiles_paths = tiles_paths_obs + tiles_paths_no_obs
-df_train_tiles = load_tiles_from_paths_fast(tiles_paths, include_labels=True, to_device = device)  # type: ignore # Load tile paths and labels into a DataFrame
+tiles_paths = [p for paths in tiles_paths_by_effort.values() for p in paths]
+tile_effort_of_path = {str(p): effort for effort, paths in tiles_paths_by_effort.items() for p in paths}
+df_train_tiles = cast(pd.DataFrame, load_tiles_from_paths_fast(tiles_paths, include_labels=True, to_device = device))  # Load tile paths and labels into a DataFrame
 
-# save the original image as identifier
-df_train_tiles["og_img"] = df_train_tiles["path"].apply(lambda x: str(Path(x).stem)[:23])  # Group by original tile (remove _row_col.png suffix)
-og_imgs = df_train_tiles["og_img"].values
+# save the original image as identifier (prefixed with the effort, so names can't collide across efforts)
+df_train_tiles["effort"] = df_train_tiles["path"].apply(lambda x: tile_effort_of_path[str(x)])
+df_train_tiles["og_img"] = df_train_tiles["effort"] + "/" + df_train_tiles["path"].apply(og_img_name)
 
 # Apply image pipeline to load and preprocess tile images, and convert to tensors for training
 images_tensor, rows_tensor, cols_tensor, labels_tensor = cast(
     tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     image_pipeline_df(df_train_tiles, input_image_size_vae=image_size, include_labels=True),
 )
+tile_effort = df_train_tiles["effort"].to_numpy()  # aligned with images_tensor
+df_train_tiles = df_train_tiles.drop(columns="image")  # raw full-res tiles, no longer needed
+
+def mean_background(effort):
+    """Mean of an effort's original images, cached next to them (other efforts: the checkpoint's
+    background is the training site's, so each site needs its own)."""
+    og_dir = Path(ROOT_DIR_C, effort, "train_scorer", "OG_images")
+    cache = og_dir.parent / "mean_background.npy"
+    if cache.exists():
+        return np.load(cache)
+    og_paths = sorted(og_dir.glob("*.png"))
+    bkg_sum = np.zeros((4512, 4512), dtype=np.float64)
+    for i, p in enumerate(og_paths):
+        print(f"  {effort}: loading original image {i + 1}/{len(og_paths)}", end="\r")
+        img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise ValueError(f"Could not read image: {p}")
+        bkg_sum += img
+    bkg = (bkg_sum / len(og_paths)).astype(np.uint8)
+    np.save(cache, bkg)
+    return bkg
+
+# Background per effort: the checkpoint's own for monitoring_effort (what the AE was trained on),
+# each other effort's mean image otherwise.
+bkg_tiles_by_effort = {}
+if bkg_tiles is not None:
+    bkg_tiles_by_effort[monitoring_effort] = bkg_tiles
+    for effort in tiles_paths_by_effort:
+        if effort != monitoring_effort:
+            print(f"Computing mean background for {effort}...")
+            bkg_tiles_by_effort[effort] = BackgroundTiles(mean_background(effort), grid_size=grid_size, image_size=image_size)
+
+def background_crops(idx):
+    """Background crops for tiles images_tensor[idx], each from its own effort's background."""
+    idx = np.asarray(idx)
+    crops = torch.empty((len(idx), *images_tensor.shape[1:]))
+    for effort, bt in bkg_tiles_by_effort.items():
+        m = tile_effort[idx] == effort
+        if m.any():
+            crops[torch.from_numpy(m)] = bt(rows_tensor[idx[m]], cols_tensor[idx[m]])
+    return crops
 
 # Subtract the background here, before augmentation: rotating/deforming a tile and then
 # subtracting an unrotated background would add a mismatch error to augmented obs tiles only.
 if bkg_tiles is not None:
     print(f"Subtracting background from {len(images_tensor)} tiles (residual AE)...")
-    bkg_tiles.subtract_(images_tensor, rows_tensor, cols_tensor)
+    for start in range(0, len(images_tensor), 4096):
+        idx = np.arange(start, min(start + 4096, len(images_tensor)))
+        images_tensor[start:idx[-1] + 1] -= background_crops(idx).to(images_tensor.device)
 
 #%% Create TensorDataset
 dataset = TensorDataset(images_tensor, rows_tensor, cols_tensor, labels_tensor)  # Convert to TensorDataset for DataLoader
@@ -331,9 +384,13 @@ with torch.no_grad():
         for images, batch_rows, batch_cols, batch_labels in dataloader_img:
             images = images.to(device, non_blocking=True)
             batch_labels = batch_labels.to(device, non_blocking=True)
-            batch_rows = batch_rows.to(device, non_blocking=True)
-            batch_cols = batch_cols.to(device, non_blocking=True)
+            # batch_rows = batch_rows.to(device, non_blocking=True)
+            # batch_cols = batch_cols.to(device, non_blocking=True)
             
+            # Disable row/col
+            batch_rows = torch.zeros_like(batch_rows)
+            batch_cols = torch.zeros_like(batch_cols)
+
             if encoder == "VAE":
                 mu, _ = encoder_model.encode(images, row=batch_rows, col=batch_cols)
 
@@ -923,6 +980,7 @@ X_latent = train_maha_latent
 # not just genuine anomalies, saturating every tile's score to the same ceiling regardless
 # of content. LedoitWolf picks its shrinkage intensity analytically (Ledoit & Wolf, 2004),
 # not a hand-tuned constant, pulling the estimate toward a well-conditioned diagonal target.
+
 X_latent_np = X_latent.cpu().numpy()
 lw = LedoitWolf().fit(X_latent_np)
 cov = lw.covariance_
@@ -1002,6 +1060,8 @@ with torch.no_grad():
 all_labels = np.concatenate(all_labels)
 all_recon = np.concatenate(all_recon)
 all_scores = np.concatenate(all_scores)  # Combine model score and reconstruction error for evaluation
+
+# n_obs = 0
 
 if n_obs == 0:
     # No observation samples in the test set: classification metrics (ROC/PR/confusion
@@ -1109,6 +1169,113 @@ else:
     plt.title('Confusion Matrix')
     plt.show()
 
+#%% Plot examples of false positives and false negatives
+fp_indices = np.where((all_labels == 0) & (preds == 1))[0]
+fn_indices = np.where((all_labels == 1) & (preds == 0))[0]
+tp_indices = np.where((all_labels == 1) & (preds == 1))[0]
+tn_indices = np.where((all_labels == 0) & (preds == 0))[0]
+
+# all_recon holds a scalar recon error per tile, not an image. test_loader isn't shuffled, so
+# result idx is tile images_tensor[test_idx[idx]]. images_tensor holds residuals when the AE is
+# residual; add the background back to show the tile as it was captured.
+def plot_error_tiles(indices, kind, N_plot=10):
+    """Top row: tile (score, AE recon MSE). Bottom row (residual AE only): tile - background."""
+    if len(indices) == 0:
+        print(f"No {kind.lower()} to plot")
+        return
+    shown = indices[:N_plot]
+    tile_idx = test_idx[shown]
+    residuals = images_tensor[tile_idx].cpu()
+    residual = bkg_tiles is not None
+    tiles = residuals + background_crops(tile_idx) if residual else residuals
+
+    n_rows = 2 if residual else 1
+    fig, axes = plt.subplots(n_rows, len(shown), figsize=(1.6 * len(shown), 1.9 * n_rows), squeeze=False)
+    v_res = residuals.abs().max().item()
+    for i, idx in enumerate(shown):
+        axes[0, i].imshow(tiles[i, 0], cmap='gray')
+        axes[0, i].set_title(f"{str(tile_effort[tile_idx[i]]).split('_')[0]}\nScore={all_scores[idx]:.3f}\nMSE={all_recon[idx]:.1e}", fontsize=7)
+        if residual:
+            axes[1, i].imshow(residuals[i, 0], cmap='gray', vmin=-v_res, vmax=v_res)
+    for ax in axes.flat:
+        ax.axis('off')
+    fig.suptitle(f"{kind}: {len(shown)} of {len(indices)} (threshold={best_threshold:.3f})", fontsize=10)
+    plt.tight_layout()
+    plt.show()
+
+### False negatives: observation tiles misclassified as empty, most confidently wrong first (lowest score)
+plot_error_tiles(fn_indices[np.argsort(all_scores[fn_indices])], "False negatives")
+
+### False positives: empty tiles misclassified as observations, most confidently wrong first (highest score)
+plot_error_tiles(fp_indices[np.argsort(-all_scores[fp_indices])], "False positives")
+
+#%% Compare against a version with no AE
+# Scores straight from the background residual r = tile - background, next to the AE-based ones,
+# on the same test tiles. The AE barely beats predicting r = 0, so its recon MSE is close to plain
+# "residual MSE". The "peak" scores take the strongest local spot instead of the tile mean, so a
+# small speck isn't averaged away by the rest of the tile.
+PEAK_WINDOW = 5  # px at image_size; roughly the smallest object to look for
+
+if bkg_tiles is None:
+    print("⚠ Not a residual AE: images_tensor holds raw tiles, so the 'residual' scores below are raw brightness")
+
+def local_energy_peak(x):
+    """Max over the tile of the mean of x**2 in a PEAK_WINDOW x PEAK_WINDOW window."""
+    return F.avg_pool2d(x ** 2, PEAK_WINDOW, stride=1).amax(dim=(1, 2, 3))
+
+scores_cmp = {name: [] for name in ["Residual MSE (no AE)", "Residual peak (no AE)", "Residual peak, mean-removed (no AE)",
+                                    "AE recon MSE", "AE recon peak"]}
+with torch.no_grad():
+    for start in range(0, len(test_idx), batch_size):
+        r = images_tensor[test_idx[start:start + batch_size]].to(device)
+        zeros = torch.zeros(len(r))  # row/col disabled, as in feature extraction
+        mu = encoder_model.encode(r, row=zeros, col=zeros)
+        if encoder == "VAE":
+            mu = mu[0]
+        err = r - encoder_model.decode(mu)
+        batch_scores = {
+            "Residual MSE (no AE)": (r ** 2).mean(dim=(1, 2, 3)),
+            "Residual peak (no AE)": local_energy_peak(r),
+            "Residual peak, mean-removed (no AE)": local_energy_peak(r - r.mean(dim=(1, 2, 3), keepdim=True)),
+            "AE recon MSE": (err ** 2).mean(dim=(1, 2, 3)),
+            "AE recon peak": local_energy_peak(err),
+        }
+        for name, s in batch_scores.items():
+            scores_cmp[name].append(s.cpu().numpy())
+scores_cmp = {name: np.concatenate(s) for name, s in scores_cmp.items()}
+scores_cmp[f"Trained scorer ({mode})"] = all_scores
+
+# AUC/AP overall and per effort (only where both classes are in the test set)
+test_effort = tile_effort[test_idx]
+groups = {"All": np.ones(len(test_idx), dtype=bool)}
+if len(set(test_effort)) > 1:
+    groups.update({effort: test_effort == effort for effort in sorted(set(test_effort))})
+for group, m in groups.items():
+    n_pos, n_neg = int(all_labels[m].sum()), int((1 - all_labels[m]).sum())
+    print(f"\n{group}: {n_pos} obs, {n_neg} empty (random AP = {n_pos / max(n_pos + n_neg, 1):.4f})")
+    if n_pos == 0 or n_neg == 0:
+        print("  needs both classes, skipped")
+        continue
+    print(f"  {'':38s}{'ROC AUC':>9s}{'AP':>9s}")
+    for name, s in scores_cmp.items():
+        print(f"  {name:38s}{roc_auc_score(all_labels[m], s[m]):9.4f}{average_precision_score(all_labels[m], s[m]):9.4f}")
+
+fig, (ax_roc, ax_pr) = plt.subplots(1, 2, figsize=(12, 5))
+for name, s in scores_cmp.items():
+    fpr_c, tpr_c, _ = roc_curve(all_labels, s)
+    prec_c, rec_c, _ = precision_recall_curve(all_labels, s)
+    ax_roc.plot(fpr_c, tpr_c, label=f"{name} (AUC={auc(fpr_c, tpr_c):.3f})")
+    ax_pr.plot(rec_c, prec_c, label=f"{name} (AP={average_precision_score(all_labels, s):.3f})")
+ax_roc.plot([0, 1], [0, 1], 'k--', lw=0.8)
+ax_roc.set(xlabel="False positive rate", ylabel="True positive rate", title="ROC, test set: with vs. without AE")
+ax_pr.set(xlabel="Recall", ylabel="Precision", title="Precision-recall, test set")
+for ax in (ax_roc, ax_pr):
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=7)
+plt.tight_layout()
+plt.show()
+
+
 # Plot score distribution for empty vs observation samples on PCA of latent space, labels in different shapes, and color by score
 # Make colorbar change colors at the threshold for better visualization
 color_norm = colors.TwoSlopeNorm(vmin=all_scores.min(), vcenter=best_threshold, vmax=all_scores.max())
@@ -1138,12 +1305,15 @@ plt.legend(
     ncol=2,
     fontsize=10,
 )
-plt.xlim(-max_dim, max_dim)
-plt.ylim(-max_dim, max_dim)
-plt.xticks([-10, -5, 0, 5, 10])
-plt.yticks([-10, -5, 0, 5, 10])
+# plt.xlim(-max_dim, max_dim)
+# plt.ylim(-max_dim, max_dim)
+# plt.xticks([-10, -5, 0, 5, 10])
+# plt.yticks([-10, -5, 0, 5, 10])
 plt.grid()
 # plt.colorbar(scatter_obs, label='Anomaly Score', ticks=[0, best_threshold, 1], format='%.3f')
+
+
+#%% Plot False positives and false negatives
 
 #%% Save scorer model for future reference
 

@@ -56,6 +56,7 @@ print(f"Using device:      {device}")
 
 ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data new\Binary_classifier"
 ROOT_DIR_C = r"C:\Users\IsaH\Documents\Jellyscope\Training data new\Binary_classifier"   
+ROOT_DIR_C = r"C:\Users\IsaH\Documents\Jellyscope\Training data new\Binary_classifier"   
 
 SAMPLE_IMAGE_IDX_TRAIN = 0 # Index of the sample image to plot process (0-based)
 
@@ -64,7 +65,7 @@ DEBUG = False
 N_DEBUG = 5000
 EPOCHS_DEBUG = 10
 
-monitoring_effort = "Faro_260926"  # for titles and saved model names, e.g. "kristineberg_251128" 
+monitoring_effort = "Faro_260928"  # for titles and saved model names, e.g. "kristineberg_251128" 
 grid_size = 16  # number of tiles along one side (e.g. 6 means 6x6=36 tiles per image)
 offsets_normalized = [0.0, 0.2, 0.4, 0.6, 0.8]  # List of normalized offsets [0.0, 0.2, 0.4, 0.6, 0.8] creates crops at 0%, 20%, 40%, 60%, 80% offset; set to [] or [0.0] to disable offset cropping (single crop per tile)
 
@@ -73,6 +74,8 @@ image_size = 128
 latent_dims = 64
 hidden_channels = 32
 
+train_tiles_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train_encoder", f"tiles{grid_size}_offsets{len(offsets_normalized)}", "no_obs")
+train_og_images_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train_encoder", "OG_images")
 train_tiles_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train_encoder", f"tiles{grid_size}_offsets{len(offsets_normalized)}", "no_obs")
 train_og_images_path = os.path.join(ROOT_DIR_C, monitoring_effort, "train_encoder", "OG_images")
 
@@ -126,6 +129,7 @@ if img_bkg_mean is not None:
     plt.imshow(img_bkg_mean, cmap="gray")
     plt.title(f"Mean background image across {len(images_train)} training images", fontsize=14)
     plt.axis("off")    
+    plt.colorbar()
 
 if img_bkg_mean is not None:
     img_bkg = img_bkg_mean
@@ -341,7 +345,8 @@ for epoch in range(epochs):
         opt.zero_grad()
 
         # calculate reconstruction error
-        x_hat = model(x, row=rows, col=cols)
+        # x_hat = model(x, row=rows, col=cols) 
+        x_hat = model(x, row=torch.zeros_like(rows), col=torch.zeros_like(cols)) # disable location 
         loss = ((x - x_hat) ** 2).mean()
 
         # backpropagate and optimize
@@ -365,7 +370,8 @@ for epoch in range(epochs):
             rows = rows.to(device, non_blocking=True)
             cols = cols.to(device, non_blocking=True)
 
-            x_hat = model(x, row=rows, col=cols)
+            # x_hat = model(x, row=rows, col=cols)
+            x_hat = x_hat = model(x, row=torch.zeros_like(rows), col=torch.zeros_like(cols)) # Disable location 
             val_loss += ((x - x_hat) ** 2).mean().item()
     
     epoch_val_losses.append(val_loss / len(val_loader))
