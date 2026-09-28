@@ -68,12 +68,26 @@ QUE_TRAINING_FRAMES = QUEUE_ROOT / "que_training_frames"  # periodic post-PREPRO
 # frames sampled by analyse.py (see TRAINING_FRAME_INTERVAL_S) for send.py to upload --
 # separate from QUE_CROPS, which holds individual per-crop classifier images instead
 
-TRAINING_FRAME_INTERVAL_S = 30 * 60  # how often analyse.py samples one full frame (after
+TRAINING_FRAME_INTERVAL_S = (3600 * 24)/200 # 200 frames/24hrs, 1 f every 7 minutes 30 * 60  # how often analyse.py samples one full frame (after
 # PREPROCESS, before SEGMENT) into QUE_TRAINING_FRAMES, for periodic offline classifier
 # retraining -- independent of and much sparser than the per-crop que_crops upload path
-TRAINING_COLLECTION_TARGET = 200  # 0 = disabled; set to e.g. 200 for a one-shot collection
-TRAINING_COLLECTION_INTERVAL_S = 10  # seconds between frames while collection is active
+TRAINING_COLLECTION_TARGET = 250  # 0 = disabled; set to e.g. 200 for a one-shot collection
+TRAINING_COLLECTION_INTERVAL_S = 3  # seconds between frames while collection is active
 TRAINING_COLLECTION_STATE_PATH = PIPELINE_DIR / "logs" / "training_collection_state.json"
+
+# Local-only archive of EVERY post-PREPROCESS full frame (never uploaded), for building
+# site-specific training sets. ~5 MB/frame PNG at one frame per 3 s = ~140 GB/day, so
+# this is a temporary switch -- set False once enough has been collected. Written by a
+# background thread in analyse.py (PNG encode is ~0.7 s/frame, too slow for the main
+# loop); analyse.py waits up to 2 s for it when it falls behind, and only drops (and
+# counts, in analyse.log) a frame if it's truly stuck. On sda1, not sdb1 -- see QUEUE_ROOT's note on sdb1's
+# ~5.7 MB/s USB link.
+ARCHIVE_PREPROCESSED_FRAMES = True
+PREPROCESSED_ARCHIVE_DIR = Path("/mnt/sda1/jellyscope_preprocessed_frames")  # per-day subfolders
+# Archiving pauses while sda1 has less than this free, so the live queues (also on sda1)
+# never run out of room because of it. Resumes on its own if space is freed.
+PREPROCESSED_ARCHIVE_MIN_FREE_GB = 150
+PREPROCESSED_ARCHIVE_PNG_LEVEL = 1  # 1 = fastest; 3 saves only ~10% space for 2x encode time
 
 ### ==========================
 ### Oversized crop handling (send.py) -- see the 2026-07-31 incident: something (camera
@@ -152,7 +166,7 @@ DARK_FRAME_PATH = PIPELINE_DIR / "bkg.png"
 ### on-board retraining lives in train/, sibling to this repo's Jetson_monitoring/ folder)
 ### ==========================
 SEGMENTATION_ENCODER_TYPE = "AE"  # "AE" or "VAE" -- must match whichever class the checkpoint below was trained with
-SEGMENTATION_AE_MODEL_PATH = PIPELINE_DIR / "models" / "Kristineberg_260814_AE_model16_l64_img128.pth"
+SEGMENTATION_AE_MODEL_PATH = PIPELINE_DIR / "models" / "Faro_260926_AE_model16_l64_img128.pth"
 
 # Kristineberg_260814 was trained with its positional embeddings zeroed out, so
 # inference has to match: False feeds the encoder's fusion layers a zero embedding
@@ -176,7 +190,7 @@ POSITIONAL_EMBEDDINGS_USED = False
 # A "binary" scorer runs as an INT8 TensorRT engine like everything else; a
 # "mahalanobis" one runs directly as FP32 PyTorch (see models/segmentation_trt.py's
 # module docstring for why).
-SEGMENTATION_SCORER_MODEL_PATH = PIPELINE_DIR / "models" / "Kristineberg_260814_scorer_mahalanobis_model16_l64_img128.pth"
+SEGMENTATION_SCORER_MODEL_PATH = PIPELINE_DIR / "models" / "Faro_260926_scorer_mahalanobis_model16_l64_img128.pth"
 
 # Overrides the checkpoint's own saved threshold (best_threshold_f3 at training time --
 # see train_DNN.py) without hand-editing/re-saving the .pth file. None = use whatever the
@@ -185,7 +199,7 @@ SEGMENTATION_SCORER_MODEL_PATH = PIPELINE_DIR / "models" / "Kristineberg_260814_
 # for real data -- e.g. a Mahalanobis checkpoint whose saved 0.9224 finds zero crops on
 # known-observation frames. Applies uniformly to either scorer mode (analyse.py just does
 # peak_threshold = scorer_threshold either way).
-SEGMENTATION_SCORER_THRESHOLD_OVERRIDE = None  # reset by update_segmentation_model.sh for 'Kristineberg_260814' -- re-add manually if you want to override its trained threshold
+SEGMENTATION_SCORER_THRESHOLD_OVERRIDE = None  # reset by update_segmentation_model.sh for 'Faro_260926' -- re-add manually if you want to override its trained threshold
 
 ### ==========================
 ### ViT classifier checkpoint
@@ -229,6 +243,14 @@ SEG_ENGINE_BATCH = 1280
 # exactly, or every classify call becomes a shape mismatch against the engine. To cap crops
 # per frame for speed, tune N_CROPS_PER_IMAGE below instead -- it's independent of this.
 VIT_ENGINE_BATCH = 16
+# INT8 calibration arrays (engines/collect_calibration_data.py -> engines/build_trt_int8.py).
+# On sda1, not the eMMC: seg_tiles.npy alone is ~2.5 GB at 30 batches (float32 1x128x128
+# tiles), and writing a 16.8 GB one to the eMMC is what filled the root disk on 2026-09-26.
+CALIBRATION_DIR = Path("/mnt/sda1/jellyscope_calibration")
+# Number of SEG_ENGINE_BATCH-sized batches INT8 calibration uses (30 = 38400 tiles = 30
+# images). collect_calibration_data.py stops collecting at this many tiles -- anything
+# beyond it was never read by build_trt_int8.py anyway.
+SEG_CALIBRATION_BATCHES = 30
 
 ### ==========================
 ### analyse.py: PREPROCESS/SEGMENT/CLASSIFY/live-stream tuning -- centralized here
@@ -238,7 +260,7 @@ VIT_ENGINE_BATCH = 16
 IMAGE_SIZE_PX = 4512  # camera frame size -- checked against each frame's actual dims in analyse.py
 IMAGE_W_MM = 91  # physical width of the sensor's field of view, in mm
 
-GAIN_DB = 20.0  # hardware gain -- set on the camera's nodemap at acquisition start (record.py, livestream.py)
+GAIN_DB = 30.0  # hardware gain -- set on the camera's nodemap at acquisition start (record.py, livestream.py)
 
 ROTATE_FRAME = 90.0  # degrees, applied once per frame (and once to the dark frame at load time)
 # before dark-subtract/median-blur/gamma/CLAHE -- corrects for the camera's physical mounting
@@ -255,38 +277,10 @@ CLAHE_TILE_PX = 512  # CLAHE grid size = IMAGE_SIZE_PX / CLAHE_TILE_PX, rounded 
 
 # Biofouling background subtraction (background_model.py) -- an EMA of the raw
 # (pre-PREPROCESS) frame, subtracted before dark-frame correction/median blur/gamma/
-# CLAHE, to stop slowly-accumulating fouling on the submerged camera window (cleaned
-# only ~twice a week) from being picked up as spurious SEGMENT detections. See
-# background_model.py's module docstring for why EMA specifically (vs a windowed mean
-# or rolling median).
-BG_SUB_ENABLED = False  # turbid water makes the EMA absorb persistent scene illumination
-# and suspended-particle haze, leaving mostly noise after subtraction; keep this off at
-# the new location until a representative background model can be calibrated there.
-# (analyse.py falls back to feeding gpu_preprocess_frame the raw frame unchanged, same
-# as before this feature existed) and the live-stream's biofouling debug thumbnails
-# go dark, without needing a restart-free code change to back this out in the field.
-#
-# Was disabled 2026-08-14 after SEGMENT started flagging the *entire* frame as one
-# giant crop every time in production (live_frame.json's crop box was
-# (0,0)-(451,451), the whole downscaled frame). Root-caused via offline prototyping
-# against real captured frames run through the actual INT8 TensorRT encoder/decoder +
-# Mahalanobis scorer: NOT alpha (tested a ~1.8-day-decay alpha, still 100% coverage)
-# and NOT spatial frequency (tested blurring the background before subtracting with
-# kernels up to 801px, still 100% coverage) -- both hypotheses ruled out. The actual
-# cause was background_model.update_and_subtract()'s old re-centering step (frame -
-# bg + offset, offset=HDR_MAX/2): raw frames are naturally dark/near-zero almost
-# everywhere, which is the distribution the AE was trained on, and shifting every
-# pixel's typical value to mid-grey broke that regardless of alpha or how bg was
-# computed -- CLAHE + the AE choked on the unfamiliar distribution, not on losing
-# real structure per se. Fixed (see background_model.py) by clipping to 0 instead of
-# recentering, the same pattern the static dark_frame subtraction above already
-# uses -- confirmed clean (normal small-coverage detections, no 100%-coverage
-# frames) across a 15-frame run against the real scorer. Re-enabled 2026-08-14 after
-# that fix.
+# CLAHE
+BG_SUB_ENABLED = True  # turbid water makes the EMA absorb persistent scene illumination
 BG_EMA_ALPHA = 0.02  # ghost left behind by a cleaning event (window wiped, EMA still
-# carrying the old fouling values) decays to ~5% residual in roughly 90-150 frames at
-# this alpha -- fast enough not to matter, so no explicit cleaning-event detection/
-# reset is needed.
+
 
 # SEGMENT
 SEG_TILE_GRID_SIZE = 16
@@ -296,16 +290,6 @@ CROP_PADDING_PIXELS = 0
 IOU_DEDUP_THRESHOLD = 0.3  # matches segment_labeled_images.py's working reference
 N_CROPS_PER_IMAGE = 5  # cap crops per frame -- freely tunable for speed/completeness tradeoff.
 SEGMENT_ENABLED = False  # False skips segmentation/crop creation while training frames collect
-# dedup_candidates sorts by peak_val descending before capping, so the strongest peaks survive
-# and only the weakest excess get dropped when a frame has more than this many. Keep this <=
-# VIT_ENGINE_BATCH: going over it forces a second (third, ...) full classify batch, each paying
-# the FULL fixed engine cost again regardless of how many of its slots are real crops -- that
-# staircase is what made classify time roughly double/triple on frames with many detections.
-# IMPORTANT: VIT_ENGINE_BATCH itself must NOT be changed here to "speed things up" -- it has to
-# exactly match the batch shape actually baked into vit_classifier_int8.engine at build time
-# (engines/build_trt_int8.py's VIT_BATCH). Setting it to anything else without rebuilding that
-# engine file creates a real shape mismatch between what analyse.py sends and what the compiled
-# engine expects -- this is NOT a valid way to tune speed, only N_CROPS_PER_IMAGE (above) is.
 
 # CLASSIFY
 CLASSIFIER_IMAGE_SIZE = 256  # must match Train_ViT.py's preprocess Resize((256,256))
@@ -314,11 +298,7 @@ CONFIDENCE_THRESHOLD = 0.7  # live-stream box only gets a species label at/above
 DISK_CHECK_EVERY_N_FRAMES = 5
 
 # Periodically returns PyTorch's cached-but-unused GPU memory to the CUDA driver
-# (torch.cuda.empty_cache() + gc.collect() in analyse.py's main loop) -- without
-# this, fragmentation from many frames of varying-shape tensor allocations builds
-# up until a native CUDA allocation blocks indefinitely (a silent hang, not a
-# crash, so supervisor.sh's restart loop never fires since the process never
-# returns). Root cause of the 2026-07-24 overnight freeze at frame 1324.
+# (torch.cuda.empty_cache() + gc.collect() in analyse.py's main loop) -
 CUDA_CACHE_CLEANUP_EVERY_N_FRAMES = 100
 
 ### ==========================
@@ -326,106 +306,27 @@ CUDA_CACHE_CLEANUP_EVERY_N_FRAMES = 100
 ### Flask/MJPEG pattern -- but showing the actual production pipeline's output
 ### and metadata, not a separate dev/test capture.
 ### ==========================
-ENABLE_LIVE_STREAM = True  # the whole monitoring web server -- /status JSON panel (temps,
-# disk, connection, last-recorded/analysed timers, backlog progress) plus the video/crops
-# UI. Keep this True to keep monitoring available at all; see BACKLOG_MODE_* below for
-# what turns off just the camera-image/crops-thumbnail rendering without losing the
-# status panel.
+ENABLE_LIVE_STREAM = True
 LIVESTREAM_PORT = 8080  # view at http://<jetson-ip>:8080/
-
-# 2026-08-13: guardrails against a slow/remote viewer stalling the dashboard's Flask
-# server -- it runs threaded (one OS thread per request, no pool, no cap) in the same
-# process as the real-time PREPROCESS/SEGMENT/CLASSIFY loop. send.py's own measured
-# upload speed to server-lab has been seen as low as ~1.2-2.6 KB/s (see its log), far
-# below the ~50-60KB/frame the video image endpoint serves -- someone viewing the
-# dashboard over that same flaky link, not the local LAN, could leave a request's
-# socket.send() blocked for a very long time otherwise, since Werkzeug's dev server
-# has no default per-connection timeout. Both knobs below only affect
-# request-handling threads in analyse.py's Flask app; they never touch record.py or
-# the actual capture/analysis loop directly.
 LIVESTREAM_REQUEST_TIMEOUT_S = 10  # per-connection socket timeout (read AND write) for
-# the dashboard's Flask server. Past this, Werkzeug drops the connection (it already
-# catches socket.timeout as a clean "connection dropped" case, not a crash -- see
-# WSGIRequestHandler.connection_dropped in werkzeug/serving.py) instead of leaving the
-# handling thread blocked indefinitely. A poll-driven dashboard (media.js re-requests
-# every 400ms-1s regardless) just asks again next tick, so a dropped slow request costs
-# nothing real.
 LIVESTREAM_MAX_CONCURRENT_REQUESTS = 8  # hard cap on simultaneous in-flight requests
-# to the dashboard Flask app (all routes, checked right after the password gate) --
-# bounds how many threads can pile up during LIVESTREAM_REQUEST_TIMEOUT_S's window even
-# under a burst of slow/stalled clients. Past this, new requests get a plain 503
-# immediately rather than spawning yet another thread; same reasoning as the timeout
-# above, the dashboard just retries on its own next poll.
-
-### ==========================
-### Backlog mode vs live mode (analyse.py's update_system_mode()) -- automatically
-### switches the per-frame video-image and crops-thumbnail rendering
-### (update_live_frame/update_recent_crops_strip) off while there's a substantial backlog
-### of unanalysed raw frames sitting on disk (old backlog + sdb1 backlog + live queue,
-### combined), since that rendering costs real per-frame time (resize/draw-boxes/
-### JPEG-encode, ~0.15-0.3s/frame observed) that's pure overhead while nobody's watching
-### and analyse.py could instead spend on actually draining the backlog. The /status JSON
-### panel keeps working in either mode -- only the live video image and crops-thumbnail
-### strip go dark in backlog mode (the page shows a placeholder instead of a broken
-### image).
-###
-### Two separate thresholds, not one, deliberately: a single threshold would flap video
-### on/off repeatedly whenever the backlog hovers right around it (e.g. draining down to
-### 950, ticking back up to 1050, etc.) -- the gap between ENTER and EXIT is a hysteresis
-### band, so once in backlog mode it takes dropping meaningfully lower (not just below
-### the same number that triggered it) to switch back.
-###
-### ENTER raised sharply 2026-08-11, after the sdb1->sda1 move: the ~0.15-0.3s/frame
-### render cost that motivated the original 1000 barely matters now that analyse.py runs
-### at ~1.79 frames/s (vs record.py's ~0.32 frames/s at FRAME_SKIP=3) -- there's enough
-### throughput margin either way. Kept as a real (if now much higher) threshold rather
-### than removed entirely, so it still trips as a genuine emergency tripwire if the queue
-### ever balloons to incident scale again (the 2026-08-03 incident reached ~63k files).
-### ==========================
-BACKLOG_MODE_ENTER_THRESHOLD = 50_000  # total pending fullframes above this -> backlog mode
-BACKLOG_MODE_EXIT_THRESHOLD = 100  # total pending fullframes below this -> live mode
-# % downscale, i.e. NxN pixel binning where N = 100/LIVESTREAM_DISP_SCALE (10 ->
-# 10x10 bins, 20 -> 5x5 bins, 50 -> 2x2 bins). Was 50 (2256x2256, ~670KB/JPEG) --
-# at the pipeline's then-current ~1fps analysis rate, that much data per frame
-# added real transmission/decode lag on top of the already-slow update rate,
-# making the live view feel even more sluggish than the ~1fps alone would;
-# dropped to 20 -> ~902x902 (much faster to send/decode), then later to 10 ->
-# ~451x451.
-#
-# 2026-08-14: raised to 50 to use some of the remote upload link's spare
-# "occupied bandwidth" headroom (see send.py's link_speed_bps vs. upload_speed_bps,
-# surfaced on the live-stream's CONNECTION panel) -- confirmed live-slow again
-# within the same session, the exact same problem the original 50->20 drop was
-# for. Settled on 20 (5x5 bins, ~902x902) as the middle ground: a real step up in
-# detail from 10, without reintroducing the local transmission/decode lag 50
-# caused both times it's been tried.
 LIVESTREAM_DISP_SCALE = 10
 LIVESTREAM_JPEG_QUALITY = 60
 CROP_BOX_COLOR = (0, 255, 0)  # green, BGR (cv2 convention)
 
-# 2026-08-12: analyse.py overwrites this path on every live-mode frame with a
-# downscaled (LIVESTREAM_DISP_SCALE) JPEG -- deliberately *without* crop boxes/labels
-# drawn on it (unlike /latest_frame.jpg's local dashboard copy, see update_live_frame())
-# -- so the future public livestream site's own frontend has full control over how
-# crops are rendered, instead of inheriting this pipeline's box color/label styling
-# baked into the pixels. The matching crop/label data goes out separately as JSON, see
-# LIVE_FRAME_JSON_PATH below. send.py watches this file's mtime and uploads both to
-# server-lab together (always overwriting the same remote filenames) whenever it
-# changes. Not a queue -- there's deliberately no history here, only the single most
-# recent frame ever matters, same "always current" idea as /latest_frame.jpg itself,
-# just also pushed off-device.
+
+### ==========================
+### Backlog mode vs live mode (analyse.py's update_system_mode()) -- automatically
+### ==========================
+BACKLOG_MODE_ENTER_THRESHOLD = 50_000  # total pending fullframes above this -> backlog mode
+BACKLOG_MODE_EXIT_THRESHOLD = 100  # total pending fullframes below this -> live mode
+
+
 LIVE_FRAME_PATH = PIPELINE_DIR / "live_frame_outbox" / "live_frame.jpg"
-# Crop boxes/labels matching LIVE_FRAME_PATH's frame, in that same JPEG's pixel
-# coordinates (i.e. already scaled by LIVESTREAM_DISP_SCALE, not full-res). Written
-# *before* LIVE_FRAME_PATH on every frame (see update_live_frame()) so that by the
-# time send.py notices the JPEG's mtime change -- its only upload trigger -- this
-# file is already there with matching data to go along with it.
+
 LIVE_FRAME_JSON_PATH = PIPELINE_DIR / "live_frame_outbox" / "live_frame.json"
 RECENT_CROPS_COUNT = 100  # how many of the most recent crops (unfiltered -- every
-# crop SEGMENT accepts, not just confidently classified ones) to keep in the
-# live-stream window's thumbnail strip. The strip renders taller than the Crops
-# tab's own viewport at this count -- the frontend scrolls it rather than shrinking
-# it to fit (see frontend_private/style.css's #liveViewContainer.scrollable).
+
 RECENT_CROPS_COLUMNS = 5  # thumbnail strip wraps into a grid this many columns wide
 # (RECENT_CROPS_COUNT=100 -> 20 rows) instead of one long unbounded row
 RECENT_CROPS_THUMB_PX = 96  # each strip thumbnail's square size in pixels, post-resize
@@ -437,7 +338,7 @@ RECENT_CROPS_CAPTION_PX = 36  # height of the black caption band under each thum
 ### Remote server (Tailscale)
 ### ==========================
 REMOTE_HOST = "server-lab"
-REMOTE_BASE = "Faro_260925_ongoing"  # relative to the SSH user's home on the remote host --
+REMOTE_BASE = "Faro_260925_ongoing_incoming"  # relative to the SSH user's home on the remote host --
 # named after the camera's current deployment (site_startdate_status); update this whenever
 # the camera moves to a new deployment location so uploads land in a folder matching where
 # the data actually came from, instead of mixing multiple deployments into one folder
@@ -449,15 +350,6 @@ TRAINING_FRAME_UPLOAD_TIMEOUT_S = 180  # full frames (4512x4512) are far bigger 
 MAX_UPLOAD_RETRIES_PER_CYCLE = 6      # exponential-backoff attempts within one polling cycle
 MAX_UPLOAD_ATTEMPTS_TOTAL = 50        # escalate an item to failed/ past this many cycle-level attempts
 CROP_UPLOAD_ENABLED = False  # False pauses crop uploads without deleting queued crops
-
-# Kill switch for send.py's uploads to server-lab (crops, training frames, live frame
-# preview) -- flip to False to pause all of it, e.g. while the deployment location is
-# unsettled or the remote folder is being renamed. Capture/segment/classify keep running
-# unaffected: crops and training frames just pile up in their local queues (que_crops,
-# que_training_frames) instead of being uploaded, and nothing is lost -- send.py drains
-# the backlog normally once this goes back to True. Does NOT affect metadata.py's own
-# device-health/environmental uploads or heartbeats, which keep going either way so the
-# device stays remotely monitorable.
 ENABLE_UPLOADS = True
 
 ### ==========================
