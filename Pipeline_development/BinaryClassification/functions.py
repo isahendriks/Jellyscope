@@ -1059,6 +1059,20 @@ def deploy_checkpoint_to_jetson(local_path, tag=None, overwrite=False):
     print(f"✓ Copied {local_path.name} to {JETSON_HOST}:{remote_path}")
     return remote_name
 
+def deploy_background_to_jetson(bkg_image, local_path, tag=None, overwrite=False):
+    """Save a background image (4512x4512 uint8 array or tensor) as a lossless PNG at
+    local_path, then copy it to the Jetson's models/ folder as <stem>_<tag>.png, with the
+    same no-overwrite rule as deploy_checkpoint_to_jetson. Returns the remote filename,
+    or None if nothing was copied.
+    """
+    bkg_image = bkg_image.cpu().numpy() if isinstance(bkg_image, torch.Tensor) else np.asarray(bkg_image)
+    if bkg_image.shape != (4512, 4512) or bkg_image.dtype != np.uint8:
+        raise ValueError(f"Expected a 4512x4512 uint8 background, got {bkg_image.shape} {bkg_image.dtype}")
+    local_path = Path(local_path).with_suffix(".png")
+    if not cv2.imwrite(str(local_path), bkg_image):
+        raise OSError(f"Could not write background image to {local_path}")
+    return deploy_checkpoint_to_jetson(local_path, tag=tag, overwrite=overwrite)
+
 def split_image_into_tiles(image, grid_size):
     """
     Split a 4512x4512 image into square tiles of size tile_size x tile_size.

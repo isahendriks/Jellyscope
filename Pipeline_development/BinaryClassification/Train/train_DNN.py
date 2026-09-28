@@ -1006,8 +1006,16 @@ scorer_maha = MahalanobisScorer(
     latent_dim=latent_dims, grid_size=grid_size,
 )
 
-#%% EVALUATION: Find optimal threshold and plot ROC curve and confusion matrix
+#%% EVALUATION: Pick threshold on the val set, then evaluate it on the test set
+# The threshold is chosen on val tiles from THRESHOLD_EFFORT only (the site the model is deployed
+# at): other efforts contribute only obs tiles, which would make precision look better than it is
+# on site. The test set is only used to report how that threshold does.
+THRESHOLD_EFFORT = monitoring_effort
+THRESHOLD_F_BETA = 3  # F-beta the threshold maximizes; >1 favours recall (catching obs) over precision
+EMPTY_PERCENTILE = 99.0  # fallback when val has no obs: flag the top 1% of empty val tiles
+
 test_loader = DataLoader(test_dataset_lat, batch_size=batch_size, shuffle=False, num_workers=0)
+val_loader_eval = DataLoader(val_dataset_lat, batch_size=batch_size, shuffle=False, num_workers=0)
 
 n_obs = test_dataset_lat.tensors[4].sum().item()
 n_empty = len(test_loader.dataset) - n_obs
@@ -1028,66 +1036,68 @@ else:
     raise ValueError(f"Invalid mode: {mode}. Must be 'one_class', 'binary', or 'mahalanobis'.")
 
 scorer.to(device)
-# Run all test data through the loader
-with torch.no_grad():
-    all_scores = []
-    all_labels = []
-    all_recon = []
-    for X_latent, X_recon, rows, cols, y in test_loader:
-        X_latent = X_latent.to(device, non_blocking=True)
-        X_recon = X_recon.to(device, non_blocking=True)
-        rows = rows.to(device, non_blocking=True)
-        cols = cols.to(device, non_blocking=True)
-        # y = y.to(device, non_blocking=True)
 
-        if mode == "one_class":
-            z = scorer(X_latent, X_recon, rows, cols)
-            scores = ((z - center) ** 2).sum(dim=1)
-        elif mode == "binary":
-            probs = scorer.predict_batch(X_latent, X_recon, rows, cols)
-            scores = probs
-        elif mode == "mahalanobis":
-            probs = scorer.predict_batch(X_latent, X_recon, rows, cols)
-            scores = probs
-        else:
-            raise ValueError(f"Invalid mode: {mode}. Must be 'one_class' or 'binary'")
+def score_loader(loader):
+    """Scorer output, labels and AE recon error for every tile in loader (loader order)."""
+    scores_list, labels_list, recon_list = [], [], []
+    with torch.no_grad():
+        for X_latent, X_recon, rows, cols, y in loader:
+            X_latent = X_latent.to(device, non_blocking=True)
+            X_recon = X_recon.to(device, non_blocking=True)
+            rows = rows.to(device, non_blocking=True)
+            cols = cols.to(device, non_blocking=True)
 
-        all_scores.append(scores.cpu().numpy())
-        all_labels.append(y.numpy())
-        all_recon.append(X_recon.cpu().numpy())
+            if mode == "one_class":
+                z = scorer(X_latent, X_recon, rows, cols)
+                scores = ((z - center) ** 2).sum(dim=1)
+            elif mode in ("binary", "mahalanobis"):
+                scores = scorer.predict_batch(X_latent, X_recon, rows, cols)
+            else:
+                raise ValueError(f"Invalid mode: {mode}. Must be 'one_class', 'binary' or 'mahalanobis'")
 
-# all_scores = np.concatenate(all_scores)
-all_labels = np.concatenate(all_labels)
-all_recon = np.concatenate(all_recon)
-all_scores = np.concatenate(all_scores)  # Combine model score and reconstruction error for evaluation
+            scores_list.append(scores.cpu().numpy())
+            labels_list.append(y.numpy())
+            recon_list.append(X_recon.cpu().numpy())
+    return np.concatenate(scores_list), np.concatenate(labels_list), np.concatenate(recon_list)
 
-# n_obs = 0
+all_scores, all_labels, all_recon = score_loader(test_loader)
+val_scores, val_labels, _ = score_loader(val_loader_eval)
 
+# --- Threshold, from the val set (THRESHOLD_EFFORT tiles only) ---
+# Neither loader is shuffled, so val results are in val_idx order.
+val_mask = tile_effort[val_idx] == THRESHOLD_EFFORT
+val_scores_thr, val_labels_thr = val_scores[val_mask], val_labels[val_mask]
+n_val_obs = int(val_labels_thr.sum())
+print(f"\nThreshold chosen on {THRESHOLD_EFFORT} val tiles: {n_val_obs} obs, {len(val_labels_thr) - n_val_obs} empty")
+
+if n_val_obs == 0:
+    # No obs to trade recall against precision: flag the top (100 - EMPTY_PERCENTILE)% of empty val tiles
+    best_threshold = float(np.percentile(val_scores_thr, EMPTY_PERCENTILE))
+    print(f"  No {THRESHOLD_EFFORT} obs in val: threshold = {EMPTY_PERCENTILE:.0f}th percentile of empty val scores = {best_threshold:.4f}")
+else:
+    val_precision, val_recall, val_thresholds = precision_recall_curve(val_labels_thr, val_scores_thr)
+    # precision/recall have one more entry than thresholds (the recall=0 end), so drop it
+    p, r = val_precision[:-1], val_recall[:-1]
+    for beta in [0.5, 1, 2, 3]:
+        f = (1 + beta**2) * p * r / (beta**2 * p + r + 1e-8)
+        i = np.argmax(f)
+        chosen = "  <- used" if beta == THRESHOLD_F_BETA else ""
+        print(f"  F{beta} threshold: {val_thresholds[i]:.4f} (val F{beta}={f[i]:.3f}, precision={p[i]:.3f}, recall={r[i]:.3f}){chosen}")
+    f = (1 + THRESHOLD_F_BETA**2) * p * r / (THRESHOLD_F_BETA**2 * p + r + 1e-8)
+    best_threshold = float(val_thresholds[np.argmax(f)])
+print(f"Threshold: {best_threshold:.4f} (applied unchanged to the test set below)")
+
+# --- Test-set evaluation at that threshold ---
 if n_obs == 0:
-    # No observation samples in the test set: classification metrics (ROC/PR/confusion
-    # matrix) are undefined without a positive class, so fall back to a one-class threshold
-    # chosen from the empty-sample score distribution instead (e.g. "flag the top 1% most
-    # anomalous empty tiles").
-    print(
-        "\nNo observation samples in test set (n_obs=0): skipping ROC/PR/confusion-matrix "
-        "evaluation since those metrics require a positive class.\n"
-        "Falling back to one-class thresholding based on the empty-tile score distribution."
-    )
-
+    # No observation samples in the test set: ROC/PR/confusion matrix need a positive class
+    print("\nNo observation samples in test set (n_obs=0): skipping ROC/PR/confusion-matrix evaluation.")
     avg_precision = float('nan')
-
-    percentile = 99.0
-    best_threshold = float(np.percentile(all_scores, percentile))
-
-    print(f"\nEmpty-tile score distribution:")
-    print(f"  mean = {all_scores.mean():.4f}, std = {all_scores.std():.4f}")
-    print(f"  min = {all_scores.min():.4f}, max = {all_scores.max():.4f}")
-    print(f"\nRecommended threshold ({percentile:.0f}th percentile of empty scores): {best_threshold:.4f}")
-    print("  (Tiles scoring above this are flagged as anomalies/observations)")
+    preds = (all_scores >= best_threshold).astype(int)
+    print(f"  {preds.mean() * 100:.2f}% of empty test tiles flagged at the val threshold")
 
     plt.figure(figsize=(6, 6))
-    plt.hist(all_scores, bins=50, alpha=0.7, label='Empty tiles')
-    plt.axvline(best_threshold, color='r', linestyle='--', label=f'Threshold = {best_threshold:.4f}')
+    plt.hist(all_scores, bins=50, alpha=0.7, label='Empty test tiles')
+    plt.axvline(best_threshold, color='r', linestyle='--', label=f'Threshold (val) = {best_threshold:.4f}')
     plt.xlabel('Anomaly score')
     plt.ylabel('Count')
     plt.title('Score Distribution on Empty Tiles (one-class evaluation)')
@@ -1095,45 +1105,8 @@ if n_obs == 0:
     plt.grid(alpha=0.3)
     plt.show()
 else:
-    # Plot precision-recall curve
-    precision, recall, thresholds = precision_recall_curve(all_labels, all_scores)
+    precision, recall, _ = precision_recall_curve(all_labels, all_scores)
     avg_precision = average_precision_score(all_labels, all_scores)
-
-    # calculate threshold based on optimized F-scores
-    # Note: precision and recall have length n_thresholds+1, thresholds has length n_thresholds
-    # So we only use the first n_thresholds elements of precision/recall
-    f0_25_scores = 1.0625 * (precision[:-1] * recall[:-1]) / (0.0625 * precision[:-1] + recall[:-1] + 1e-8)
-    f0_5_scores = 1.25 * (precision[:-1] * recall[:-1]) / (0.25 * precision[:-1] + recall[:-1] + 1e-8)
-    f1_scores = 2 * (precision[:-1] * recall[:-1]) / (precision[:-1] + recall[:-1] + 1e-8)
-    f2_scores = 5 * (precision[:-1] * recall[:-1]) / (4 * precision[:-1] + recall[:-1] + 1e-8)
-    f3_scores = 10 * (precision[:-1] * recall[:-1]) / (9 * precision[:-1] + recall[:-1] + 1e-8)
-
-    # Calculate best threshold for each F-score
-    best_idx_f0_25 = np.argmax(f0_25_scores)
-    best_idx_f0_5 = np.argmax(f0_5_scores)
-    best_idx_f1 = np.argmax(f1_scores)
-    best_idx_f2 = np.argmax(f2_scores)
-    best_idx_f3 = np.argmax(f3_scores)
-
-    best_threshold_f0_25 = thresholds[best_idx_f0_25]
-    best_threshold_f0_5 = thresholds[best_idx_f0_5]
-    best_threshold_f1 = thresholds[best_idx_f1]
-    best_threshold_f2 = thresholds[best_idx_f2]
-    best_threshold_f3 = thresholds[best_idx_f3]
-    youdens_j = recall - (1 - precision)
-    best_idx_youden = np.argmax(youdens_j)
-    best_threshold_youden = thresholds[best_idx_youden]
-
-    print(f"Optimal thresholds:")
-    print(f"  0.25 score: {best_threshold_f0_25:.4f} (0.25={f0_25_scores[best_idx_f0_25]:.4f})")
-    print(f"  0.5 score: {best_threshold_f0_5:.4f} (0.5={f0_5_scores[best_idx_f0_5]:.4f})")
-    print(f"  F1 score: {best_threshold_f1:.4f} (F1={f1_scores[best_idx_f1]:.4f})")
-    print(f"  F2 score: {best_threshold_f2:.4f} (F2={f2_scores[best_idx_f2]:.4f})")
-    print(f"  F3 score: {best_threshold_f3:.4f} (F3={f3_scores[best_idx_f3]:.4f})")
-
-    # Use F3 since you prefer recall (catching obs) over precision
-    best_threshold = best_threshold_f3
-    print(f"\nRecommended threshold based on Youden's J statistic: {best_threshold:.4f}")
 
     plt.figure(figsize=(6, 6))
     plt.plot(recall, precision, label=f'Precision-Recall curve (AP = {avg_precision:.4f})')
@@ -1152,7 +1125,7 @@ else:
 
     plt.figure(figsize=(6, 6))
     plt.plot(fpr, tpr, label=f'ROC curve (AUC = {roc_auc:.4f})')
-    plt.plot(x_threshold, y_threshold, 'ro', label=f'Threshold = {best_threshold:.4f}')
+    plt.plot(x_threshold, y_threshold, 'ro', label=f'Threshold (val) = {best_threshold:.4f}')
     plt.plot([0, 1], [0, 1], 'k--')
     plt.xlabel('False Positive Rate')
     plt.ylabel('True Positive Rate')
@@ -1162,11 +1135,18 @@ else:
     plt.show()
 
     preds = (all_scores >= best_threshold).astype(int)
-    cm = confusion_matrix(all_labels, preds)
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Empty', 'Observation'])
-    disp.plot(cmap='Blues')
 
-    plt.title('Confusion Matrix')
+    # All test tiles, and THRESHOLD_EFFORT's alone (what the deployed model will see)
+    test_mask_thr = tile_effort[test_idx] == THRESHOLD_EFFORT
+    cm_groups = [("All test tiles", np.ones(len(preds), dtype=bool)), (f"{THRESHOLD_EFFORT} test tiles", test_mask_thr)]
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    for ax, (title, m) in zip(axes, cm_groups):
+        cm = confusion_matrix(all_labels[m], preds[m], labels=[0, 1])
+        ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Empty', 'Observation']).plot(cmap='Blues', ax=ax, colorbar=False)
+        (tn, fp), (fn, tp) = cm
+        ax.set_title(f"{title}\nprecision={tp / max(tp + fp, 1):.3f}, recall={tp / max(tp + fn, 1):.3f}", fontsize=10)
+    fig.suptitle(f"Confusion matrices at val threshold {best_threshold:.4f}")
+    plt.tight_layout()
     plt.show()
 
 #%% Plot examples of false positives and false negatives
@@ -1400,3 +1380,5 @@ else:
 DEPLOY_TAG = "residual_v1"
 
 deploy_checkpoint_to_jetson(scorer_model_name, tag=DEPLOY_TAG)
+
+# %%
