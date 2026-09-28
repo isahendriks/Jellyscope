@@ -1,0 +1,197 @@
+/*
+  Jellyscope public livestream styles.
+
+  Deliberately the same visual language as ../frontend_private/style.css (dark
+  background, green accent, monospace) -- this is the public face of the same
+  project, just with different content (a scrolling sightings feed instead of
+  device telemetry) and no login.
+
+  Organized top-to-bottom in the order below:
+    1. RESET & THEME  -- page-wide defaults
+    2. LAYOUT          -- where things sit on screen (video, column)
+    3. PANEL CHROME     -- the shared "box" look used by all panels
+    4. CROPS FEED       -- the recent-sightings list specifically
+*/
+
+/* ===== 1. RESET & THEME ===== */
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  overflow: auto;
+  background: #000;
+  color: #fff;
+  font-family: -apple-system, Menlo, Consolas, monospace;
+}
+
+.panel-title {
+  display: block;
+  font-size: 11px;
+  font-weight: bold;
+  letter-spacing: 0.6px;
+  margin-bottom: 6px;
+}
+
+/* ===== 2. LAYOUT ===== */
+
+/* width/height (not max-width/max-height) so the live frame -- sent
+   downscaled by the Jetson for faster transmit/decode -- gets scaled UP to
+   fill the space instead of rendering at its tiny native pixel size.
+   min(100vw,100vh) fills the smaller viewport dimension, so the green border
+   hugs the visible frame rather than empty space out to the screen edge.
+   Same approach as frontend_private/style.css's #videoFrame. */
+#liveFrame {
+  position: fixed;
+  bottom: 0;
+  right: 0;
+  width: min(100vw, 100vh);
+  height: min(100vw, 100vh);
+  display: block;
+  box-sizing: border-box;
+  border: 2px solid #00ff00;
+  background: #050505; /* visible as a placeholder color before the first frame loads */
+}
+
+/* Exactly the same box as #liveFrame (same position/size rules), so the two
+   stack in perfect registration -- this is what lets media.js draw a box's
+   x/y/width/height straight out of live_frame.json without ever having to
+   know how big #liveFrame is actually rendered on screen; the SVG's viewBox
+   (set in media.js) handles that scaling automatically. pointer-events: none
+   so this transparent layer never blocks anything under it. */
+#liveFrameBoxes {
+  position: fixed;
+  bottom: 0;
+  right: 0;
+  width: min(100vw, 100vh);
+  height: min(100vw, 100vh);
+  box-sizing: border-box;
+  pointer-events: none;
+}
+
+.crop-box {
+  fill: none;
+  stroke: #00ff00;
+  stroke-width: 2;
+  /* Constant on-screen thickness regardless of the viewBox scale factor --
+     without this, stroke-width:2 would render thicker/thinner depending on
+     how large #liveFrame happens to be on a given visitor's screen. */
+  vector-effect: non-scaling-stroke;
+}
+
+.crop-box-label {
+  fill: #00ff00;
+  font-family: -apple-system, Menlo, Consolas, monospace;
+  font-weight: bold;
+  /* No font-size/stroke-width here (unlike .crop-box's stroke-width) --
+     there's no reliably-supported CSS equivalent of non-scaling-stroke for
+     text size, so media.js computes and sets both per-element instead,
+     scaled against the SVG's actual on-screen size vs. its viewBox. See
+     renderBoxes() there. */
+  paint-order: stroke;
+  stroke: #000;
+}
+
+#liveBadge {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: bold;
+  letter-spacing: 0.6px;
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid #00ff00;
+  border-radius: 4px;
+}
+
+/* One column, in normal document flow -- panels stack top-to-bottom here and
+   can never overlap or need JS to measure/place one relative to the other. */
+#topLeftColumn {
+  position: fixed;
+  top: 16px;
+  left: 16px;
+  width: 300px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 32px);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* ===== 3. PANEL CHROME ===== */
+
+/* Every panel on this page shares this "box" look -- one class, not
+   duplicated rules, so changing the panel style only ever needs editing here. */
+.panel {
+  padding: 8px 12px;
+  border: 2px solid #00ff00;
+  border-radius: 6px;
+  background: rgba(10, 10, 10, 0.88);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.45);
+}
+
+#introPanel p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #ccc;
+}
+
+/* ===== 4. CROPS FEED ===== */
+
+#cropsPanel {
+  overflow-y: auto;
+}
+
+#cropsEmpty {
+  display: block;
+  font-size: 11px;
+  color: #aaa;
+}
+
+#cropsFeed {
+  display: none; /* shown by crops.js once at least one sighting has arrived */
+}
+
+.crop-entry {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-top: 1px solid rgba(0, 255, 0, 0.2);
+}
+
+.crop-entry:first-child {
+  border-top: none;
+}
+
+.crop-thumb {
+  width: 48px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: 3px;
+  border: 1px solid rgba(0, 255, 0, 0.4);
+  flex-shrink: 0;
+  /* Crops arrive in all sorts of source aspect ratios/sizes -- a plain gray
+     background avoids a flash of empty white while each thumbnail loads. */
+  background: #111;
+}
+
+.crop-caption {
+  display: flex;
+  flex-direction: column;
+  min-width: 0; /* lets long species names ellipsize instead of overflowing the column */
+}
+
+.crop-species {
+  font-size: 13px;
+  font-weight: bold;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.crop-details {
+  font-size: 11px;
+  color: #aaa;
+}

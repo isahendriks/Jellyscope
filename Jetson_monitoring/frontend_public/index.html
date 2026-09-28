@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<!--
+  Jellyscope public livestream -- the page skeleton only.
+
+  This file just says WHAT is on the page and WHERE (structure). It does not
+  contain any actual crop images or species names -- those get filled in by
+  media.js and crops.js after the page loads, by asking server.py (the Python
+  backend running on server-lab, NOT the Jetson) for the latest data.
+
+  This page is deliberately public: no login, no password. Compare with
+  ../frontend_private/index.html, the password-gated ops dashboard the Jetson
+  serves for the people running the station -- that one shows device health
+  and queue depths; this one only ever shows the live view and recent jellyfish
+  sightings, because that's the only data server.py's backend hands out here.
+
+  Every element below that JS needs to find and update has a stable `id` --
+  that's the connection between this file and media.js/crops.js. If you rename
+  an id here, update the matching `getElementById(...)` call in the JS too, or
+  that piece of the page will silently stop updating.
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Jellyscope Live</title>
+  <meta name="description" content="Live jellyfish and plankton monitoring feed from Kristineberg research station.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- The current camera view, refreshed every couple of seconds by media.js.
+       Not a real video stream -- see media.js for why that's a deliberate choice,
+       not a limitation. The image itself is undecorated (no boxes baked into its
+       pixels) -- liveFrameBoxes below is a separate, transparent SVG layered
+       exactly on top of it, and media.js draws each sighting's box into that SVG
+       from live_frame.json. Keeping them as two elements (not one pre-drawn image)
+       is what lets this page style the boxes/labels itself. -->
+  <img id="liveFrame" alt="Live camera view from Kristineberg station">
+  <svg id="liveFrameBoxes"></svg>
+  <div id="liveBadge">LIVE</div>
+
+  <!-- Everything else lives in this one column, pinned to the top-left. -->
+  <div id="topLeftColumn">
+
+    <div id="introPanel" class="panel">
+      <div class="panel-title">JELLYSCOPE</div>
+      <p>
+        The Jellyscope is an instrument designed specifically for monitoring gelatinous zooplankton continuously. 
+        This is a livestream of the Jellyscope deployed at Kristineberg research station. 
+      </p>
+    </div>
+
+    <!-- Feed of the most recently identified crops (jellyfish/plankton
+         sightings), newest first. crops.js fills this in from /recent_crops;
+         cropsEmpty is shown until the first real sighting arrives. -->
+    <div id="cropsPanel" class="panel">
+      <div class="panel-title">RECENT SIGHTINGS</div>
+      <div id="cropsFeed"></div>
+      <span id="cropsEmpty">Waiting for the first sighting...</span>
+    </div>
+
+  </div>
+
+  <!-- media.js first, crops.js second -- load order doesn't matter functionally
+       (neither depends on the other), this just keeps "simple file first" as the
+       reading order (same convention as frontend_private/index.html). -->
+  <script src="media.js"></script>
+  <script src="crops.js"></script>
+</body>
+</html>
