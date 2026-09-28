@@ -40,7 +40,7 @@ import config
 from models import segmentation as seg_models
 from models import vit_classifier
 
-CAL_DIR = config.PIPELINE_DIR / "trt" / "calibration"
+CAL_DIR = config.CALIBRATION_DIR
 ENGINE_DIR = config.PIPELINE_DIR / "trt" / "engines"
 
 device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")

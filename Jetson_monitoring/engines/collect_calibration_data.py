@@ -68,8 +68,11 @@ import segment_core
 from models import segmentation as seg_models
 from models import vit_classifier
 
-CAL_DIR = config.PIPELINE_DIR / "trt" / "calibration"
+CAL_DIR = config.CALIBRATION_DIR
 CAL_DIR.mkdir(parents=True, exist_ok=True)
+# build_trt_int8.py never reads past this many tiles -- collecting more only costs disk
+# (a 200-image run tried to write a 16.8 GB seg_tiles.npy and filled the eMMC).
+MAX_SEG_TILES = config.SEG_CALIBRATION_BATCHES * config.SEG_ENGINE_BATCH
 
 device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 print(f"Using device: {device}")
@@ -151,6 +154,15 @@ def main(folder: Path, max_images: int) -> None:
     if not image_paths:
         raise FileNotFoundError(f"No calibration images found under {folder} -- check the folder layout "
                                  "(expects obs/, no_obs/, or a flat/nested folder of .png files).")
+    # Each image yields SEG_ENGINE_BATCH tiles, so only this many images can ever be used.
+    # Spread them evenly over the selection rather than taking the first N -- consecutive
+    # frames are near-duplicates and would narrow the calibration ranges.
+    max_useful_images = -(-MAX_SEG_TILES // config.SEG_ENGINE_BATCH)
+    if len(image_paths) > max_useful_images:
+        keep = np.linspace(0, len(image_paths) - 1, max_useful_images).round().astype(int)
+        image_paths = [image_paths[i] for i in keep]
+        print(f"Capped to {len(image_paths)} evenly spaced images ({MAX_SEG_TILES} tiles = what "
+              f"build_trt_int8.py uses)")
 
     all_tiles, all_rows, all_cols = [], [], []
     all_crops, all_sizes = [], []
@@ -196,9 +208,9 @@ def main(folder: Path, max_images: int) -> None:
 
         print(f"  {image_path.name}: {tiles_tensor.shape[0]} tiles, {len(accepted)} crops")
 
-    seg_tiles = torch.cat(all_tiles, dim=0)
-    seg_rows = torch.cat(all_rows, dim=0)
-    seg_cols = torch.cat(all_cols, dim=0)
+    seg_tiles = torch.cat(all_tiles, dim=0)[:MAX_SEG_TILES]
+    seg_rows = torch.cat(all_rows, dim=0)[:MAX_SEG_TILES]
+    seg_cols = torch.cat(all_cols, dim=0)[:MAX_SEG_TILES]
     print(f"\nTotal SEGMENT calibration tiles: {seg_tiles.shape[0]}")
     np.save(CAL_DIR / "seg_tiles.npy", seg_tiles.numpy())
     np.save(CAL_DIR / "seg_rows.npy", seg_rows.numpy())

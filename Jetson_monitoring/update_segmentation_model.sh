@@ -46,6 +46,7 @@ MODELS_DIR="${SCRIPT_DIR}/models"
 CONFIG_PY="${SCRIPT_DIR}/Monitor/config.py"
 ENGINE_DIR="${SCRIPT_DIR}/trt/engines"
 ONNX_DIR="${SCRIPT_DIR}/trt/onnx"
+CAL_DIR="/mnt/sda1/jellyscope_calibration"  # must match Monitor/config.py's CALIBRATION_DIR
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 <name> [--with-fp16] [--max-images N] [--calibration-folder DIR]" >&2
@@ -142,6 +143,9 @@ rm -f "${ENGINE_DIR}"/seg_encoder_int8.engine "${ENGINE_DIR}"/seg_decoder_int8.e
 rm -f "${ONNX_DIR}"/seg_encoder.onnx "${ONNX_DIR}"/seg_encoder.onnx.data
 rm -f "${ONNX_DIR}"/seg_decoder.onnx "${ONNX_DIR}"/seg_decoder.onnx.data
 rm -f "${ONNX_DIR}"/seg_scorer.onnx "${ONNX_DIR}"/seg_scorer.onnx.data
+# build_trt_int8.py reuses an existing *_calibration.cache instead of recalibrating --
+# a stale one would silently give the new checkpoint the previous one's INT8 ranges.
+rm -f "${CAL_DIR}"/seg_encoder_calibration.cache "${CAL_DIR}"/seg_decoder_calibration.cache "${CAL_DIR}"/seg_scorer_calibration.cache
 if [[ "${WITH_FP16}" != true ]]; then
   rm -f "${ENGINE_DIR}"/seg_encoder_fp16.engine "${ENGINE_DIR}"/seg_decoder_fp16.engine "${ENGINE_DIR}"/seg_scorer_fp16.engine
 fi

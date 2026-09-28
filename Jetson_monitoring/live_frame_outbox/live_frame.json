@@ -1,15 +1,6 @@
 {
-  "frame_timestamp_unix": 1790423044.6228993,
+  "frame_timestamp_unix": 1790601637.7476864,
   "image_width": 451,
   "image_height": 451,
-  "crops": [
-    {
-      "crop_x0": 0,
-      "crop_y0": 0,
-      "crop_x1": 451,
-      "crop_y1": 451,
-      "class_label": null,
-      "class_confidence": null
-    }
-  ]
+  "crops": []
 }

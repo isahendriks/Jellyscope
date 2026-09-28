@@ -41,7 +41,7 @@ import torch
 import config
 
 ONNX_DIR = config.PIPELINE_DIR / "trt" / "onnx"
-CAL_DIR = config.PIPELINE_DIR / "trt" / "calibration"
+CAL_DIR = config.CALIBRATION_DIR
 ENGINE_DIR = config.PIPELINE_DIR / "trt" / "engines"
 ENGINE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -75,8 +75,9 @@ VIT_BATCH = config.VIT_ENGINE_BATCH
 # real accuracy regression at the smaller calibration size -- INT8 SEGMENT produced
 # 55 crops vs FP32's 226 across the same 48 sample images, not just noise near the
 # scorer_threshold=0.3004 decision boundary. More calibration data is the direct fix
-# for exactly this kind of range-estimation error.
-SEG_CALIBRATION_BATCHES = 30
+# for exactly this kind of range-estimation error. Lives in config.py so
+# collect_calibration_data.py collects exactly this many tiles and no more.
+SEG_CALIBRATION_BATCHES = config.SEG_CALIBRATION_BATCHES
 
 
 class NpyCalibrator(trt.IInt8EntropyCalibrator2):
@@ -163,7 +164,8 @@ def build_engine(onnx_path: Path, engine_path: Path, precision: str, calibrator=
 
 
 def main(skip_fp16: bool, skip_int8: bool):
-    seg_tiles = np.load(CAL_DIR / "seg_tiles.npy")
+    # mmap: seg_tiles.npy is ~2.5 GB -- only the calibrator's current batch needs to be in RAM.
+    seg_tiles = np.load(CAL_DIR / "seg_tiles.npy", mmap_mode="r")
     seg_rows = np.load(CAL_DIR / "seg_rows.npy")
     seg_cols = np.load(CAL_DIR / "seg_cols.npy")
     seg_mu = np.load(CAL_DIR / "seg_mu.npy")

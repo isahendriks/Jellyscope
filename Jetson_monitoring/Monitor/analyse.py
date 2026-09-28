@@ -27,6 +27,8 @@ models/segmentation.py's build_scorer()/detect_scorer_type().
 import gc
 import json
 import os
+import queue
+import shutil
 import threading
 import time
 from collections import deque
@@ -924,6 +926,64 @@ def maybe_queue_training_frame(enhanced, image_name: str, source_frame_id, sourc
         save_training_collection_count()
 
 
+# Full-frame archive (config.ARCHIVE_PREPROCESSED_FRAMES) -- PNG-encoding a 4512px frame
+# takes ~0.7 s, so it runs on one background thread fed by a small bounded queue (see
+# maybe_archive_frame for what happens when it's full). Started lazily on first use so
+# importing analyse.py (test harness) doesn't start it.
+_archive_queue: queue.Queue = queue.Queue(maxsize=4)
+_archive_thread: threading.Thread | None = None
+archive_frames_written = 0
+archive_frames_dropped = 0
+_archive_low_space_logged = False
+
+
+def _archive_writer() -> None:
+    global archive_frames_written, archive_frames_dropped, _archive_low_space_logged
+    png_params = [cv2.IMWRITE_PNG_COMPRESSION, config.PREPROCESSED_ARCHIVE_PNG_LEVEL]
+    while True:
+        enhanced, image_name, timestamp_unix = _archive_queue.get()
+        try:
+            free_gb = shutil.disk_usage(config.PREPROCESSED_ARCHIVE_DIR.parent).free / 1e9
+            if free_gb < config.PREPROCESSED_ARCHIVE_MIN_FREE_GB:
+                archive_frames_dropped += 1
+                if not _archive_low_space_logged:
+                    print(f"Frame archive paused: {free_gb:.0f} GB free < "
+                          f"PREPROCESSED_ARCHIVE_MIN_FREE_GB={config.PREPROCESSED_ARCHIVE_MIN_FREE_GB}")
+                    _archive_low_space_logged = True
+                continue
+            _archive_low_space_logged = False
+            day_dir = config.PREPROCESSED_ARCHIVE_DIR / time.strftime("%Y%m%d", time.gmtime(timestamp_unix))
+            day_dir.mkdir(parents=True, exist_ok=True)
+            ok, encoded = cv2.imencode(".png", enhanced, png_params)
+            if not ok:
+                raise RuntimeError("cv2.imencode failed")
+            # tmp + rename so a crash/power cut never leaves a truncated .png behind
+            tmp_path = day_dir / f"{image_name}.png.tmp"
+            tmp_path.write_bytes(encoded.tobytes())
+            os.replace(tmp_path, day_dir / f"{image_name}.png")
+            archive_frames_written += 1
+        except Exception as exc:  # never let archiving take analyse.py down
+            archive_frames_dropped += 1
+            print(f"Frame archive: failed to write {image_name}: {exc}")
+
+
+def maybe_archive_frame(enhanced, image_name: str, timestamp_unix: float) -> None:
+    global _archive_thread, archive_frames_dropped
+    if not config.ARCHIVE_PREPROCESSED_FRAMES:
+        return
+    if _archive_thread is None:
+        _archive_thread = threading.Thread(target=_archive_writer, daemon=True, name="frame-archive")
+        _archive_thread.start()
+        print(f"Frame archive enabled -> {config.PREPROCESSED_ARCHIVE_DIR}")
+    # Brief blocking wait rather than put_nowait: during backlog catch-up analyse.py can
+    # outpace the ~0.7 s/frame writer, and waiting keeps every frame. The timeout only
+    # trips if the writer is actually stuck (e.g. sda1 hung), so the main loop can't wedge.
+    try:
+        _archive_queue.put((enhanced, image_name, timestamp_unix), timeout=2.0)
+    except queue.Full:
+        archive_frames_dropped += 1
+
+
 def segment_and_classify(enhanced, image_name: str, source_frame_id=None, source_timestamp_unix=None) -> tuple[list, dict]:
     """Runs SEGMENT + CLASSIFY on an already-enhanced (post-PREPROCESS) image and
     returns (results, timings) -- results is a list of (crop_stem, encoded_png_bytes,
@@ -1161,6 +1221,7 @@ def process_frame(stem: str, read_result: dict, claim_duration: float = 0.0) -> 
     t_preprocess_end = time.perf_counter()
 
     maybe_queue_training_frame(enhanced, image_name, sidecar["frame_id"], sidecar["timestamp_unix"])
+    maybe_archive_frame(enhanced, image_name, sidecar["timestamp_unix"])
 
     results, seg_timings = segment_and_classify(
         enhanced, image_name,
@@ -1210,7 +1271,9 @@ def process_frame(stem: str, read_result: dict, claim_duration: float = 0.0) -> 
           f"sidecar={sidecar_time:.3f} imread={imread_time:.3f}) preprocess={preprocess_time:.3f}s "
           f"segment={segment_time:.3f}s inference={inference_time:.3f}s "
           f"send={send_time:.3f}s[{write_times_str}] stream={stream_time:.3f}s "
-          f"total={total_time:.3f}s crops={len(results)}")
+          f"total={total_time:.3f}s crops={len(results)}"
+          + (f" archived={archive_frames_written} archive_dropped={archive_frames_dropped}"
+             if config.ARCHIVE_PREPROCESSED_FRAMES else ""))
 
     del image_gray, original_frame, enhanced, results, sidecar
 

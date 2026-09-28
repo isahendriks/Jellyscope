@@ -1,0 +1,10 @@
+{
+  "window_start_unix": 1790595792.0073118,
+  "window_end_unix": 1790595851.3406692,
+  "sample_count": 56,
+  "bar3xt_pressure_mbar_mean": 1108.6564285714287,
+  "bar3xt_temp_c_mean": 23.201785714285712,
+  "bar3xt_depth_m_mean": 0.9755357142857142,
+  "bar3xt_depth_m_min": 0.97,
+  "bar3xt_depth_m_max": 0.98
+}
