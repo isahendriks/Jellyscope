@@ -1,0 +1,6 @@
+numpy
+opencv-python
+torch
+kornia
+psutil
+PyGObject  # Python bindings for Aravis; needs: brew install aravis gobject-introspection pkg-config cairo
