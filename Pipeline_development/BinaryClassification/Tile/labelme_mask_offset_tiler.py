@@ -31,7 +31,7 @@ from collections import defaultdict
 grid_size = 16
 tile_size = int(4512 / grid_size)
 
-monitoring_effort = "Kristineberg_251128"
+monitoring_effort = "Faro_260930"  # "Kristineberg_260424"
 
 OFFSET_NORMALIZED = [0.0, 0.2, 0.4, 0.6, 0.8]
 

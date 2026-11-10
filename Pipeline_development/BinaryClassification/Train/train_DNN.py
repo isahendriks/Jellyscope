@@ -79,7 +79,7 @@ ROOT_DIR_C = r"C:\Users\IsaH\Documents\Jellyscope\Training data new\Binary_class
 ROOT_DIR_R = r"R:\LU24A1037-Jellyscope\Jellyscope\Training data new\Binary_classifier"
 
 # monitoring_effort = "Kristineberg_260814"
-monitoring_effort = "Faro_260928"  # for titles and saved model names, e.g. "kristineberg_251128"
+monitoring_effort = "Faro_260930"  # for titles and saved model names, e.g. "kristineberg_251128"
 grid_size = 16
 tile_size = int(4512/grid_size)
 image_size_vae = 128
@@ -1183,11 +1183,15 @@ def plot_error_tiles(indices, kind, N_plot=10):
     plt.tight_layout()
     plt.show()
 
-### False negatives: observation tiles misclassified as empty, most confidently wrong first (lowest score)
-plot_error_tiles(fn_indices[np.argsort(all_scores[fn_indices])], "False negatives")
+def most_confused_first(indices):
+    """indices sorted by how close their score is to the threshold (most borderline first)."""
+    return indices[np.argsort(np.abs(all_scores[indices] - best_threshold))]
 
-### False positives: empty tiles misclassified as observations, most confidently wrong first (highest score)
-plot_error_tiles(fp_indices[np.argsort(-all_scores[fp_indices])], "False positives")
+### False negatives: observation tiles misclassified as empty, closest to the threshold first
+plot_error_tiles(most_confused_first(fn_indices), "False negatives (most confused)")
+
+### False positives: empty tiles misclassified as observations, closest to the threshold first
+plot_error_tiles(most_confused_first(fp_indices), "False positives (most confused)")
 
 #%% Compare against a version with no AE
 # Scores straight from the background residual r = tile - background, next to the AE-based ones,

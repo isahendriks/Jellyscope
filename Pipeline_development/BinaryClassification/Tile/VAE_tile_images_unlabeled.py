@@ -27,7 +27,7 @@ AUGMENTATION = False
 # Set to [] or [0.0] to disable offset cropping (single crop per tile)
 OFFSET_NORMALIZED = [0.0, 0.2, 0.4, 0.6, 0.8]
 
-monitoring_effort = "Faro_260928" #"Kristineberg_260424" 
+monitoring_effort = "Faro_260930" #"Kristineberg_260424" 
 
 # Folder paths
 input_folder = f"{monitoring_effort}\\train_encoder\\OG_images"# Folder containing images to split

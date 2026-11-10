@@ -1016,24 +1016,57 @@ JETSON_HOST = "jellyfish@jellyscope"
 JETSON_MODELS_DIR = "/home/jellyfish/Github/Jellyscope/Jetson_monitoring/models"
 # BatchMode=yes so a first-time host-key prompt or a password/passphrase request fails fast
 # instead of ssh/scp hanging forever waiting for input nothing will ever supply (matches
-# Jetson_monitoring/Monitor/transfer.py's own SSH options).
-JETSON_SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"]
+# Jetson_monitoring/Monitor/transfer.py's own SSH options). ServerAlive*: a connection that
+# stalls on the 5G link (no data either way) is dropped after ~60 s instead of scp sitting on
+# it silently until timeout_s.
+JETSON_SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new",
+                   "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"]
+# Checkpoint entries only needed to resume training (Adam's state is 2x the weights), left out
+# of the copy sent to the Jetson. The local checkpoint keeps them.
+JETSON_DROP_CHECKPOINT_KEYS = ("optimizer_state_dict",)
 
-def deploy_checkpoint_to_jetson(local_path, tag=None, overwrite=False):
+def _run_ssh_command(cmd, timeout):
+    """subprocess.run for ssh/scp, capturing stderr only. Windows' OpenSSH ssh.exe can hang
+    after the remote command exits when its stdout is a pipe (capture_output=True), until the
+    timeout; nothing here reads stdout, so it goes to DEVNULL."""
+    return subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.PIPE, text=True, timeout=timeout)
+
+def _slim_checkpoint_for_jetson(local_path):
+    """Path of a copy of the .pth checkpoint without JETSON_DROP_CHECKPOINT_KEYS
+    (<stem>_deploy.pth next to it), or local_path itself if there's nothing to drop."""
+    if local_path.suffix != ".pth":
+        return local_path
+    ckpt = torch.load(local_path, map_location="cpu", weights_only=False)
+    if not isinstance(ckpt, dict) or not any(k in ckpt for k in JETSON_DROP_CHECKPOINT_KEYS):
+        return local_path
+    slim_path = local_path.with_name(f"{local_path.stem}_deploy{local_path.suffix}")
+    torch.save({k: v for k, v in ckpt.items() if k not in JETSON_DROP_CHECKPOINT_KEYS}, slim_path)
+    return slim_path
+
+def deploy_checkpoint_to_jetson(local_path, tag=None, overwrite=False, timeout_s=3600):
     """Copy a checkpoint into the Jetson's models/ folder as <stem>_<tag><suffix>.
 
     Refuses to replace a file that already exists there unless overwrite=True, since the
     Jetson may be running it. Returns the remote filename, or None if nothing was copied.
+
+    Training-only entries (JETSON_DROP_CHECKPOINT_KEYS, e.g. the optimizer state) are left
+    out of the copy. It goes to <name>.part and is renamed on success, so a copy cut off by
+    the (slow, 5G) link never leaves a truncated checkpoint under the real name. timeout_s
+    covers the whole copy; the Jetson link can be as slow as a few KB/s.
     """
     local_path = Path(local_path)
     remote_name = f"{local_path.stem}_{tag}{local_path.suffix}" if tag else local_path.name
     remote_path = f"{JETSON_MODELS_DIR}/{remote_name}"
+    source_path = _slim_checkpoint_for_jetson(local_path)
+    size_mb = source_path.stat().st_size / 1e6
+    print(f"Copying {source_path.name} ({size_mb:.1f} MB) to the Jetson as {remote_name} (timeout {timeout_s} s)...")
 
+    step = "ssh (checking for an existing file)"
     try:
         if not overwrite:
-            exists = subprocess.run(
-                ["ssh", *JETSON_SSH_OPTS, JETSON_HOST, f"test -e '{remote_path}'"],
-                capture_output=True, text=True, timeout=30,
+            exists = _run_ssh_command(
+                ["ssh", *JETSON_SSH_OPTS, JETSON_HOST, f"test -e '{remote_path}'"], timeout=120,
             )
             if exists.returncode == 0:
                 print(f"{remote_name} already exists on the Jetson -- not copied. "
@@ -1043,23 +1076,32 @@ def deploy_checkpoint_to_jetson(local_path, tag=None, overwrite=False):
                 print(f"ssh failed (exit {exists.returncode}): {exists.stderr.strip()}")
                 return None
 
-        scp_result = subprocess.run(
-            ["scp", *JETSON_SSH_OPTS, str(local_path), f"{JETSON_HOST}:{remote_path}"],
-            capture_output=True, text=True, timeout=120,
+        # -C: compress in transit (checkpoints with a bkg_image compress well)
+        step = "scp (copying the file)"
+        scp_result = _run_ssh_command(
+            ["scp", "-C", *JETSON_SSH_OPTS, str(source_path), f"{JETSON_HOST}:{remote_path}.part"],
+            timeout=timeout_s,
         )
+        if scp_result.returncode != 0:
+            print(f"scp failed (exit {scp_result.returncode}): {scp_result.stderr.strip()}")
+            return None
+        step = "ssh (renaming .part)"
+        mv_result = _run_ssh_command(
+            ["ssh", *JETSON_SSH_OPTS, JETSON_HOST, f"mv '{remote_path}.part' '{remote_path}'"], timeout=120,
+        )
+        if mv_result.returncode != 0:
+            print(f"Copied, but renaming {remote_name}.part failed: {mv_result.stderr.strip()}")
+            return None
     except subprocess.TimeoutExpired:
-        print(f"ssh/scp to {JETSON_HOST} timed out -- check that SSH key auth works non-interactively "
-              f"(test with: ssh -o BatchMode=yes {JETSON_HOST} whoami)")
+        print(f"{step} to {JETSON_HOST} timed out. If `ssh -o BatchMode=yes {JETSON_HOST} whoami` works, "
+              f"the link may just be slow: retry with a larger timeout_s. A leftover {remote_name}.part on "
+              f"the Jetson is incomplete and can be deleted.")
         return None
 
-    if scp_result.returncode != 0:
-        print(f"scp failed (exit {scp_result.returncode}): {scp_result.stderr.strip()}")
-        return None
-
-    print(f"✓ Copied {local_path.name} to {JETSON_HOST}:{remote_path}")
+    print(f"✓ Copied {source_path.name} to {JETSON_HOST}:{remote_path}")
     return remote_name
 
-def deploy_background_to_jetson(bkg_image, local_path, tag=None, overwrite=False):
+def deploy_background_to_jetson(bkg_image, local_path, tag=None, overwrite=False, timeout_s=3600):
     """Save a background image (4512x4512 uint8 array or tensor) as a lossless PNG at
     local_path, then copy it to the Jetson's models/ folder as <stem>_<tag>.png, with the
     same no-overwrite rule as deploy_checkpoint_to_jetson. Returns the remote filename,
@@ -1071,7 +1113,7 @@ def deploy_background_to_jetson(bkg_image, local_path, tag=None, overwrite=False
     local_path = Path(local_path).with_suffix(".png")
     if not cv2.imwrite(str(local_path), bkg_image):
         raise OSError(f"Could not write background image to {local_path}")
-    return deploy_checkpoint_to_jetson(local_path, tag=tag, overwrite=overwrite)
+    return deploy_checkpoint_to_jetson(local_path, tag=tag, overwrite=overwrite, timeout_s=timeout_s)
 
 def split_image_into_tiles(image, grid_size):
     """
